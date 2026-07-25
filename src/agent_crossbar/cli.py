@@ -6,9 +6,12 @@ between doctor mode and the MCP server.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from typing import Any
+
+from agent_crossbar import __version__
 
 
 def _format_text(results: dict[str, Any], profile_filter: str | None = None) -> str:
@@ -87,23 +90,33 @@ def doctor_cmd(json_output: bool = False, profile: str | None = None) -> None:
         sys.stdout.write(_format_text(results_dict, profile))
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the lightweight CLI parser without importing the MCP server."""
+    parser = argparse.ArgumentParser(
+        prog="agent-crossbar",
+        description="Run the Agent Crossbar MCP server or inspect provider readiness.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Print the installed Agent Crossbar version and exit.",
+    )
+    subcommands = parser.add_subparsers(dest="command")
+    doctor = subcommands.add_parser("doctor", help="Check provider readiness.")
+    doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    doctor.add_argument("--profile", metavar="PROFILE", help="Check one provider profile.")
+    return parser
+
+
 def main() -> None:
-    """CLI dispatcher: ``agent-crossbar [doctor]``.
+    """Dispatch ``agent-crossbar [doctor]`` while keeping the default MCP mode."""
+    args = _build_parser().parse_args()
 
-    With no arguments, starts the MCP server.
-    With ``doctor``, runs readiness checks.
-    """
-    args = sys.argv[1:]
+    if args.command == "doctor":
+        doctor_cmd(json_output=args.json, profile=args.profile)
+        return
 
-    if args and args[0] == "doctor":
-        json_output = "--json" in args
-        profile: str | None = None
-        for i, arg in enumerate(args):
-            if arg == "--profile" and i + 1 < len(args):
-                profile = args[i + 1]
-                break
-        doctor_cmd(json_output=json_output, profile=profile)
-    else:
-        from agent_crossbar.server import main as server_main
+    from agent_crossbar.server import main as server_main
 
-        server_main()
+    server_main()
