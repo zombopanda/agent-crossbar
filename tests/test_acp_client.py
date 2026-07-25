@@ -318,10 +318,10 @@ def test_invalid_autonomy_no_spawn():
             _run(
                 run_acp_prompt(
                     ["fake"],
-                        secret,
-                        "/tmp",
-                        autonomy="invalid",
-                        model="test-model",
+                    secret,
+                    "/tmp",
+                    autonomy="invalid",
+                    model="test-model",
                 )
             )
     assert secret not in str(exc.value)
@@ -348,10 +348,10 @@ def test_launch_error_maps():
             _run(
                 run_acp_prompt(
                     ["fake"],
-                        secret,
-                        "/tmp",
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        model="test-model",
+                    secret,
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
                 )
             )
     assert secret not in str(exc.value)
@@ -370,10 +370,10 @@ def test_protocol_error_maps():
             _run(
                 run_acp_prompt(
                     ["fake"],
-                        secret,
-                        "/tmp",
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        model="test-model",
+                    secret,
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
                 )
             )
     assert "handshake failed" in str(exc.value)
@@ -397,10 +397,10 @@ def test_protocol_error_after_prompt_dispatch_marks_execution_stage():
             _run(
                 run_acp_prompt(
                     ["fake"],
-                        secret,
-                        "/tmp",
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        model="test-model",
+                    secret,
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
                 )
             )
     assert secret not in str(exc.value)
@@ -421,10 +421,10 @@ def test_timeout_cleanup():
                 run_acp_prompt(
                     ["fake"],
                     secret,
-                        "/tmp",
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        timeout=0.01,
-                        model="test-model",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    timeout=0.01,
+                    model="test-model",
                 )
             )
     assert secret not in str(exc.value)
@@ -452,10 +452,10 @@ def test_timeout_before_prompt_sent_marks_prompt_delivery_stage():
                 run_acp_prompt(
                     ["fake"],
                     secret,
-                        "/tmp",
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        timeout=0.01,
-                        model="test-model",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    timeout=0.01,
+                    model="test-model",
                 )
             )
     assert secret not in str(exc.value)
@@ -706,6 +706,64 @@ class TestRunAcpPromptModelSelection:
         assert len(conn.set_config_option_calls) == 1
         assert conn.set_config_option_calls[0][2] == "opencode-go/deepseek-v4-pro"
 
+    def test_effort_uses_thought_level_config_option_after_model_selection(self):
+        """OpenCode-style effort is set through ACP, after model selection."""
+        model_opt = _config_with_category(
+            option_id="model",
+            category="model",
+            values=["opencode-go/deepseek-v4-flash"],
+        )
+        effort_opt = _config_with_category(
+            option_id="effort",
+            category="thought_level",
+            values=["low", "high"],
+            current_value="low",
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, effort_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="opencode-go/deepseek-v4-flash",
+                    effort="high",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+            ("effort", "session-1", "high"),
+        ]
+
+    def test_effort_without_advertised_selector_is_rejected_before_prompt(self):
+        """Explicit effort must never be silently ignored by an ACP agent."""
+        model_opt = _config_with_category(
+            category="model",
+            values=["opencode-go/deepseek-v4-flash"],
+        )
+        conn = _ConnWithConfig(config_options=[model_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            with pytest.raises(AcpProtocolError, match="No effort config option available") as exc:
+                _run(
+                    run_acp_prompt(
+                        ["fake"],
+                        "safe",
+                        "/tmp",
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        model="opencode-go/deepseek-v4-flash",
+                        effort="high",
+                    )
+                )
+        assert exc.value.stage == "prompt_delivery"
+
     def test_model_option_absent_raises_protocol_error(self):
         """No config option with category==model or id==model -> AcpProtocolError."""
         conn = _ConnWithConfig(config_options=[])
@@ -862,10 +920,10 @@ class TestRunAcpPromptModelSelection:
         assert secret in str(exc_info.value.__cause__)
 
 
-# J. model forwarded through run_acp_job
-class TestRunAcpJobForwardsModel:
-    def test_model_passed_to_run_acp_prompt(self, tmp_path):
-        """run_acp_job forwards model to run_acp_prompt."""
+# J. model and effort forwarded through run_acp_job
+class TestRunAcpJobForwardsConfiguration:
+    def test_model_and_effort_passed_to_run_acp_prompt(self, tmp_path):
+        """run_acp_job forwards requested ACP session configuration."""
         from agent_crossbar.acp_runtime import run_acp_job
         from agent_crossbar.jobs import JobStore
 
@@ -889,7 +947,7 @@ class TestRunAcpJobForwardsModel:
                     cwd=str(tmp_path),
                     task="dev",
                     model="opencode-go/deepseek-v4-flash",
-                    effort=None,
+                    effort="high",
                     autonomy=Autonomy.EDIT_LOCAL,
                     max_runtime_sec=30,
                 )
@@ -897,6 +955,7 @@ class TestRunAcpJobForwardsModel:
 
         _, kwargs = mock_run.call_args
         assert kwargs["model"] == "opencode-go/deepseek-v4-flash"
+        assert kwargs["effort"] == "high"
 
 
 @pytest.mark.parametrize(

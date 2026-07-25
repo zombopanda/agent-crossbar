@@ -182,6 +182,9 @@ class OpencodeAdapter(StaticAdapter):
             backend="acp",
             supports_interactive=False,
             effort_map={"low": "low", "medium": "medium", "high": "high", "max": "max"},
+            # OpenCode ACP v1.18.4 advertises the per-model `effort` selector
+            # (category `thought_level`) through session config options.
+            supports_acp_effort=True,
         )
 
     def discover_models(self, runner: DiscoveryProcess) -> ModelCatalog:

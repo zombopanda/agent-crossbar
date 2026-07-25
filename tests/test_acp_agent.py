@@ -379,6 +379,28 @@ class TestAgentStartAcpPreflight:
 
         monkeypatch.setattr(rmod, "probe_profile", fake_probe)
 
+        # Mock discovery so "opencode/test-model" resolves as a valid model —
+        # model validation now runs before the ACP preflight gate this test targets.
+        from agent_crossbar.adapters.base import ModelCatalog, ModelInfo
+
+        mock_catalog = ModelCatalog(
+            models=("opencode/test-model",),
+            default_model="opencode/test-model",
+            native_efforts=("high", "max"),
+            source="mock",
+            model_info=(
+                ModelInfo(
+                    id="opencode/test-model",
+                    supported_efforts=("high", "max"),
+                    default_effort="high",
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "agent_crossbar.discovery.discover_profile_models",
+            lambda sr, profile, refresh=False: mock_catalog,
+        )
+
         with mock.patch(
             "agent_crossbar.acp_lifecycle.check_opencode_acp_readiness",
             return_value={
@@ -392,6 +414,7 @@ class TestAgentStartAcpPreflight:
                 prompt="test preflight",
                 task="dev",
                 cwd=str(tmp_path),
+                model="opencode/test-model",
             )
             assert result["ok"] is False
             assert result["error"] == "opencode_acp_probe_failed"
@@ -626,8 +649,8 @@ class TestAgentStartAcpRouting:
         assert len(self.acp_calls) == 1
         assert len(self.print_job_calls) == 0
 
-    def test_opencode_explicit_effort_uses_legacy_print(self, tmp_path, monkeypatch):
-        """OpenCode with explicit effort must route to legacy print backend, NOT ACP."""
+    def test_opencode_explicit_effort_uses_acp(self, tmp_path, monkeypatch):
+        """OpenCode configures explicit effort through its ACP session selector."""
         monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
         # Mock discovery to return a catalog where the model supports high effort
@@ -658,14 +681,14 @@ class TestAgentStartAcpRouting:
             prompt="test task",
             task="dev",
             model="opencode/test-model",
-            effort="high",  # explicit effort → legacy print
+            effort="high",
             cwd=str(tmp_path),
         )
         assert result["ok"] is True, f"agent_start failed: {result}"
-        assert len(self.acp_calls) == 0, "ACP must NOT be called when effort is explicit"
-        assert len(self.print_job_calls) == 1, (
-            f"Expected 1 print_job call, got {len(self.print_job_calls)}"
-        )
+        assert result["backend"] == "acp"
+        assert len(self.acp_calls) == 1
+        assert self.acp_calls[0]["effort"] == "high"
+        assert len(self.print_job_calls) == 0
 
     def test_opencode_unsupported_effort_rejected(self, tmp_path, monkeypatch):
         """OpenCode with explicit effort NOT supported by model must be rejected before job creation."""

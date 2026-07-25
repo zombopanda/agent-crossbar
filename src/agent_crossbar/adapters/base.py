@@ -84,6 +84,9 @@ class StaticAdapter:
     backend: str
     supports_interactive: bool
     effort_map: Mapping[str, str]
+    # Whether this ACP agent advertises an effort/thought-level selector that
+    # can be set through session/set_config_option.
+    supports_acp_effort: bool = False
 
     def map_effort(self, effort: str) -> str:
         return normalize_effort(effort, self.effort_map)

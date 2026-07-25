@@ -139,7 +139,7 @@ With the MCP server running, from any MCP client:
 |---------|-------|---------|-----|-----------------|
 | `codex` | ask, review, dev | ACP one-shot (fallback to print for explicit effort) | macOS, Linux | Required on every call |
 | `claude` | ask, review, dev | Native `claude_bg` (noninteractive only; `claude -p` disabled; no `job_send`) | macOS, Linux | Required on every call |
-| `opencode` | ask, review, dev | ACP one-shot (fallback to print for explicit effort) | macOS, Linux | Required on every call |
+| `opencode` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
 
 `model` is mandatory for every `agent_start` request. Agent Crossbar never
 chooses or falls back to a default model. Use `profiles_list` to inspect the

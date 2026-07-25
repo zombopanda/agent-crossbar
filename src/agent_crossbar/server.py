@@ -633,10 +633,10 @@ def agent_start(
         _acp_profiles = frozenset({"codex", "opencode"})
         if result["profile"] in _acp_profiles and getattr(adapter, "backend", None) == "acp":
             # ── Effort routing ──
-            # ACP one-shot cannot set reasoning_effort.  Explicit effort
-            # routes to the proven print backend (Codex CLI effort
-            # config / OpenCode --variant).  Omitted effort uses ACP.
-            if effort is not None:
+            # Some ACP agents do not advertise a session config selector for
+            # effort. Keep their proven print path; agents that do advertise
+            # it (currently OpenCode) stay on ACP and configure it per session.
+            if effort is not None and not getattr(adapter, "supports_acp_effort", False):
                 # Route to print backend with explicit effort
                 store = _job_store()
                 job = store.create_job(
@@ -717,7 +717,10 @@ def agent_start(
 
             # ── Create durable job ──
             store = _job_store()
-            resolved_model = model  # may be None
+            resolved_model = result["model"]
+            resolved_effort = (
+                result["effort"] if getattr(adapter, "supports_acp_effort", False) else None
+            )
 
             job = store.create_job(
                 profile=result["profile"],
@@ -734,7 +737,7 @@ def agent_start(
                     "backend": "acp",
                     "acp_transport": "sdk_stdio",
                     "model": resolved_model,
-                    "effort": None,  # ACP path: no explicit effort
+                    "effort": resolved_effort,
                     "task": task,
                     "interactive": interactive,
                     "cwd": effective_cwd,
@@ -764,7 +767,7 @@ def agent_start(
                     cwd=effective_cwd,
                     task=task,
                     model=resolved_model,
-                    effort=None,  # ACP path: no explicit effort
+                    effort=resolved_effort,
                     autonomy=run_req["autonomy"],
                     max_runtime_sec=max_runtime_sec,
                 )

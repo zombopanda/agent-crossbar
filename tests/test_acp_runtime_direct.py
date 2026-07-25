@@ -120,6 +120,7 @@ class TestRunAcpJobSuccess:
             timeout=12,
             autonomy=Autonomy.EDIT_LOCAL,
             model="glm",
+            effort=None,
             on_process_start=ANY,
         )
 
@@ -550,7 +551,9 @@ class TestExhaustiveFailureStageTaxonomy:
         # literal value, which was never one of the six allowed stages.
         assert stage != "protocol", f"{label}: regressed to the removed 'protocol' stage"
 
+
 # ── safe_acp_termination tests ──────────────────────────────────────────
+
 
 def test_provider_limit_failure_persists_terminal_actionable_envelope(tmp_path):
     store, job_id = _create_job_store(tmp_path)

@@ -148,6 +148,7 @@ async def run_acp_job(
             timeout=effective_timeout,
             autonomy=autonomy,
             model=model,
+            effort=effort,
             on_process_start=_record_acp_pid,
         )
     except AcpProviderUnavailableError as exc:

@@ -291,6 +291,29 @@ def _find_model_config_option(
     return None
 
 
+def _find_effort_config_option(
+    config_options: list[Any] | None,
+) -> SessionConfigOptionSelect | None:
+    """Find the optional reasoning/effort selector advertised by an ACP agent.
+
+    ACP agents may identify this standard semantic selector by category
+    ``thought_level``. OpenCode uses the stable ``effort`` id, retained here
+    as a compatibility fallback for agents that omit the category.
+    """
+    if not config_options:
+        return None
+    for opt in config_options:
+        if (
+            isinstance(opt, SessionConfigOptionSelect)
+            and getattr(opt, "category", None) == "thought_level"
+        ):
+            return opt
+    for opt in config_options:
+        if isinstance(opt, SessionConfigOptionSelect) and getattr(opt, "id", None) == "effort":
+            return opt
+    return None
+
+
 def _model_value_available(option: SessionConfigOptionSelect, value: str) -> bool:
     """Check if *value* exists among *option*'s flat options or grouped options."""
     for entry in option.options:
@@ -314,13 +337,14 @@ async def run_acp_prompt(
     timeout: float | None = None,
     autonomy: str | Autonomy = Autonomy.READ_ONLY,
     model: str,
+    effort: str | None = None,
     startup_timeout: float = 30.0,
     on_process_start: Callable[[int], None] | None = None,
 ) -> AcpResult:
     """Launch a provider, optionally set model, run one ACP prompt, and return the result.
 
-    Sequence: ``initialize`` → ``session/new`` → (optional ``set_config_option``
-    for model) → ``session/prompt``.
+    Sequence: ``initialize`` → ``session/new`` → ``set_config_option`` for
+    model → (optional ``set_config_option`` for effort) → ``session/prompt``.
 
     During ``session/prompt`` the agent may send ``session/update``
     notifications carrying ``AgentMessageChunk`` — those are accumulated
@@ -344,6 +368,9 @@ async def run_acp_prompt(
             ``id=="model"`` as fallback) in the ``NewSessionResponse``
             config options, verifies the model value is available, and
             calls ``set_config_option`` before the prompt.
+        effort: Optional reasoning level. When supplied, the agent must
+            advertise a compatible thought-level/effort config selector after
+            model selection; the value is validated and set before the prompt.
         startup_timeout: Maximum seconds for initialize, session creation,
             and model selection before the job fails as a startup timeout.
         on_process_start: Optional callback receiving the child PID.
@@ -434,7 +461,9 @@ async def run_acp_prompt(
                             "Failed to set model config option", stage="prompt_delivery"
                         ) from exc
 
-                    # Validate that the agent accepted the model value
+                    # Validate that the agent accepted the model value. Model
+                    # selection can change the available effort variants, so
+                    # subsequent selector discovery uses this response.
                     response_options: list[Any] | None = getattr(
                         set_response, "config_options", None
                     )
@@ -447,6 +476,42 @@ async def run_acp_prompt(
                             f"Agent rejected model {model!r}: the config option was not applied",
                             stage="prompt_delivery",
                         )
+
+                    if effort is not None:
+                        effort_option = _find_effort_config_option(response_options)
+                        if effort_option is None:
+                            raise AcpProtocolError(
+                                "No effort config option available from agent",
+                                stage="prompt_delivery",
+                            )
+                        if not _model_value_available(effort_option, effort):
+                            raise AcpProtocolError(
+                                f"Requested effort {effort!r} not available from agent",
+                                stage="prompt_delivery",
+                            )
+                        try:
+                            effort_response = await conn.set_config_option(
+                                config_id=effort_option.id,
+                                session_id=session_id,
+                                value=effort,
+                            )
+                        except Exception as exc:
+                            raise AcpProtocolError(
+                                "Failed to set effort config option", stage="prompt_delivery"
+                            ) from exc
+
+                        effort_response_options: list[Any] | None = getattr(
+                            effort_response, "config_options", None
+                        )
+                        response_effort_option = _find_effort_config_option(effort_response_options)
+                        if (
+                            response_effort_option is None
+                            or response_effort_option.current_value != effort
+                        ):
+                            raise AcpProtocolError(
+                                f"Agent rejected effort {effort!r}: the config option was not applied",
+                                stage="prompt_delivery",
+                            )
                     return session_id
 
                 stderr_task = asyncio.create_task(_watch_stderr())
