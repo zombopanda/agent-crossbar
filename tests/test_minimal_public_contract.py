@@ -355,7 +355,24 @@ def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeyp
     """Claude interactive mode must remain on native --bg, never Claude -p."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
+    import time
+
+    import agent_crossbar.readiness as readiness_module
     from agent_crossbar.adapters.claude import LaunchResult, ReadinessResult
+    from agent_crossbar.readiness import ReadinessResult as ProfileReadinessResult
+
+    monkeypatch.setattr(
+        readiness_module,
+        "probe_profile",
+        lambda profile, _runner=None, use_cache=True: ProfileReadinessResult(
+            profile=profile,
+            state="ready",
+            support_tier="supported",
+            authenticated=True,
+            probe_version=1,
+            timestamp=time.time(),
+        ),
+    )
 
     class FakeClaudeAdapter:
         name = "claude"
@@ -386,7 +403,24 @@ def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
     """Claude agent_start response must report backend='claude_bg', not 'print'."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
+    import time
+
+    import agent_crossbar.readiness as readiness_module
     from agent_crossbar.adapters.claude import LaunchResult, ReadinessResult
+    from agent_crossbar.readiness import ReadinessResult as ProfileReadinessResult
+
+    monkeypatch.setattr(
+        readiness_module,
+        "probe_profile",
+        lambda profile, _runner=None, use_cache=True: ProfileReadinessResult(
+            profile=profile,
+            state="ready",
+            support_tier="supported",
+            authenticated=True,
+            probe_version=1,
+            timestamp=time.time(),
+        ),
+    )
 
     class FakeClaudeAdapter:
         name = "claude"
