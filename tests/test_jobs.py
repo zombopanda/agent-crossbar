@@ -158,6 +158,64 @@ def test_job_tail_lazy_finalizes_completed_tmux_job(tmp_path):
     assert (job.path / "result.json").exists()
 
 
+def test_job_tail_includes_print_output_tail(tmp_path):
+    """job_tail serves output_tail for print transport (noninteractive Reasonix)."""
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="review", transport="print")
+    output_path = job.path / "stdout.log"
+    output_path.write_text("analysis line 1\nanalysis line 2\nfinal result\n", encoding="utf-8")
+    store.update_job_meta(job.job_id, {"print_output_path": str(output_path)})
+
+    tail = store.job_tail(job.job_id, since_seq=job.events.last_seq)
+
+    assert tail["ok"] is True
+    assert tail["events"] == []
+    assert tail["output_tail"] is not None
+    assert tail["output_tail"]["path"] == str(output_path)
+    assert tail["output_tail"]["text"] == "analysis line 1\nanalysis line 2\nfinal result\n"
+    assert tail["output_tail"]["truncated"] is False
+
+
+def test_job_tail_can_read_incremental_print_output(tmp_path):
+    """job_tail supports output_since_bytes for incremental print output reads."""
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="print")
+    output_path = job.path / "stdout.log"
+    output_path.write_text("chunk1\nchunk2\n", encoding="utf-8")
+    store.update_job_meta(job.job_id, {"print_output_path": str(output_path)})
+
+    first = store.job_tail(job.job_id, output_since_bytes=0, max_bytes=7)
+    second = store.job_tail(
+        job.job_id,
+        output_since_bytes=first["output_next_bytes"],
+        max_bytes=100,
+    )
+
+    assert first["output_tail"]["text"] == "chunk1\n"
+    assert first["output_tail"]["bytes"] == 7
+    assert first["output_next_bytes"] == 7
+    assert second["output_tail"]["text"] == "chunk2\n"
+    assert second["output_next_bytes"] == 14
+
+
+def test_job_tail_print_output_bounds_and_ignores_unsafe_path(tmp_path):
+    """Print output tail respects max_bytes and rejects paths outside job dir."""
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="review", transport="print")
+    output_path = job.path / "stdout.log"
+    output_path.write_text("0123456789\nabcdefghij\n", encoding="utf-8")
+    unsafe_path = tmp_path / "outside.log"
+    unsafe_path.write_text("do not read me\n", encoding="utf-8")
+    store.update_job_meta(job.job_id, {"print_output_path": str(unsafe_path)})
+
+    tail = store.job_tail(job.job_id, max_bytes=8)
+
+    # Unsafe path is rejected; falls back to default stdout.log in job dir.
+    assert tail["output_tail"]["path"] == str(output_path)
+    assert tail["output_tail"]["text"] == "defghij\n"
+    assert tail["output_tail"]["truncated"] is True
+
+
 def test_job_list_lazy_finalizes_completed_tmux_job(tmp_path):
     store = JobStore(tmp_path)
     job = store.create_job(profile="reasonix", operation="dev", transport="tmux")

@@ -498,16 +498,27 @@ class JobStore:
             last_seq = int(clipped[-1]["seq"]) if clipped else since_seq
             next_seq = last_seq + 1
         meta = self._read_job_meta(job.path)
+        transport = meta.get("transport", job.transport)
         output_tail = None
         output_next_bytes = output_since_bytes
-        if meta.get("transport", job.transport) == "tmux":
+        if transport in ("tmux", "print"):
+            fallback_name = "tmux-output.log" if transport == "tmux" else "stdout.log"
+            meta_key = "tmux_output_path" if transport == "tmux" else "print_output_path"
             output_path = self._safe_job_artifact_path(
-                job, meta.get("tmux_output_path"), "tmux-output.log"
+                job, meta.get(meta_key), fallback_name
             )
             if output_since_bytes is None:
                 output_tail = self._read_output_tail(
                     output_path, max_bytes or _OUTPUT_TAIL_FALLBACK_BYTES
                 )
+                if output_tail is not None:
+                    # When reading a full tail (no offset), the next byte to
+                    # read from is the current file size — this lets callers
+                    # switch to incremental mode after the first poll.
+                    try:
+                        output_next_bytes = output_path.stat().st_size
+                    except OSError:
+                        output_next_bytes = output_tail["bytes"]
             else:
                 output_tail, output_next_bytes = self._read_output_since(
                     output_path, output_since_bytes, max_bytes or _OUTPUT_TAIL_FALLBACK_BYTES

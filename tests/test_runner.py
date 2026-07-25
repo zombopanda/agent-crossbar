@@ -340,6 +340,120 @@ def test_run_print_job_records_events_and_result(tmp_path):
     assert "result" in event_types
 
 
+def test_run_print_job_writes_stdout_log_for_incremental_tail(tmp_path):
+    """run_print_job creates stdout.log and sets print_output_path metadata."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="reasonix",
+        operation="review",
+        transport="print",
+        sensitivity="normal",
+    )
+
+    def fake_run(args, **kwargs):
+        # Simulate: the file is written by _file_streaming_run wrapper
+        stdout_log = job.path / "stdout.log"
+        stdout_log.write_text("line1\nline2\n")
+        return _completed("line1\nline2\n")
+
+    result = run_print_job(
+        store,
+        job.job_id,
+        {
+            "profile": "reasonix",
+            "operation": "review",
+            "transport": "print",
+            "prompt": "review this",
+            "model": "deepseek-v4-flash",
+        },
+        run=fake_run,
+    )
+
+    assert result["ok"] is True
+    stdout_log = job.path / "stdout.log"
+    assert stdout_log.exists()
+
+    # Metadata must have print_output_path so job_tail can find it
+    meta = store._read_job_meta(job.path)
+    assert "print_output_path" in meta
+    assert meta["print_output_path"] == str(stdout_log)
+
+    # job_tail must serve the output for print transport
+    tail = store.job_tail(job.job_id)
+    assert tail["ok"] is True
+    assert tail["output_tail"] is not None
+    assert tail["output_tail"]["text"] == "line1\nline2\n"
+
+
+def test_run_print_job_output_tail_visible_while_running(tmp_path):
+    """job_tail returns incremental print output before the job completes."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="reasonix",
+        operation="review",
+        transport="print",
+        sensitivity="normal",
+    )
+
+    # Simulate a long-running process: write to stdout.log in stages
+    stdout_log = job.path / "stdout.log"
+    store.update_job_meta(job.job_id, {"print_output_path": str(stdout_log)})
+
+    # Stage 1: partial output written
+    stdout_log.write_text("first chunk\n")
+    tail1 = store.job_tail(job.job_id, output_since_bytes=0)
+    assert tail1["output_tail"] is not None
+    assert tail1["output_tail"]["text"] == "first chunk\n"
+    assert tail1["status"] == "running"
+
+    # Stage 2: more output appended (simulating process progress)
+    with open(stdout_log, "a") as f:
+        f.write("second chunk\n")
+    tail2 = store.job_tail(
+        job.job_id,
+        output_since_bytes=tail1["output_next_bytes"],
+    )
+    assert tail2["output_tail"] is not None
+    assert tail2["output_tail"]["text"] == "second chunk\n"
+
+
+def test_run_print_job_failure_still_records_output_tail(tmp_path):
+    """When a print job fails, stdout.log is still visible via job_tail."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="reasonix",
+        operation="review",
+        transport="print",
+        sensitivity="normal",
+    )
+
+    stdout_log = job.path / "stdout.log"
+    stdout_log.write_text("error: something went wrong\n")
+
+    def fake_run(args, **kwargs):
+        return _completed("error: something went wrong\n", returncode=1)
+
+    result = run_print_job(
+        store,
+        job.job_id,
+        {
+            "profile": "reasonix",
+            "operation": "review",
+            "transport": "print",
+            "prompt": "review this",
+            "model": "deepseek-v4-flash",
+        },
+        run=fake_run,
+    )
+
+    assert result["ok"] is False
+
+    tail = store.job_tail(job.job_id)
+    assert tail["status"] == "failed"
+    assert tail["output_tail"] is not None
+    assert tail["output_tail"]["text"] == "error: something went wrong\n"
+
+
 def test_run_gui_job_persists_prompt_and_generation_progress(tmp_path, monkeypatch):
     store = JobStore(tmp_path)
     job = store.create_job(

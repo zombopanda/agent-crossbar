@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from agent_crossbar.env_compat import getenv
@@ -1998,7 +1999,21 @@ def run_print_job(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout_sec: int | None = None,
 ) -> dict[str, Any]:
-    """Run a print job and persist events/result."""
+    """Run a print job and persist events/result.
+
+    Stdout is written incrementally to stdout.log inside the job
+    directory so that JobStore.job_tail can serve live
+    output_tail / output_since_bytes while the provider is
+    still running.
+    """
+    job = store.get_job(job_id)
+    output_path = (job.path / "stdout.log") if job is not None else None
+
+    # Expose the output path in metadata before starting so job_tail
+    # can find it immediately (provider-neutral — no adapter fields).
+    if output_path is not None:
+        store.update_job_meta(job_id, {"print_output_path": str(output_path)})
+
     store.send_event(
         job_id,
         level="info",
@@ -2006,7 +2021,42 @@ def run_print_job(
         message="Provider execution started",
         data={"profile": req.get("profile"), "operation": req.get("operation")},
     )
-    result = run_print_request(req, run=run, timeout_sec=timeout_sec)
+
+    # Build a run wrapper that streams stdout to the file while the
+    # process runs so job_tail sees incremental output.  We still need
+    # the final stdout text for result persistence, so read the file
+    # back after the subprocess exits.
+    if output_path is not None and run is subprocess.run:
+        def _file_streaming_run(
+            argv: list[str], **kwargs: Any
+        ) -> subprocess.CompletedProcess[str]:
+            # Drop capture_output / text — we handle those ourselves.
+            kwargs.pop("capture_output", None)
+            kwargs.pop("text", None)
+            kwargs.setdefault("stdin", subprocess.DEVNULL)
+            with open(output_path, "wb") as out_f:
+                completed = subprocess.run(
+                    argv,
+                    stdout=out_f,
+                    stderr=subprocess.STDOUT,
+                    **kwargs,
+                )
+            # Read back the captured text for the caller.
+            try:
+                stdout_text = output_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stdout_text = ""
+            return SimpleNamespace(
+                returncode=completed.returncode,
+                stdout=stdout_text,
+                stderr="",
+            )
+
+        effective_run = _file_streaming_run
+    else:
+        effective_run = run
+
+    result = run_print_request(req, run=effective_run, timeout_sec=timeout_sec)
     if result.get("output"):
         store.send_event(
             job_id,
