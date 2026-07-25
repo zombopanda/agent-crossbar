@@ -27,7 +27,7 @@ from agent_crossbar.discovery import (
 )
 from agent_crossbar.env_compat import getenv
 from agent_crossbar.envelope import build_result_envelope, sanitize_diagnostic_text
-from agent_crossbar.jobs import JobStore
+from agent_crossbar.jobs import JobStore, default_state_root
 from agent_crossbar.profiles import list_profiles
 from agent_crossbar.runner import (
     CHATGPT_PRO_DEFAULT_TIMEOUT_SEC,
@@ -46,14 +46,11 @@ _sync_request_state: ContextVar[tuple[str, threading.Event, asyncio.Task[Any] | 
 
 
 def _state_root() -> Path:
-    env_dir = getenv("AGENT_CROSSBAR_STATE_DIR")
-    if env_dir:
-        return Path(env_dir)
-    return Path.home() / ".local" / "state" / "agent-crossbar"
+    return default_state_root()
 
 
 def _job_store() -> JobStore:
-    return JobStore(_state_root())
+    return JobStore(default_state_root())
 
 
 def _client_metadata(
@@ -83,7 +80,22 @@ def _client_metadata(
     if client_session_id is not None:
         data["session_id"] = client_session_id
     data.setdefault("session_id", None)
+    _redact_operator_session_id(data)
     return data
+
+
+def _redact_operator_session_id(data: dict[str, Any]) -> None:
+    """Redact session_id if it matches the configured operator token."""
+    sid = data.get("session_id")
+    if sid is None:
+        return
+    import secrets
+
+    from agent_crossbar.env_compat import getenv
+
+    token = getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
+    if token is not None and secrets.compare_digest(sid, token):
+        data["session_id"] = "[REDACTED:operator_token]"
 
 
 def _effective_client_session_id(

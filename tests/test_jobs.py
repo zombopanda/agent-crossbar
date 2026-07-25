@@ -635,3 +635,252 @@ def test_send_user_input_tmux_settles_between_text_and_enter(monkeypatch, tmp_pa
     assert len(sleep_calls) == 1, f"expected 1 sleep call, got {len(sleep_calls)}"
     assert sleep_calls[0] == 0.5, f"expected 0.5s sleep, got {sleep_calls[0]}"
     assert len(captured) == 2, f"expected 2 subprocess calls, got {len(captured)}"
+
+# ── Operator token: cross-session access ──────────────────────────────────
+
+def test_foreign_access_denied_by_default(tmp_path):
+    """Without operator token, foreign session access is rejected for all tools."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    # tail
+    assert store.job_tail(job.job_id, client_session_id="thread-b")["error"] == "job_not_found"
+    # result
+    assert store.get_result(job.job_id, client_session_id="thread-b")["error"] == "job_not_found"
+    # stop
+    assert store.stop_job(job.job_id, client_session_id="thread-b")["error"] == "job_not_found"
+    # send_user_input (uses _get_owned_job internally)
+    assert store.send_user_input(job.job_id, "hello", client_session_id="thread-b")["error"] == "job_not_found"
+    # None session (anonymous caller) is also rejected
+    assert store.job_tail(job.job_id)["error"] == "job_not_found"
+    assert store.get_result(job.job_id)["error"] == "job_not_found"
+
+
+def test_operator_token_allows_cross_session_tail(tmp_path, monkeypatch):
+    """Operator token bypasses session isolation for job_tail."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    result = store.job_tail(job.job_id, client_session_id="op-secret")
+    assert result["ok"] is True
+    assert result["job_id"] == job.job_id
+    assert result["status"] == "running"
+
+
+def test_operator_token_allows_cross_session_result(tmp_path, monkeypatch):
+    """Operator token bypasses session isolation for get_result."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    # Without result.json, it returns result_not_ready but NOT job_not_found
+    result = store.get_result(job.job_id, client_session_id="op-secret")
+    assert result["error"] == "result_not_ready"
+
+
+def test_operator_token_allows_cross_session_stop(tmp_path, monkeypatch):
+    """Operator token bypasses session isolation for stop_job."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    result = store.stop_job(job.job_id, client_session_id="op-secret")
+    assert result["ok"] is True
+    assert result["job_id"] == job.job_id
+
+
+def test_operator_token_allows_cross_session_send_input(tmp_path, monkeypatch):
+    """Operator token bypasses session isolation for send_user_input (ownership gate)."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    # Without interactive flag, it should return job_not_interactive, NOT job_not_found
+    result = store.send_user_input(job.job_id, "hello", client_session_id="op-secret")
+    assert result["error"] == "job_not_interactive"
+
+
+def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
+    """job_list filters by client_session_id unless operator token is used."""
+    store = JobStore(tmp_path)
+    store.create_job(
+        profile="claude", operation="review",
+        client_session_id="thread-a", client_name="codex", cwd="/a",
+    )
+    store.create_job(
+        profile="claude", operation="review",
+        client_session_id="thread-b", client_name="codex", cwd="/b",
+    )
+
+    listed_a = store.list_jobs(client_session_id="thread-a")
+    assert len(listed_a) == 1
+    assert listed_a[0]["client_session_id"] == "thread-a"
+
+    listed_b = store.list_jobs(client_session_id="thread-b")
+    assert len(listed_b) == 1
+    assert listed_b[0]["client_session_id"] == "thread-b"
+
+    # Anonymous caller (client_session_id=None) sees all jobs at store level;
+    # the server layer filters out jobs with client_session_id when session is None.
+    listed_none = store.list_jobs()
+    assert len(listed_none) == 2  # store level returns all
+
+
+def test_job_list_operator_token_shows_all_jobs(tmp_path, monkeypatch):
+    """With operator token, job_list returns jobs from all sessions."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    store.create_job(
+        profile="claude", operation="review",
+        client_session_id="thread-a", client_name="codex", cwd="/a",
+    )
+    store.create_job(
+        profile="reasonix", operation="dev",
+        client_session_id="thread-b", client_name="claude", cwd="/b",
+    )
+
+    listed = store.list_jobs(client_session_id="op-secret")
+    assert len(listed) == 2
+    sessions = {j["client_session_id"] for j in listed}
+    assert sessions == {"thread-a", "thread-b"}
+
+
+def test_operator_token_noop_when_unset(tmp_path):
+    """When AGENT_CROSSBAR_OPERATOR_TOKEN is not set, no bypass occurs."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    # Random string as client_session_id should NOT grant access
+    assert store.job_tail(job.job_id, client_session_id="op-secret")["error"] == "job_not_found"
+    assert store.get_result(job.job_id, client_session_id="op-secret")["error"] == "job_not_found"
+
+
+def test_operator_token_does_not_leak_into_job_creation(tmp_path, monkeypatch):
+    """Jobs created normally still store their real client_session_id,
+    not the operator token (unless the caller passes the token as their
+    actual session id, which is their choice)."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    meta = store._read_job_meta(job.path)
+    assert meta["client_session_id"] == "thread-a"
+    # operator token can still access it
+    assert store.job_tail(job.job_id, client_session_id="op-secret")["ok"] is True
+
+
+def test_operator_token_bad_job_id_still_rejected(tmp_path, monkeypatch):
+    """Even with operator token, invalid job IDs are rejected before ownership check."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    store = JobStore(tmp_path)
+    assert store.job_tail("../etc", client_session_id="op-secret")["error"] == "invalid_job_id"
+    assert store.job_tail("abc", client_session_id="op-secret")["error"] == "invalid_job_id"
+
+# ── Shared default state root (regression) ──────────────────────────────────
+
+
+def test_default_state_root_is_shared_not_per_session(monkeypatch):
+    """default_state_root must return the stable shared path, not a per-process dir."""
+    from agent_crossbar.jobs import default_state_root
+
+    monkeypatch.delenv("AGENT_CROSSBAR_STATE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_HARNESS_STATE_DIR", raising=False)
+    root = default_state_root()
+    assert root.name == "agent-crossbar", (
+        f"Expected .../agent-crossbar, got {root.name}"
+    )
+    assert root.parent.name == "state", f"Expected .../state/agent-crossbar, got {root.parent}"
+    assert ".local" in str(root), f"Expected ~/.local/... path, got {root}"
+
+
+def test_default_state_root_respects_override(monkeypatch):
+    """AGENT_CROSSBAR_STATE_DIR must override the default path."""
+    from agent_crossbar.jobs import default_state_root
+
+    override = "/tmp/test-shared-state"
+    monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", override)
+    assert str(default_state_root()) == override
+
+
+def test_two_job_stores_share_state_root(tmp_path):
+    """Two independent JobStore instances with the same root see each other's jobs."""
+    store_a = JobStore(tmp_path)
+    job = store_a.create_job(profile="claude", operation="review")
+    job.events.write(level="info", type="progress", message="hello from A")
+
+    store_b = JobStore(tmp_path)
+    assert store_b.get_job(job.job_id) is not None
+    tail = store_b.job_tail(job.job_id)
+    assert tail["ok"] is True
+    assert tail["job_id"] == job.job_id
+    assert any(e["message"] == "hello from A" for e in tail["events"])
+
+
+def test_job_store_default_constructor_uses_shared_path(monkeypatch):
+    """JobStore() with no arguments must use default_state_root()."""
+    from agent_crossbar.jobs import default_state_root
+
+    monkeypatch.delenv("AGENT_CROSSBAR_STATE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_HARNESS_STATE_DIR", raising=False)
+    store = JobStore()
+    assert store.state_root == default_state_root()
+
+
+def test_job_store_default_and_explicit_are_consistent(monkeypatch):
+    """JobStore() and JobStore(default_state_root()) must be equivalent."""
+    from agent_crossbar.jobs import default_state_root
+
+    monkeypatch.delenv("AGENT_CROSSBAR_STATE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_HARNESS_STATE_DIR", raising=False)
+    s1 = JobStore()
+    s2 = JobStore(default_state_root())
+    assert s1.state_root == s2.state_root
+
+
+def test_list_jobs_sees_jobs_from_another_instance(tmp_path):
+    """list_jobs from one JobStore must see jobs created by another."""
+    store_a = JobStore(tmp_path)
+    job_a = store_a.create_job(profile="claude", operation="review", client_name="alice")
+
+    store_b = JobStore(tmp_path)
+    listed = store_b.list_jobs()
+    assert any(j["job_id"] == job_a.job_id for j in listed)
+    assert any(j["client_name"] == "alice" for j in listed)
+
+
+def test_is_operator_session_constant_time_comparison(monkeypatch):
+    """_is_operator_session must match only the exact token, using constant-time comparison."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+    import agent_crossbar.jobs as jobs_module
+
+    # Exact match
+    assert jobs_module._is_operator_session("op-secret") is True
+    # Non-match
+    assert jobs_module._is_operator_session("other-token") is False
+    assert jobs_module._is_operator_session("") is False
+    assert jobs_module._is_operator_session(None) is False
+    # Prefix/suffix must not match (constant-time comparison prevents substring tricks)
+    assert jobs_module._is_operator_session("op-secret-extra") is False
+    assert jobs_module._is_operator_session("prefix-op-secret") is False

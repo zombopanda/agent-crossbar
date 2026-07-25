@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_crossbar.env_compat import getenv
-from agent_crossbar.jobs import JobStore
+from agent_crossbar.jobs import JobStore, default_state_root
 from agent_crossbar.providers import (
     _opencode_model_id,
     build_launch_plan,
@@ -197,10 +197,7 @@ def _path_bin(env_name: str, fallback: str) -> str:
 
 
 def _state_root() -> Path:
-    env_dir = getenv("AGENT_CROSSBAR_STATE_DIR")
-    if env_dir:
-        return Path(env_dir)
-    return Path.home() / ".local" / "state" / "agent-crossbar"
+    return default_state_root()
 
 
 def _mise_trust_env() -> dict[str, str]:

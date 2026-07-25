@@ -25,6 +25,46 @@ _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
 
 
+def _operator_token() -> str | None:
+    """Return the configured operator token, or None if not set.
+
+    When AGENT_CROSSBAR_OPERATOR_TOKEN is set, a trusted local operator
+    may pass its value as client_session_id to retrieve, tail, stop, or
+    list jobs owned by *any* session.  This is a deliberate opt-in; the
+    default remains strict per-session isolation.
+    """
+    from agent_crossbar.env_compat import getenv
+
+    return getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
+
+
+def _is_operator_session(client_session_id: str | None) -> bool:
+    """Return True when *client_session_id* matches the configured operator token."""
+    if client_session_id is None:
+        return False
+    token = _operator_token()
+    if token is None:
+        return False
+    import secrets
+    return secrets.compare_digest(client_session_id, token)
+
+
+def default_state_root() -> Path:
+    """Return the shared default state root directory.
+
+    - AGENT_CROSSBAR_STATE_DIR (or deprecated AGENT_HARNESS_STATE_DIR)
+      overrides the default.
+    - Otherwise ~/.local/state/agent-crossbar is used — this is a
+      shared, durable location, NOT per-session or per-process.
+    """
+    from agent_crossbar.env_compat import getenv
+
+    env_dir = getenv("AGENT_CROSSBAR_STATE_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".local" / "state" / "agent-crossbar"
+
+
 def _generate_job_id(existing_ids: set[str]) -> str:
     """Generate a unique job ID matching the required regex."""
     import time
@@ -140,7 +180,7 @@ class JobStore:
 
     def __init__(self, state_root: str | Path | None = None) -> None:
         if state_root is None:
-            state_root = Path.home() / ".local" / "state" / "agent-crossbar"
+            state_root = default_state_root()
         self.state_root = Path(state_root)
         self._known_ids: set[str] = set()
         self._lock = threading.Lock()
@@ -361,7 +401,14 @@ class JobStore:
         if job is None:
             return job
         owner = self._read_job_meta(job.path).get("client_session_id")
-        return job if owner is None or owner == client_session_id else None
+        if owner is None or owner == client_session_id:
+            return job
+        # Operator token bypass: a trusted local operator may access any job
+        # by presenting the configured AGENT_CROSSBAR_OPERATOR_TOKEN as their
+        # client_session_id.
+        if _is_operator_session(client_session_id):
+            return job
+        return None
 
     # ── tail ──────────────────────────────────────────────────────────────
 
@@ -851,7 +898,7 @@ class JobStore:
                     meta = json.loads(meta_path.read_text())
                 except (json.JSONDecodeError, OSError):
                     pass
-            if client_session_id is not None and meta.get("client_session_id") != client_session_id:
+            if client_session_id is not None and not _is_operator_session(client_session_id) and meta.get("client_session_id") != client_session_id:
                 continue
             if meta.get("status", "running") == "running":
                 job = self.get_job(job_id)

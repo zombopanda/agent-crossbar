@@ -1271,3 +1271,207 @@ def test_monitor_log_delta_sanitizes_ansi_control_chars(
         assert "\x1b" not in text, f"ANSI escape in delta: {repr(text)}"
         # No BEL control char
         assert "\x07" not in text, f"Control char in delta: {repr(text)}"
+
+
+# ---------------------------------------------------------------------------
+# Test: Claude idle-after-final-response lifecycle fix (regression)
+# ---------------------------------------------------------------------------
+
+
+
+def _agents_entry_working_idle(session_id="f43e1980"):
+    """Claude agents entry with state=working, status=idle — the bug condition."""
+    return RunResult(
+        0,
+        json.dumps(
+            [
+                {
+                    "id": session_id,
+                    "sessionId": f"{session_id}-9fd6-4813-a6e6-3cb0d134de46",
+                    "state": "working",
+                    "status": "idle",
+                    "waitingFor": None,
+                    "cwd": "/repo",
+                    "startedAt": 1784739414928,
+                }
+            ]
+        ),
+        "",
+    )
+
+
+def test_monitor_finalizes_working_idle_with_final_response(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """When Claude reports state=working,status=idle with a final response in
+    logs, the monitor must detect the completed session and finalize it."""
+    final_output = (
+        "[Screen Reader Mode: on via flag]\n"
+        "$claude: Summary\n"
+        "\n"
+        "Here is the contract drift analysis for pandahome:\n"
+        "\n"
+        "The contract has three material changes:\n"
+        "1. Payment terms changed from net-30 to net-15\n"
+        "2. Liability cap increased from $100k to $250k\n"
+        "3. Termination notice period reduced from 90 to 30 days\n"
+        "\n"
+        "don't ask on (shift+tab to cycle) · esc to interrupt\n"
+        "1284 tokens\n"
+        "$Worked for 45s\n"
+    )
+    # Each poll: status + idle-detection get_logs + regular get_logs.
+    # Poll 3 triggers idle finalization (breaks before regular get_logs).
+    # Post-break: terminal block calls get_logs once more.
+    runner = FakeRunner([
+        _auth_ok(),
+        _launch_ok("f43e1980"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(final_output), _logs_ok(final_output),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(final_output), _logs_ok(final_output),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(final_output),
+        _logs_ok(final_output),
+    ])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run
+    )
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude", prompt="audit pandahome contract",
+        task="review", interactive=False, client_name="test",
+    )
+    assert result.get("ok") is True, result
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    final = store.get_result(job_id)
+    assert final["ok"] is True, (
+        f"Expected completed, got {final.get('status')}: {final.get('summary', '')[:200]}"
+    )
+    assert final["status"] == "completed"
+    assert "contract drift" in final.get("summary", "")
+
+    # Verify idle_finalized event was emitted
+    tail = store.job_tail(job_id)
+    idle_events = [e for e in tail["events"] if e["type"] == "idle_finalized"]
+    assert len(idle_events) >= 1, f"Expected idle_finalized event, got {[e['type'] for e in tail['events']]}"
+    assert idle_events[0]["data"]["consecutive_idle_polls"] >= 2
+
+
+def test_monitor_does_not_false_finalize_without_final_response(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """When Claude reports state=working,status=idle but logs contain NO
+    complete final response, the monitor must NOT falsely finalize."""
+    incomplete = (
+        "[Screen Reader Mode: on via flag]\n"
+        "$claude: Summary\n"
+        "esc to interrupt\n"
+        "0 tokens\n"
+        "$Worked for 2s\n"
+    )
+    runner = FakeRunner([
+        _auth_ok(),
+        _launch_ok("f43e1980"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(incomplete), _logs_ok(incomplete),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(incomplete), _logs_ok(incomplete),
+        _agents_entry_working_idle("f43e1980"), _logs_ok(incomplete), _logs_ok(incomplete),
+        _agents_entry("done", "f43e1980"), _logs_ok("eventual output"),
+    ])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run
+    )
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude", prompt="something", task="ask",
+        interactive=False, client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    final = store.get_result(job_id)
+    assert final["status"] == "completed"
+    tail = store.job_tail(job_id)
+    idle_events = [e for e in tail["events"] if e["type"] == "idle_finalized"]
+    assert len(idle_events) == 0, "Must not emit idle_finalized without final response"
+
+
+def test_monitor_resets_idle_counter_on_changed_logs(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """When logs change between working+idle polls, the idle counter resets."""
+    final_output = "[Screen Reader Mode: on via flag]\n$claude: Summary\ndone\n$Worked for 5s\n"
+    runner = FakeRunner([
+        _auth_ok(),
+        _launch_ok("f43e1980"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok("partial A"), _logs_ok("partial A"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok("partial B"), _logs_ok("partial B"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok("partial B"), _logs_ok("partial B"),
+        _agents_entry_working_idle("f43e1980"), _logs_ok("partial B"), _logs_ok("partial B"),
+        _agents_entry("done", "f43e1980"), _logs_ok(final_output),
+    ])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run
+    )
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude", prompt="something", task="ask",
+        interactive=False, client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    final = store.get_result(job_id)
+    assert final["status"] == "completed"
+    tail = store.job_tail(job_id)
+    idle_events = [e for e in tail["events"] if e["type"] == "idle_finalized"]
+    assert len(idle_events) == 0, (
+        "Must not finalize via idle when logs changed, resetting counter"
+    )
+
+
+def test_job_tail_preserves_log_delta_events_for_claude_bg(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """job_tail must surface incremental log_delta events emitted during
+    Claude bg polling — these were recently added and must be preserved."""
+    runner = FakeRunner([
+        _auth_ok(),
+        _launch_ok("a1b2c3d4"),
+        _agents_entry("working", "a1b2c3d4"), _logs_ok("\x1b[32mincremental\x1b[0m\n"), _logs_ok("\x1b[32mincremental\x1b[0m\n"),
+        _agents_entry("done", "a1b2c3d4"), _logs_ok("final output"),
+    ])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run
+    )
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude", prompt="test", task="ask",
+        interactive=False, client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    tail = store.job_tail(job_id)
+    delta_events = [e for e in tail["events"] if e["type"] == "log_delta"]
+    assert len(delta_events) >= 1, (
+        f"Must preserve log_delta events; got {[e['type'] for e in tail['events']]}"
+    )
+    for e in delta_events:
+        text = e["data"].get("text", "")
+        assert "\x1b" not in text, f"ANSI escape in delta: {repr(text)}"

@@ -80,6 +80,7 @@ def _run_adapter_job(
     deadline: float = time.monotonic() + effective_max_runtime
 
     last_logs = ""
+    _consecutive_idle = 0  # counter for working+idle detection
 
     try:
         while True:
@@ -149,6 +150,55 @@ def _run_adapter_job(
 
             if native_state in ("done", "failed", "stopped"):
                 break
+
+            # ── Claude idle-after-completion detection ──────────────────
+            # Claude may report state=working, process_status=idle even
+            # after producing a complete final response in the logs.
+            # Track consecutive unchanged idle polls and safely finalize
+            # when the logs contain a recoverable final response.
+            if native_state == "working" and status.get("process_status") == "idle":
+                try:
+                    idle_logs = adapter.get_logs(runner, session_id)
+                except Exception:
+                    idle_logs = last_logs
+                if idle_logs == last_logs:
+                    # Logs haven't changed since the previous poll → truly idle
+                    _consecutive_idle += 1
+                else:
+                    _consecutive_idle = 0
+                    last_logs = idle_logs
+
+                if _consecutive_idle >= 2:
+                    # Three consecutive idle polls with unchanged logs and a final
+                    # response in logs → treat as terminal completion.
+                    from agent_crossbar.adapters.claude import _screen_reader_final_response
+
+                    final_text = _screen_reader_final_response(
+                        _clean_provider_logs(idle_logs)
+                    )
+                    if final_text:
+                        store.send_event(
+                            job_id,
+                            level="info",
+                            type="idle_finalized",
+                            message=(
+                                "Claude session idle with complete final response; "
+
+                                "finalizing as completed"
+                            ),
+                            data={
+                                "consecutive_idle_polls": _consecutive_idle,
+                                "native_state": native_state,
+                                "process_status": status.get("process_status"),
+                            },
+                        )
+                        # Mutate status dict so the terminal block below sees
+                        # this as a completed session.
+                        status = dict(status)
+                        status["state"] = "done"
+                        break
+            elif native_state != "working" or status.get("process_status") != "idle":
+                _consecutive_idle = 0
 
             if native_state == "blocked":
                 meta_blocked = store._read_job_meta(store.get_job(job_id).path)

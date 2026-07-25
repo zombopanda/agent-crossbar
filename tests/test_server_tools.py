@@ -261,3 +261,48 @@ def test_job_stop_acp_persists_terminal_result(tmp_path, monkeypatch):
     assert result["status"] == "cancelled"
     assert result["stop_reason"] == "test_stop"
     assert result["technical"]["acp_stop"]["reason"] == "no_acp_pid_in_meta"
+
+
+def test_client_metadata_redacts_operator_token_in_session_id(monkeypatch):
+    """_client_metadata must replace operator token with redaction marker."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret-token")
+    from agent_crossbar.server import _client_metadata
+
+    meta = _client_metadata(
+        client=None,
+        client_name="test-client",
+        client_version="1.0",
+        client_session_id="op-secret-token",
+    )
+
+    assert meta["session_id"] == "[REDACTED:operator_token]"
+    assert meta["name"] == "test-client"
+    assert meta["version"] == "1.0"
+
+
+def test_client_metadata_preserves_ordinary_session_id(monkeypatch):
+    """_client_metadata must preserve session IDs that are not the operator token."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret-token")
+    from agent_crossbar.server import _client_metadata
+
+    meta = _client_metadata(
+        client=None,
+        client_name="test-client",
+        client_version="1.0",
+        client_session_id="ordinary-session-456",
+    )
+
+    assert meta["session_id"] == "ordinary-session-456"
+
+
+def test_client_metadata_redacts_operator_token_from_client_dict(monkeypatch):
+    """Operator token passed via client['session_id'] must also be redacted."""
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret-token")
+    from agent_crossbar.server import _client_metadata
+
+    meta = _client_metadata(
+        client={"session_id": "op-secret-token", "name": "override-me"},
+        client_name="test-client",
+    )
+
+    assert meta["session_id"] == "[REDACTED:operator_token]"
