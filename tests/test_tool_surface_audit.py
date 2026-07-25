@@ -85,6 +85,10 @@ def test_agent_start_preserves_cwd_and_effort(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(rmod, "probe_profile", fake_probe)
+    monkeypatch.setattr(
+        "agent_crossbar.acp_lifecycle.check_codex_acp_readiness",
+        lambda _runner: {"ready": True},
+    )
 
     # ask task with cwd and effort — maps to advice operation, reasonix supports it
     server.agent_start(
