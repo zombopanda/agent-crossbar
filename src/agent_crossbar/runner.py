@@ -2339,6 +2339,29 @@ def _monitor_tmux_job(
     consecutive_complete_observations = 0
     required_complete_observations = 10 if (profile or "").casefold() == "codex" else 1
     while True:
+        job = store.get_job(job_id)
+        if job is not None and store._read_job_meta(job.path).get("status") == "stopped":
+            cleanup = run(
+                ["tmux", "kill-session", "-t", session_name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            message = "Tmux monitor stopped after job_stop"
+            store.send_event(
+                job_id,
+                level="info",
+                type="tmux_exited",
+                message=message,
+                data={
+                    "tmux_session": session_name,
+                    "stopped": True,
+                    "tmux_cleanup": "killed"
+                    if _completed_returncode(cleanup) == 0
+                    else "kill_failed",
+                },
+            )
+            return {"ok": False, "error": "job_stopped", "message": message}
         try:
             alive = run(
                 ["tmux", "has-session", "-t", session_name],
@@ -2556,6 +2579,16 @@ def run_tmux_job(
     job = store.get_job(job_id)
     if job is None:
         return {"ok": False, "error": "job_not_found", "job_id": job_id}
+    if store._read_job_meta(job.path).get("status") == "stopped":
+        message = "Tmux provider execution skipped because job_stop was already requested"
+        store.send_event(
+            job_id,
+            level="info",
+            type="tmux_start_skipped",
+            message=message,
+            data={"tmux_session": _tmux_session_name(job_id), "stopped": True},
+        )
+        return {"ok": False, "error": "job_stopped", "message": message}
 
     candidates, plan_error = _tmux_candidates(req, job.path)
     if not candidates:
@@ -2617,6 +2650,35 @@ def run_tmux_job(
         )
         if _completed_returncode(result) != 0:
             continue
+
+        # ``job_stop`` may run after the worker starts but before tmux has
+        # created its session.  Re-check immediately after creation so a
+        # session cannot outlive a job that has already been stopped.
+        current_job = store.get_job(job_id)
+        if (
+            current_job is not None
+            and store._read_job_meta(current_job.path).get("status") == "stopped"
+        ):
+            cleanup = run(
+                ["tmux", "kill-session", "-t", session_name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            message = "Tmux session removed because job_stop was requested during startup"
+            store.send_event(
+                job_id,
+                level="info",
+                type="tmux_start_cancelled",
+                message=message,
+                data={
+                    "tmux_session": session_name,
+                    "tmux_cleanup": "killed"
+                    if _completed_returncode(cleanup) == 0
+                    else "kill_failed",
+                },
+            )
+            return {"ok": False, "error": "job_stopped", "message": message}
 
         target_ready = _wait_for_tmux_target(target, run=run, sleep=sleep)
         pipe_result = run(
@@ -3019,6 +3081,21 @@ def start_tmux_job(
     complete_on_output: bool = True,
 ) -> threading.Thread:
     """Start a tmux job in the background and return the worker thread."""
+    job = store.get_job(job_id)
+    if job is not None:
+        # Store the deterministic session identity before exposing the job to
+        # callers.  That makes job_stop effective even if it races the worker
+        # before ``tmux new-session`` completes.
+        store.update_job_meta(
+            job_id,
+            {
+                "tmux_session": _tmux_session_name(job_id),
+                "tmux_target": _tmux_session_name(job_id),
+                "tmux_transcript_path": str(job.path / "transcript.jsonl"),
+                "tmux_output_path": str(job.path / "tmux-output.log"),
+                "tmux_exit_status_path": str(job.path / "tmux-exit-status.txt"),
+            },
+        )
     thread = threading.Thread(
         target=run_tmux_job,
         kwargs={

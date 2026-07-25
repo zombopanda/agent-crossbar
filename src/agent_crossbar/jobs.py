@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -194,12 +195,35 @@ class JobStore:
             return {}
 
     def _write_job_meta(self, job_dir: Path, meta: dict[str, Any]) -> None:
-        """Write meta.json with restricted permissions."""
+        """Atomically write meta.json with restricted permissions."""
         meta_path = job_dir / "meta.json"
-        fd = os.open(str(meta_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+        tmp_path = job_dir / f".meta-{os.getpid()}-{threading.get_ident()}.tmp"
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(meta, separators=(",", ":")) + "\n")
+        os.replace(tmp_path, meta_path)
         meta_path.chmod(_FILE_MODE)
+
+    @contextmanager
+    def _job_meta_lock(self, job_dir: Path):
+        """Serialize metadata state transitions across store instances."""
+        lock_path = job_dir / ".meta.lock"
+        with self._lock:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, _FILE_MODE)
+            try:
+                try:
+                    import fcntl
+                except ImportError:  # pragma: no cover - Windows fallback
+                    fcntl = None
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def _safe_job_artifact_path(self, job: Job, value: Any, fallback_name: str) -> Path:
         """Resolve a job-local artifact path, ignoring unsafe metadata paths."""
@@ -287,9 +311,10 @@ class JobStore:
         job = self.get_job(job_id)
         if job is None:
             return {"ok": False, "error": "job_not_found", "job_id": job_id}
-        meta = self._read_job_meta(job.path)
-        meta.update(updates)
-        self._write_job_meta(job.path, meta)
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            meta.update(updates)
+            self._write_job_meta(job.path, meta)
         return {"ok": True, "job_id": job_id}
 
     def _refresh_known_ids_locked(self) -> None:
@@ -558,30 +583,31 @@ class JobStore:
         # Guard: never overwrite a terminal status — a stopped job must not be
         # resurrected by a late-arriving background completion.  Check BEFORE
         # writing result.json so the file system is never touched on a terminal job.
-        meta = self._read_job_meta(job.path)
-        current_status = meta.get("status", "running")
-        if current_status not in ("running", None, ""):
-            return {
-                "ok": False,
-                "error": "job_already_terminal",
-                "job_id": job_id,
-                "current_status": current_status,
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            current_status = meta.get("status", "running")
+            if current_status not in ("running", None, ""):
+                return {
+                    "ok": False,
+                    "error": "job_already_terminal",
+                    "job_id": job_id,
+                    "current_status": current_status,
+                }
+            result_data: dict[str, Any] = {
+                "ok": ok,
+                "summary": summary,
+                "artifacts": artifacts or [],
+                "ts": datetime.now(timezone.utc).isoformat(),
             }
-        result_data: dict[str, Any] = {
-            "ok": ok,
-            "summary": summary,
-            "artifacts": artifacts or [],
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        if envelope is not None:
-            result_data["envelope"] = envelope
-        result_path = job.path / "result.json"
-        fd = os.open(str(result_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(result_data, separators=(",", ":")) + "\n")
-        result_path.chmod(_FILE_MODE)
-        meta["status"] = "succeeded" if ok else "failed"
-        self._write_job_meta(job.path, meta)
+            if envelope is not None:
+                result_data["envelope"] = envelope
+            result_path = job.path / "result.json"
+            fd = os.open(str(result_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(result_data, separators=(",", ":")) + "\n")
+            result_path.chmod(_FILE_MODE)
+            meta["status"] = "succeeded" if ok else "failed"
+            self._write_job_meta(job.path, meta)
         job.events.write(level="info", type="result", message=summary, data=result_data)
         return {"ok": True, "job_id": job_id}
 
@@ -723,6 +749,16 @@ class JobStore:
             self._inject_cross_session_note(result, cross_session_note)
             return result
         meta = self._read_job_meta(job.path)
+        if meta.get("status") == "stopped":
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "status": "stopped",
+                "stop_reason": meta.get("stop_reason", "user_cancelled"),
+                "summary": f"Job stopped: {meta.get('stop_reason', 'user_cancelled')}",
+                "artifacts": [],
+                "warnings": [],
+            }
         result_path = job.path / "result.json"
         if not result_path.exists():
             self._finalize_completed_tmux_job(job)
@@ -878,7 +914,14 @@ class JobStore:
             result = {"ok": False, "error": "job_not_found", "job_id": job_id}
             self._inject_cross_session_note(result, cross_session_note)
             return result
-        meta = self._read_job_meta(job.path)
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            # Make a stop terminal before attempting provider cleanup. A runner
+            # that observes its process exit while cleanup is in flight must not
+            # publish a late success over the caller's explicit stop request.
+            meta["status"] = "stopped"
+            meta["stop_reason"] = reason
+            self._write_job_meta(job.path, meta)
         data: dict[str, Any] = {"reason": reason}
         tmux_session = meta.get("tmux_session")
         if job.transport == "tmux" and tmux_session:
@@ -932,9 +975,6 @@ class JobStore:
                 data["print_stop"] = "error"
                 data["print_stop_error"] = str(exc)
 
-        meta["status"] = "stopped"
-        meta["stop_reason"] = reason
-        self._write_job_meta(job.path, meta)
         job.events.write(
             level="info",
             type="stopped",

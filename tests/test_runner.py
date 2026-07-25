@@ -1091,6 +1091,82 @@ def test_job_stop_kills_recorded_tmux_session(tmp_path, monkeypatch):
     assert stopped["data"]["tmux_stop"] == "killed"
 
 
+def test_start_tmux_job_records_session_before_background_worker(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="tmux")
+
+    class NoStartThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(runner_module.threading, "Thread", NoStartThread)
+
+    runner_module.start_tmux_job(
+        store,
+        job.job_id,
+        {"profile": "reasonix", "operation": "dev", "transport": "tmux"},
+    )
+
+    meta = json.loads((job.path / "meta.json").read_text())
+    assert meta["tmux_session"] == f"agents-{job.job_id}"
+    assert meta["tmux_output_path"] == str(job.path / "tmux-output.log")
+
+
+def test_run_tmux_job_does_not_start_after_prior_stop(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="tmux")
+    store.stop_job(job.job_id, reason="test_stop")
+
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("tmux must not start after job_stop")
+
+    result = runner_module.run_tmux_job(
+        store,
+        job.job_id,
+        {
+            "profile": "reasonix",
+            "operation": "dev",
+            "transport": "tmux",
+            "prompt": "Reply OK.",
+            "model": "deepseek-v4-flash",
+            "cwd": str(tmp_path),
+        },
+        run=should_not_run,
+    )
+
+    assert result["error"] == "job_stopped"
+    assert store.job_tail(job.job_id)["status"] == "stopped"
+
+
+def test_tmux_monitor_stops_without_waiting_for_session_exit(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="tmux")
+    store.stop_job(job.job_id, reason="test_stop")
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        return _completed("")
+
+    result = runner_module._monitor_tmux_job(
+        store,
+        job.job_id,
+        session_name=f"agents-{job.job_id}",
+        output_path=job.path / "tmux-output.log",
+        transcript_path=job.path / "transcript.jsonl",
+        exit_status_path=job.path / "tmux-exit-status.txt",
+        run=fake_run,
+        sleep=lambda _seconds: None,
+        poll_interval_sec=0,
+    )
+
+    assert result["error"] == "job_stopped"
+    assert ["tmux", "has-session", "-t", f"agents-{job.job_id}"] not in calls
+
+
 def test_job_stop_terminates_recorded_print_process_group(tmp_path, monkeypatch):
     store = JobStore(tmp_path)
     job = store.create_job(profile="reasonix", operation="review", transport="print")

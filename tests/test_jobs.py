@@ -1,3 +1,6 @@
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 import agent_crossbar.jobs as jobs_module
@@ -357,6 +360,102 @@ def test_get_result_lazy_finalizes_completed_tmux_job(tmp_path):
     tail = store.job_tail(job.job_id)
     assert tail["status"] == "succeeded"
     assert [event["type"] for event in tail["events"]][-2:] == ["tmux_exited", "result"]
+
+
+def test_get_result_keeps_stopped_status_over_existing_provider_result(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="tmux")
+    assert store.set_result(job.job_id, ok=True, summary="late success")["ok"] is True
+    store.update_job_meta(job.job_id, {"status": "stopped", "stop_reason": "user_cancelled"})
+
+    result = store.get_result(job.job_id)
+
+    assert result["ok"] is True
+    assert result["status"] == "stopped"
+    assert result["stop_reason"] == "user_cancelled"
+
+
+def test_stop_marks_terminal_before_tmux_termination(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="dev", transport="tmux")
+    store.update_job_meta(job.job_id, {"tmux_session": "agents-stop-order"})
+
+    def fake_run(args, **_kwargs):
+        if args[:3] == ["tmux", "has-session", "-t"]:
+            late_result = store.set_result(job.job_id, ok=True, summary="late success")
+            assert late_result["error"] == "job_already_terminal"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    stopped = store.stop_job(job.job_id, reason="user_cancelled", run=fake_run)
+
+    assert stopped["ok"] is True
+    assert store.get_result(job.job_id)["status"] == "stopped"
+
+
+def test_stop_cannot_be_overwritten_by_inflight_provider_completion(tmp_path, monkeypatch):
+    producer = JobStore(tmp_path)
+    stopper = JobStore(tmp_path)
+    job = producer.create_job(profile="reasonix", operation="dev", transport="tmux")
+    ready = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+    original_write = producer._write_job_meta
+
+    def paused_write(job_dir, meta):
+        ready.set()
+        assert release.wait(timeout=2)
+        original_write(job_dir, meta)
+
+    monkeypatch.setattr(producer, "_write_job_meta", paused_write)
+    producer_thread = threading.Thread(
+        target=lambda: producer.set_result(job.job_id, ok=True, summary="late success")
+    )
+    stop_thread = threading.Thread(target=lambda: (stopper.stop_job(job.job_id), stopped.set()))
+
+    producer_thread.start()
+    assert ready.wait(timeout=2)
+    stop_thread.start()
+    assert not stopped.wait(timeout=0.1)
+    release.set()
+    producer_thread.join(timeout=2)
+    stop_thread.join(timeout=2)
+
+    assert stopped.is_set()
+    assert stopper.get_result(job.job_id)["status"] == "stopped"
+
+
+def test_tmux_metadata_update_cannot_overwrite_inflight_stop(tmp_path, monkeypatch):
+    starter = JobStore(tmp_path)
+    stopper = JobStore(tmp_path)
+    job = starter.create_job(profile="reasonix", operation="dev", transport="tmux")
+    ready = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+    original_write = starter._write_job_meta
+
+    def paused_write(job_dir, meta):
+        ready.set()
+        assert release.wait(timeout=2)
+        original_write(job_dir, meta)
+
+    monkeypatch.setattr(starter, "_write_job_meta", paused_write)
+    metadata_thread = threading.Thread(
+        target=lambda: starter.update_job_meta(job.job_id, {"tmux_session": "agents-test"})
+    )
+    stop_thread = threading.Thread(target=lambda: (stopper.stop_job(job.job_id), stopped.set()))
+
+    metadata_thread.start()
+    assert ready.wait(timeout=2)
+    stop_thread.start()
+    assert not stopped.wait(timeout=0.1)
+    release.set()
+    metadata_thread.join(timeout=2)
+    stop_thread.join(timeout=2)
+
+    assert stopped.is_set()
+    meta = stopper._read_job_meta(job.path)
+    assert meta["status"] == "stopped"
+    assert meta["tmux_session"] == "agents-test"
 
 
 def test_get_result_lazy_finalizes_interactive_tmux_output_without_exit_status(tmp_path):
