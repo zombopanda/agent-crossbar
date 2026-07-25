@@ -96,7 +96,6 @@ def test_tmux_transport_rejected_for_non_interactive_profiles(tmp_path):
     """Profiles with interactive=False must reject tmux transport."""
     cases = (
         _base_request(profile="codex", operation="review", transport="tmux"),
-        _base_request(profile="claude", operation="review", transport="tmux"),
         _base_request(profile="opencode", operation="review", transport="tmux"),
     )
     for req in cases:
@@ -187,7 +186,7 @@ def test_claude_aliases_and_models(tmp_path):
         "claude-haiku-4-5",
     ]
     assert profiles["claude"]["operations"] == ["review", "advice", "dev"]
-    assert profiles["claude"]["interactive"] is False
+    assert profiles["claude"]["interactive"] is True
 
     # Aliases resolve to canonical claude profile
     for profile in ("claude", "opus", "fable"):
@@ -290,12 +289,12 @@ def test_claude_matrix_reports_claude_bg_backend():
     )
 
 
-def test_claude_matrix_job_send_not_supported():
-    """Claude claude_bg backend must report job_send_supported=False."""
+def test_claude_matrix_job_send_supported():
+    """Claude's native background attach path truthfully supports job_send."""
     from agent_crossbar.profiles import PROVIDER_SUPPORT_MATRIX
 
-    assert PROVIDER_SUPPORT_MATRIX["claude"].get("job_send_supported") is False, (
-        "Claude claude_bg must declare job_send_supported=False"
+    assert PROVIDER_SUPPORT_MATRIX["claude"].get("job_send_supported") is True, (
+        "Claude claude_bg must declare job_send_supported=True"
     )
 
 
@@ -395,11 +394,11 @@ def test_reasonix_matrix_supports_both_interaction_modes():
     assert entry["job_send_supported"] is True
 
 
-def test_noninteractive_only_profiles_do_not_support_job_send():
-    """Claude, Codex, OpenCode, and ChatGPT Pro are single-shot: noninteractive only."""
+def test_single_shot_profiles_do_not_support_job_send():
+    """Codex, OpenCode, and ChatGPT Pro are single-shot: noninteractive only."""
     from agent_crossbar.profiles import PROVIDER_SUPPORT_MATRIX
 
-    for provider in ("claude", "codex", "opencode", "chatgpt_pro"):
+    for provider in ("codex", "opencode", "chatgpt_pro"):
         entry = PROVIDER_SUPPORT_MATRIX[provider]
         assert entry["interaction_modes"] == ["noninteractive"], provider
         assert entry["job_send_supported"] is False, provider

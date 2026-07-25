@@ -451,10 +451,24 @@ def test_job_stop_calls_adapter_cancel_for_claude_bg_jobs(
 # ---------------------------------------------------------------------------
 
 
-def test_agent_start_rejects_interactive_claude_before_attach_ready(
-    claude_state_root: Path, monkeypatch
+def test_agent_start_accepts_interactive_claude_and_launches_tmux_attach(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
 ):
-    """Prove interactive=true is rejected with interactive_not_supported."""
+    """Prove interactive=true Claude launch succeeds and stores tmux metadata."""
+    runner = FakeRunner([_auth_ok(), _launch_ok("cafebabe")])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    # Mock tmux calls to avoid real tmux dependency
+    mock_tmux_result = type("Result", (), {"returncode": 0, "stderr": ""})()
+
+    def fake_tmux(*args, **kwargs):
+        return mock_tmux_result
+
+    monkeypatch.setattr("subprocess.run", fake_tmux)
+
     result = agent_start(
         profile="claude",
         prompt="do thing",
@@ -463,18 +477,66 @@ def test_agent_start_rejects_interactive_claude_before_attach_ready(
         client_name="test",
     )
 
-    assert result.get("ok") is False, result
-    assert "interactive_not_supported" in str(result.get("error", "")), (
-        f"Expected interactive_not_supported error, got {result}"
+    assert result.get("ok") is True, result
+    assert result.get("backend") == "claude_bg_pty"
+
+    # Verify job meta stores tmux session info
+    store = JobStore(claude_state_root)
+    job = store.get_job(result["job_id"])
+    assert job is not None
+    meta = store._read_job_meta(job.path)
+    assert meta.get("interactive") is True
+    assert meta.get("tmux_session") is not None
+    assert "agents-" in meta["tmux_session"]
+    assert meta.get("transport") == "tmux"
+    assert meta.get("native_session_id") == "cafebabe"
+
+
+def test_interactive_claude_job_send_routes_to_tmux(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """job_send for interactive Claude routes to tmux send-keys."""
+    runner = FakeRunner([_auth_ok(), _launch_ok("feedface")])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    mock_tmux_result = type("Result", (), {"returncode": 0, "stderr": ""})()
+
+    def fake_tmux(*args, **kwargs):
+        return mock_tmux_result
+
+    monkeypatch.setattr("subprocess.run", fake_tmux)
+
+    result = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
+        interactive=True,
+        client_name="test",
+    )
+
+    assert result.get("ok") is True
+    job_id = result["job_id"]
+
+    # Now send input — should succeed via tmux send-keys
+    send_result = job_send(
+        job_id=job_id,
+        text="more input please",
+        client_name="test",
+    )
+
+    assert send_result.get("ok") is True, (
+        f"Expected job_send to succeed for interactive Claude, got {send_result}"
     )
 
 
-def test_job_send_rejects_claude_bg_job(
+def test_noninteractive_claude_job_send_still_rejected(
     claude_state_root: Path, monkeypatch, suppress_background_monitor
 ):
-    """job_send must reject Claude bg jobs without a working attach path."""
+    """Non-interactive Claude bg jobs must still reject job_send."""
     runner = FakeRunner([_auth_ok(), _launch_ok("feedface")])
-
     monkeypatch.setattr(
         "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
         runner.run,
@@ -491,18 +553,129 @@ def test_job_send_rejects_claude_bg_job(
     assert result.get("ok") is True
     job_id = result["job_id"]
 
-    # job_send should reject because Claude bg has no send path yet
+    # job_send should reject non-interactive Claude bg
     send_result = job_send(
         job_id=job_id,
         text="more input",
         client_name="test",
     )
 
-    assert send_result.get("ok") is False
-    assert (
-        "not_available" in str(send_result.get("error", ""))
-        or "interactive" in str(send_result.get("error", "")).lower()
+    assert send_result.get("ok") is False, (
+        f"Expected job_send to fail for non-interactive Claude, got {send_result}"
     )
+
+
+def test_interactive_claude_launch_tmux_failure_propagates(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """When tmux session creation fails, the error propagates to agent_start."""
+    runner = FakeRunner([_auth_ok(), _launch_ok("deadbeef"), _cancel_ok()])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    # Mock tmux failure
+    mock_fail = type("Result", (), {"returncode": 1, "stderr": "tmux: command not found"})()
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_fail)
+
+    result = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
+        interactive=True,
+        client_name="test",
+    )
+
+    assert result.get("ok") is False, result
+    assert result.get("error") == "tmux_launch_failed"
+    assert any(call["args"][:2] == ["claude", "stop"] for call in runner.calls)
+
+
+def test_interactive_claude_job_stop_kills_tmux_and_native_session(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """job_stop for interactive Claude kills tmux session and calls claude stop."""
+    runner = FakeRunner([
+        _auth_ok(),
+        _launch_ok("cafebabe"),
+        _cancel_ok(),  # claude stop call
+    ])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    tmux_calls = []
+
+    def fake_tmux(args, **kwargs):
+        tmux_calls.append(args)
+        return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_tmux)
+
+    result = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
+        interactive=True,
+        client_name="test",
+    )
+
+    assert result.get("ok") is True
+    job_id = result["job_id"]
+
+    # Call job_stop
+    stop_result = job_stop(
+        job_id=job_id,
+        reason="user_cancelled",
+        client_name="test",
+    )
+
+    assert stop_result.get("ok") is True, stop_result
+
+    # Verify tmux kill-session was called
+    kill_calls = [c for c in tmux_calls if c[:2] == ["tmux", "kill-session"]]
+    assert len(kill_calls) >= 1, f"Expected tmux kill-session, got {tmux_calls}"
+
+    # Verify claude stop was called
+    cancel_calls = [c for c in runner.calls if c["args"][:2] == ["claude", "stop"]]
+    assert len(cancel_calls) >= 1, f"Expected claude stop call, got {runner.calls}"
+
+
+def test_foreign_session_cannot_cancel_interactive_claude_job(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """Ownership is checked before Claude or tmux receive any stop command."""
+    runner = FakeRunner([_auth_ok(), _launch_ok("cafebabe")])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+    tmux_calls = []
+
+    def fake_tmux(args, **kwargs):
+        tmux_calls.append(args)
+        return type("Result", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr("subprocess.run", fake_tmux)
+    started = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
+        interactive=True,
+        client_session_id="owner-session",
+    )
+
+    stopped = job_stop(
+        job_id=started["job_id"],
+        reason="foreign_attempt",
+        client_session_id="other-session",
+    )
+
+    assert stopped["error"] == "job_not_found"
+    assert not [call for call in runner.calls if call["args"][:2] == ["claude", "stop"]]
+    assert not [call for call in tmux_calls if call[:2] == ["tmux", "kill-session"]]
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1347,73 @@ def test_monitor_log_delta_handles_empty_or_identical_logs_gracefully(
     final = store.get_result(job_id)
     assert final.get("ok") is True
     assert final.get("summary") == "final result"
+
+
+def test_monitor_log_delta_deduplicates_sliding_log_tails(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """A bounded provider log tail must not re-emit its overlapping prefix."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00025"),
+            _agents_entry("working", "a1b00025"),
+            _logs_ok("line 1\nline 2\n"),
+            _agents_entry("working", "a1b00025"),
+            _logs_ok("line 2\nline 3\n"),
+            _agents_entry("done", "a1b00025"),
+            _logs_ok("line 2\nline 3\nfinal result"),
+        ]
+    )
+    monkeypatch.setattr("agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run)
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    job_id = agent_start(
+        profile="claude", prompt="sliding logs", task="ask", interactive=False, client_name="test"
+    )["job_id"]
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+    deltas = [
+        event["data"]["text"]
+        for event in store.job_tail(job_id)["events"]
+        if event["type"] == "log_delta"
+    ]
+    assert deltas == ["line 1\nline 2", "line 3"]
+
+
+def test_monitor_emits_working_heartbeat_when_provider_is_silent(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """A silent but working provider remains observable without being stopped."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00026"),
+            _agents_entry("working", "a1b00026"),
+            _logs_ok(""),
+            _agents_entry("done", "a1b00026"),
+            _logs_ok("finished after quiet reasoning"),
+        ]
+    )
+    monkeypatch.setattr("agent_crossbar.adapters.claude.LocalSubprocessRunner.run", runner.run)
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    job_id = agent_start(
+        profile="claude", prompt="quiet reasoning", task="ask", interactive=False, client_name="test"
+    )["job_id"]
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+    events = store.job_tail(job_id)["events"]
+    heartbeats = [event for event in events if event["type"] == "provider_heartbeat"]
+    assert len(heartbeats) == 1
+    assert heartbeats[0]["data"]["native_state"] == "working"
+    assert not any(call["args"][:2] == ["claude", "stop"] for call in runner.calls)
 
 
 def test_monitor_log_delta_survives_get_logs_failure(

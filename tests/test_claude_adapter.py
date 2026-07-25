@@ -266,6 +266,91 @@ def test_result_normalization_uses_state_and_waiting_for() -> None:
     assert result.waiting_for == "permission prompt"
 
 
+
+
+# ── Interactive support ────────────────────────────────────────────────
+
+def test_adapter_supports_interactive():
+    """ClaudeAdapter must report supports_interactive=True."""
+    assert ClaudeAdapter().supports_interactive is True
+
+
+def test_interactive_launch_uses_claude_bg_pty_backend():
+    """Interactive launch must set backend=claude_bg_pty."""
+    plan = build_claude_launch(
+        model="claude-opus-5",
+        task="ask",
+        prompt="hello",
+        cwd="/repo",
+        interactive=True,
+    )
+
+    assert plan.error is None
+    assert plan.backend == "claude_bg_pty"
+    # Still uses claude --bg, not -p
+    assert plan.args[:2] == ["claude", "--bg"]
+    assert "-p" not in plan.args
+
+
+def test_interactive_launch_extracts_session_id_with_pty_backend():
+    """Interactive launch returns backend=claude_bg_pty with session_id."""
+    runner = FakeRunner(
+        [RunResult(0, "backgrounded · deadbeef · relay-test\n  claude attach deadbeef\n", "")]
+    )
+    adapter = ClaudeAdapter()
+
+    result = adapter.launch(
+        runner,
+        model="claude-sonnet-5",
+        task="dev",
+        prompt="build feature",
+        cwd="/repo",
+        interactive=True,
+    )
+
+    assert result.session_id == "deadbeef"
+    assert result.backend == "claude_bg_pty"
+    assert result.error is None
+
+
+def test_launch_interactive_dev_preserves_permission_mode():
+    """Interactive dev task must still set permission_mode=auto."""
+    plan = build_claude_launch(
+        model="claude-sonnet-5",
+        task="dev",
+        prompt="implement",
+        cwd="/repo",
+        interactive=True,
+    )
+
+    assert plan.error is None
+    assert plan.permission_mode == "auto"
+
+
+def test_interactive_attach_fails_when_tty_output_cannot_be_piped(monkeypatch, tmp_path):
+    """A Claude attach without captured output must be torn down and rejected."""
+    from agent_crossbar.adapters.claude import start_claude_interactive_tmux
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["tmux", "pipe-pane"]:
+            return RunResult(1, "", "cannot pipe pane")
+        return RunResult(0, "", "")
+
+    monkeypatch.setattr("agent_crossbar.adapters.claude.subprocess.run", fake_run)
+    result = start_claude_interactive_tmux(
+        session_id="deadbeef",
+        job_id="test-job",
+        cwd="/repo",
+        tmux_session_name="agents-test-job",
+        output_path=tmp_path / "tmux-output.log",
+    )
+
+    assert result.returncode == 1
+    assert ["tmux", "kill-session", "-t", "agents-test-job"] in calls
+
 # ── Task 3.6: Claude effort in launch argv + catalog exposure (TDD) ──
 
 

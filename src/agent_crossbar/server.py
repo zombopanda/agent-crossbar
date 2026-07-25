@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 import threading
 import time
 import uuid
@@ -17,7 +18,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from agent_crossbar.acp_runtime import run_acp_job as _run_acp_job
-from agent_crossbar.adapters.claude import LocalSubprocessRunner
+from agent_crossbar.adapters.claude import LocalSubprocessRunner, start_claude_interactive_tmux
 from agent_crossbar.adapters.registry import get_adapter
 from agent_crossbar.agent_runner import start_agent_job
 from agent_crossbar.discovery import (
@@ -85,16 +86,13 @@ def _client_metadata(
 
 
 def _redact_operator_session_id(data: dict[str, Any]) -> None:
-    """Redact session_id if it matches the configured operator token."""
-    sid = data.get("session_id")
-    if sid is None:
+    """Do not persist an operator token in telemetry metadata."""
+    session_id = data.get("session_id")
+    if session_id is None:
         return
-    import secrets
+    from agent_crossbar.jobs import _is_operator_session
 
-    from agent_crossbar.env_compat import getenv
-
-    token = getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
-    if token is not None and secrets.compare_digest(sid, token):
+    if _is_operator_session(str(session_id)):
         data["session_id"] = "[REDACTED:operator_token]"
 
 
@@ -568,7 +566,7 @@ def agent_start(
                 prompt=prompt,
                 cwd=effective_cwd,
                 effort=resolved_effort,
-                interactive=False,
+                interactive=interactive,
             )
             if launch_result.error:
                 return _tool_error(
@@ -585,15 +583,66 @@ def agent_start(
 
             # Create durable job
             store = _job_store()
+            effective_transport = "tmux" if interactive else launch_result.backend
+
             job = store.create_job(
                 profile=result["profile"],
                 operation=result["operation"],
-                transport=launch_result.backend,
+                transport=effective_transport,
                 sensitivity=run_req["sensitivity"],
                 client_session_id=_effective_client_session_id(client, client_session_id),
                 client_name=_client_metadata(client, client_name)["name"],
                 cwd=effective_cwd,
             )
+
+            # ── Interactive: launch tmux claude attach session ──
+            tmux_session_name: str | None = None
+            if interactive:
+                safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", job.job_id).strip("-")
+                tmux_session_name = f"agents-{safe_id}"
+                output_path = job.path / "tmux-output.log"
+                tmux_result = start_claude_interactive_tmux(
+                    session_id=session_id,
+                    job_id=job.job_id,
+                    cwd=effective_cwd,
+                    tmux_session_name=tmux_session_name,
+                    output_path=output_path,
+                )
+                if tmux_result.returncode != 0:
+                    # The native background session already exists. Roll it
+                    # back before exposing a failed start so a retry cannot
+                    # duplicate a still-running provider turn.
+                    try:
+                        cancelled = adapter.cancel(runner, session_id)
+                    except Exception as exc:
+                        cancelled = False
+                        store.send_event(
+                            job.job_id,
+                            level="error",
+                            type="cancel_error",
+                            message=f"Rollback cancel threw: {exc}",
+                            data={"session_id": session_id},
+                        )
+                    if not cancelled:
+                        store.send_event(
+                            job.job_id,
+                            level="warn",
+                            type="cancel_warning",
+                            message="Rollback cancel failed; native session may still be running",
+                            data={"session_id": session_id},
+                        )
+                    store.set_result(
+                        job.job_id,
+                        ok=False,
+                        summary=f"tmux session creation failed: {tmux_result.stderr[:500]}",
+                    )
+                    return {
+                        "ok": False,
+                        "error": "tmux_launch_failed",
+                        "message": tmux_result.stderr[:500],
+                        "job_id": job.job_id,
+                    }
+
             store.update_job_meta(
                 job.job_id,
                 {
@@ -606,6 +655,10 @@ def agent_start(
                     "cwd": effective_cwd,
                     "adapter_name": adapter.name,
                     "max_runtime_sec": max_runtime_sec,
+                    **({"tmux_session": tmux_session_name,
+                        "tmux_output_path": str(output_path),
+                        "transport": "tmux",
+                       } if interactive else {}),
                 },
             )
             job.events.write(
@@ -618,10 +671,10 @@ def agent_start(
                     "transport": run_req["transport"],
                     "backend": launch_result.backend,
                     "native_session_id": session_id,
+                    **({"tmux_session": tmux_session_name} if interactive else {}),
                 },
             )
 
-            # Start background monitor
             start_agent_job(
                 store,
                 job.job_id,
@@ -1015,19 +1068,16 @@ def job_send(
 
     def _handle() -> dict[str, Any]:
         store = _job_store()
-        job = store.get_job(job_id)
+        effective_session_id = _effective_client_session_id(client, client_session_id)
+        job, cross_session_note = store._get_owned_job(job_id, effective_session_id)
         if job is None:
-            return {
-                "ok": False,
-                "error": "job_not_found",
-                "job_id": job_id,
-                "warnings": [],
-                "job_created": False,
-            }
+            result = {"ok": False, "error": "job_not_found", "job_id": job_id}
+            store._inject_cross_session_note(result, cross_session_note)
+            return result
         return store.send_user_input(
             job_id,
             text,
-            client_session_id=_effective_client_session_id(client, client_session_id),
+            client_session_id=effective_session_id,
         )
 
     return _run_logged_tool(
@@ -1054,9 +1104,12 @@ def job_stop(
 
     def _handle() -> dict[str, Any]:
         store = _job_store()
-        job = store.get_job(job_id)
+        effective_session_id = _effective_client_session_id(client, client_session_id)
+        job, cross_session_note = store._get_owned_job(job_id, effective_session_id)
         if job is None:
-            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+            result = {"ok": False, "error": "job_not_found", "job_id": job_id}
+            store._inject_cross_session_note(result, cross_session_note)
+            return result
         meta = store._read_job_meta(job.path)
 
         # Do not terminate already-terminal jobs
@@ -1071,7 +1124,7 @@ def job_stop(
 
         # Native lifecycle: cancel via adapter before marking stopped
         backend = meta.get("backend")
-        if backend == "claude_bg":
+        if backend in ("claude_bg", "claude_bg_pty"):
             session_id = meta.get("native_session_id")
             if session_id:
                 try:
@@ -1156,7 +1209,7 @@ def job_stop(
         return store.stop_job(
             job_id,
             reason=reason,
-            client_session_id=_effective_client_session_id(client, client_session_id),
+            client_session_id=effective_session_id,
         )
 
     return _run_logged_tool(

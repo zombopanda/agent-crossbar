@@ -14,7 +14,7 @@ def build_entry() -> dict:
         # rollout, so an unavailable probe is represented by an empty list.
         "models": [],
         "operations": ["review", "advice", "dev"],
-        "interactive": False,
+        "interactive": True,
         "support_tier": SUPPORT_TIER,
     }
 
@@ -26,8 +26,8 @@ def build_matrix_entry() -> dict:
         "os": ["darwin", "linux"],
         "operations": entry["operations"],
         "backend": "claude_bg",
-        "interaction_modes": ["noninteractive"],
+        "interaction_modes": ["noninteractive", "interactive"],
         "effort_support": True,
         "billing_mode": "subscription_quota",
-        "job_send_supported": False,
+        "job_send_supported": True,
     }

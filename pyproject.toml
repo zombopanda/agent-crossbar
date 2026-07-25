@@ -1,6 +1,6 @@
 [project]
 name = "agent-crossbar"
-version = "0.3.2"
+version = "0.3.3"
 description = "Agent Crossbar — delegate review, advice, text, and dev work to local coding agents through MCP"
 requires-python = ">=3.11"
 dependencies = [

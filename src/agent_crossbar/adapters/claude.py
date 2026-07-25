@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from ..profiles.claude import SUPPORT_TIER
@@ -384,13 +386,61 @@ def normalize_claude_result(entry: dict[str, Any], logs: str) -> NormalizedResul
     )
 
 
+
+def start_claude_interactive_tmux(
+    *,
+    session_id: str,
+    job_id: str,
+    cwd: str,
+    tmux_session_name: str,
+    output_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    """Start a harness-owned tmux session running claude attach <session_id>.
+
+    The tmux session is created detached (-d); output is captured via
+    pipe-pane into *output_path*.  Callers are responsible for
+    verifying the result and recording the session name in job meta.
+    """
+    args: list[str] = [
+        "tmux", "new-session", "-d", "-s", tmux_session_name,
+        "-c", cwd,
+        "claude", "attach", session_id,
+    ]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        return result
+
+    pipe_result = subprocess.run(
+        ["tmux", "pipe-pane", "-t", tmux_session_name, "-o",
+         f"cat >> {shlex.quote(str(output_path))}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if pipe_result.returncode == 0:
+        return result
+
+    # An interactive job without a readable transcript is unusable: job_tail
+    # cannot report the model's output. Do not leave an orphaned attach pane.
+    subprocess.run(
+        ["tmux", "kill-session", "-t", tmux_session_name],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return subprocess.CompletedProcess(
+        args=args,
+        returncode=pipe_result.returncode,
+        stdout=pipe_result.stdout,
+        stderr=pipe_result.stderr,
+    )
+
+
 class ClaudeAdapter(StaticAdapter):
     def __init__(self) -> None:
         super().__init__(
             name="claude",
             support_tier=SUPPORT_TIER,
             backend="claude_bg",
-            supports_interactive=False,
+            supports_interactive=True,
             effort_map=CLAUDE_EFFORT_MAP,
         )
 

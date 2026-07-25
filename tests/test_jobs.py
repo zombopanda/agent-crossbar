@@ -1,3 +1,5 @@
+import pytest
+
 import agent_crossbar.jobs as jobs_module
 from agent_crossbar.jobs import JobStore
 
@@ -74,7 +76,7 @@ def test_job_tail_includes_tmux_output_tail(tmp_path):
     assert tail["output_tail"]["truncated"] is False
 
 
-def test_job_tail_next_seq_points_after_last_returned_event(tmp_path):
+def test_job_tail_sequence_window_is_self_consistent_when_truncated(tmp_path):
     store = JobStore(tmp_path)
     job = store.create_job(profile="reasonix", operation="review")
     for idx in range(3):
@@ -84,7 +86,11 @@ def test_job_tail_next_seq_points_after_last_returned_event(tmp_path):
 
     assert tail["truncated"] is True
     assert [event["seq"] for event in tail["events"]] == [1]
+    assert tail["last_seq"] == 1
     assert tail["next_seq"] == 2
+
+    continued = store.job_tail(job.job_id, since_seq=tail["last_seq"])
+    assert [event["seq"] for event in continued["events"]] == [2, 3]
 
 
 def test_job_tail_does_not_advance_cursor_when_limit_returns_no_events(tmp_path):
@@ -96,6 +102,7 @@ def test_job_tail_does_not_advance_cursor_when_limit_returns_no_events(tmp_path)
 
     assert tail["truncated"] is True
     assert tail["events"] == []
+    assert tail["last_seq"] == 0
     assert tail["next_seq"] == 1
 
 
@@ -636,10 +643,36 @@ def test_send_user_input_tmux_settles_between_text_and_enter(monkeypatch, tmp_pa
     assert sleep_calls[0] == 0.5, f"expected 0.5s sleep, got {sleep_calls[0]}"
     assert len(captured) == 2, f"expected 2 subprocess calls, got {len(captured)}"
 
-# ── Operator token: cross-session access ──────────────────────────────────
+
+def test_send_user_input_marks_awaiting_job_running(monkeypatch, tmp_path):
+    """A delivered follow-up resumes an interactive job's lifecycle state."""
+    from agent_crossbar.jobs import JobStore
+
+    monkeypatch.setattr(
+        "agent_crossbar.jobs.subprocess.run",
+        lambda *args, **kwargs: type("R", (), {"returncode": 0})(),
+    )
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="claude", operation="advice", transport="tmux")
+    store.update_job_meta(job.job_id, {"status": "awaiting_input", "waiting_for": "user"})
+
+    result = store.send_user_input(job.job_id, "continue", _sleep=lambda _: None)
+
+    assert result["ok"] is True
+    meta = store._read_job_meta(job.path)
+    assert meta["status"] == "running"
+    assert "waiting_for" not in meta
+
+# ── Cross-session access: operator token ─────────────────────────────
+
+
+@pytest.fixture
+def operator_session(monkeypatch):
+    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "operator-token")
+    return "operator-token"
 
 def test_foreign_access_denied_by_default(tmp_path):
-    """Without operator token, foreign session access is rejected for all tools."""
+    """Without an operator token, foreign session access is rejected for all tools."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -659,24 +692,22 @@ def test_foreign_access_denied_by_default(tmp_path):
     assert store.get_result(job.job_id)["error"] == "job_not_found"
 
 
-def test_operator_token_allows_cross_session_tail(tmp_path, monkeypatch):
-    """Operator token bypasses session isolation for job_tail."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_allows_cross_session_tail(tmp_path, operator_session):
+    """The configured operator token allows cross-session job_tail."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
         operation="review",
         client_session_id="thread-a",
     )
-    result = store.job_tail(job.job_id, client_session_id="op-secret")
+    result = store.job_tail(job.job_id, client_session_id=operator_session)
     assert result["ok"] is True
     assert result["job_id"] == job.job_id
     assert result["status"] == "running"
 
 
-def test_operator_token_allows_cross_session_result(tmp_path, monkeypatch):
-    """Operator token bypasses session isolation for get_result."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_allows_cross_session_result(tmp_path, operator_session):
+    """The configured operator token allows cross-session get_result."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -684,27 +715,25 @@ def test_operator_token_allows_cross_session_result(tmp_path, monkeypatch):
         client_session_id="thread-a",
     )
     # Without result.json, it returns result_not_ready but NOT job_not_found
-    result = store.get_result(job.job_id, client_session_id="op-secret")
+    result = store.get_result(job.job_id, client_session_id=operator_session)
     assert result["error"] == "result_not_ready"
 
 
-def test_operator_token_allows_cross_session_stop(tmp_path, monkeypatch):
-    """Operator token bypasses session isolation for stop_job."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_allows_cross_session_stop(tmp_path, operator_session):
+    """The configured operator token allows cross-session stop_job."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
         operation="review",
         client_session_id="thread-a",
     )
-    result = store.stop_job(job.job_id, client_session_id="op-secret")
+    result = store.stop_job(job.job_id, client_session_id=operator_session)
     assert result["ok"] is True
     assert result["job_id"] == job.job_id
 
 
-def test_operator_token_allows_cross_session_send_input(tmp_path, monkeypatch):
-    """Operator token bypasses session isolation for send_user_input (ownership gate)."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_allows_cross_session_send_input(tmp_path, operator_session):
+    """The configured operator token allows cross-session send_user_input."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -712,12 +741,12 @@ def test_operator_token_allows_cross_session_send_input(tmp_path, monkeypatch):
         client_session_id="thread-a",
     )
     # Without interactive flag, it should return job_not_interactive, NOT job_not_found
-    result = store.send_user_input(job.job_id, "hello", client_session_id="op-secret")
+    result = store.send_user_input(job.job_id, "hello", client_session_id=operator_session)
     assert result["error"] == "job_not_interactive"
 
 
 def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
-    """job_list filters by client_session_id unless operator token is used."""
+    """job_list filters by client_session_id unless an operator token is used."""
     store = JobStore(tmp_path)
     store.create_job(
         profile="claude", operation="review",
@@ -742,9 +771,8 @@ def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
     assert len(listed_none) == 2  # store level returns all
 
 
-def test_job_list_operator_token_shows_all_jobs(tmp_path, monkeypatch):
-    """With operator token, job_list returns jobs from all sessions."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_job_list_operator_session_shows_all_jobs(tmp_path, operator_session):
+    """An operator token lists jobs from all sessions."""
     store = JobStore(tmp_path)
     store.create_job(
         profile="claude", operation="review",
@@ -755,14 +783,14 @@ def test_job_list_operator_token_shows_all_jobs(tmp_path, monkeypatch):
         client_session_id="thread-b", client_name="claude", cwd="/b",
     )
 
-    listed = store.list_jobs(client_session_id="op-secret")
+    listed = store.list_jobs(client_session_id=operator_session)
     assert len(listed) == 2
     sessions = {j["client_session_id"] for j in listed}
     assert sessions == {"thread-a", "thread-b"}
 
 
-def test_operator_token_noop_when_unset(tmp_path):
-    """When AGENT_CROSSBAR_OPERATOR_TOKEN is not set, no bypass occurs."""
+def test_random_session_still_denied(tmp_path):
+    """Random client_session_id string does NOT grant cross-session access."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -770,15 +798,12 @@ def test_operator_token_noop_when_unset(tmp_path):
         client_session_id="thread-a",
     )
     # Random string as client_session_id should NOT grant access
-    assert store.job_tail(job.job_id, client_session_id="op-secret")["error"] == "job_not_found"
-    assert store.get_result(job.job_id, client_session_id="op-secret")["error"] == "job_not_found"
+    assert store.job_tail(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
+    assert store.get_result(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
 
 
-def test_operator_token_does_not_leak_into_job_creation(tmp_path, monkeypatch):
-    """Jobs created normally still store their real client_session_id,
-    not the operator token (unless the caller passes the token as their
-    actual session id, which is their choice)."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_does_not_leak_into_job_creation(tmp_path, operator_session):
+    """Jobs created normally still store their real client_session_id."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -787,17 +812,14 @@ def test_operator_token_does_not_leak_into_job_creation(tmp_path, monkeypatch):
     )
     meta = store._read_job_meta(job.path)
     assert meta["client_session_id"] == "thread-a"
-    # operator token can still access it
-    assert store.job_tail(job.job_id, client_session_id="op-secret")["ok"] is True
+    assert store.job_tail(job.job_id, client_session_id=operator_session)["ok"] is True
 
 
-def test_operator_token_bad_job_id_still_rejected(tmp_path, monkeypatch):
-    """Even with operator token, invalid job IDs are rejected before ownership check."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
+def test_operator_session_bad_job_id_still_rejected(tmp_path, operator_session):
+    """Even with an operator token, invalid job IDs are rejected before ownership check."""
     store = JobStore(tmp_path)
-    assert store.job_tail("../etc", client_session_id="op-secret")["error"] == "invalid_job_id"
-    assert store.job_tail("abc", client_session_id="op-secret")["error"] == "invalid_job_id"
-
+    assert store.job_tail("../etc", client_session_id=operator_session)["error"] == "invalid_job_id"
+    assert store.job_tail("abc", client_session_id=operator_session)["error"] == "invalid_job_id"
 # ── Shared default state root (regression) ──────────────────────────────────
 
 
@@ -870,17 +892,61 @@ def test_list_jobs_sees_jobs_from_another_instance(tmp_path):
     assert any(j["client_name"] == "alice" for j in listed)
 
 
-def test_is_operator_session_constant_time_comparison(monkeypatch):
-    """_is_operator_session must match only the exact token, using constant-time comparison."""
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "op-secret")
-    import agent_crossbar.jobs as jobs_module
 
-    # Exact match
-    assert jobs_module._is_operator_session("op-secret") is True
-    # Non-match
-    assert jobs_module._is_operator_session("other-token") is False
-    assert jobs_module._is_operator_session("") is False
-    assert jobs_module._is_operator_session(None) is False
-    # Prefix/suffix must not match (constant-time comparison prevents substring tricks)
-    assert jobs_module._is_operator_session("op-secret-extra") is False
-    assert jobs_module._is_operator_session("prefix-op-secret") is False
+# ── Cross-session note: response hint ────────────────────────────────────
+
+def test_cross_session_note_in_denied_responses(tmp_path):
+    """Denied cross-session access includes an actionable non-secret hint."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+    expected_note = "pass the configured operator token as client_session_id for local cross-session access"
+
+    # job_tail
+    tail = store.job_tail(job.job_id, client_session_id="thread-b")
+    assert tail["error"] == "job_not_found"
+    assert tail.get("cross_session_note") == expected_note
+
+    # get_result
+    result = store.get_result(job.job_id, client_session_id="thread-b")
+    assert result["error"] == "job_not_found"
+    assert result.get("cross_session_note") == expected_note
+
+    # send_user_input
+    send = store.send_user_input(job.job_id, "hello", client_session_id="thread-b")
+    assert send["error"] == "job_not_found"
+    assert send.get("cross_session_note") == expected_note
+
+    # stop_job
+    stop = store.stop_job(job.job_id, client_session_id="thread-b")
+    assert stop["error"] == "job_not_found"
+    assert stop.get("cross_session_note") == expected_note
+
+
+def test_cross_session_note_absent_on_own_job(tmp_path):
+    """Own-session access does NOT include the cross_session_note hint."""
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+    )
+
+    tail = store.job_tail(job.job_id, client_session_id="thread-a")
+    assert tail["ok"] is True
+    assert "cross_session_note" not in tail
+
+    stop = store.stop_job(job.job_id, client_session_id="thread-a")
+    assert stop["ok"] is True
+    assert "cross_session_note" not in stop
+
+
+def test_cross_session_note_absent_when_job_not_found_at_all(tmp_path):
+    """Bogus job_id (valid format but doesn't exist) has no cross_session_note."""
+    store = JobStore(tmp_path)
+    tail = store.job_tail("99999999-nonexistent", client_session_id="any-session")
+    assert tail["error"] == "job_not_found"
+    assert "cross_session_note" not in tail

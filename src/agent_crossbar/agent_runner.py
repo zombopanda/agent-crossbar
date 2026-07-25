@@ -26,6 +26,7 @@ _PROVIDER_LIMIT_MARKERS = (
     "rate limit",
 )
 _PROVIDER_AUTH_MARKERS = ("not logged in", "please run /login", "authentication required")
+_HEARTBEAT_INTERVAL_SEC = 30.0
 
 
 def _clean_provider_logs(logs: str) -> str:
@@ -33,6 +34,30 @@ def _clean_provider_logs(logs: str) -> str:
     plain = strip_ansi(logs).replace("\r", "\n")
     plain = _CONTROL_CHAR_RE.sub("", plain)
     return sanitize_diagnostic_text(plain.strip())
+
+
+def _incremental_log_delta(previous: str, current: str) -> tuple[str, str]:
+    """Return unseen text and the accumulated observation cursor.
+
+    Provider log commands normally return a growing transcript, but some
+    providers return a bounded tail. Comparing only prefixes turns a sliding
+    tail into repeated output. Preserve the longest suffix/prefix overlap so
+    every byte observed by the monitor is emitted once.
+    """
+    if not current or current == previous:
+        return "", previous
+    if current.startswith(previous):
+        return current[len(previous) :], current
+    if previous.endswith(current):
+        return "", previous
+
+    for overlap in range(min(len(previous), len(current)), 0, -1):
+        if previous.endswith(current[:overlap]):
+            delta = current[overlap:]
+            return delta, previous + delta
+
+    # A log reset has no reliable shared cursor. Emit the new snapshot once.
+    return current, current
 
 
 def _provider_limit_detected(logs: str) -> bool:
@@ -77,9 +102,11 @@ def _run_adapter_job(
     effective_max_runtime = (
         max_runtime_sec if max_runtime_sec is not None else _DEFAULT_MAX_RUNTIME_SEC
     )
-    deadline: float = time.monotonic() + effective_max_runtime
+    started_monotonic = time.monotonic()
+    deadline: float = started_monotonic + effective_max_runtime
 
     last_logs = ""
+    last_heartbeat_at: float | None = None
     _consecutive_idle = 0  # counter for working+idle detection
 
     try:
@@ -148,8 +175,46 @@ def _run_adapter_job(
             if full_session_id:
                 store.update_job_meta(job_id, {"native_full_session_id": full_session_id})
 
+            if native_state == "done" and meta.get("interactive"):
+                interactive_meta = store._read_job_meta(store.get_job(job_id).path)
+                if interactive_meta.get("status") != "awaiting_input":
+                    store.update_job_meta(
+                        job_id,
+                        {"status": "awaiting_input", "waiting_for": "follow_up"},
+                    )
+                    store.send_event(
+                        job_id,
+                        level="info",
+                        type="awaiting_input",
+                        message="Claude completed a turn and is awaiting follow-up input",
+                        data={"waiting_for": "follow_up", "native_state": native_state},
+                    )
+                time.sleep(poll_interval_sec)
+                continue
+
             if native_state in ("done", "failed", "stopped"):
                 break
+
+            # Log output and source changes are not a liveness signal: a
+            # provider can spend minutes reasoning without producing either.
+            # Emit a sparse, provider-neutral heartbeat from its native status
+            # so a supervising client never has to infer a stall from silence.
+            now = time.monotonic()
+            if native_state == "working" and (
+                last_heartbeat_at is None or now - last_heartbeat_at >= _HEARTBEAT_INTERVAL_SEC
+            ):
+                store.send_event(
+                    job_id,
+                    level="info",
+                    type="provider_heartbeat",
+                    message="Provider still reports working",
+                    data={
+                        "native_state": native_state,
+                        "process_status": status.get("process_status"),
+                        "elapsed_sec": int(now - started_monotonic),
+                    },
+                )
+                last_heartbeat_at = now
 
             # ── Claude idle-after-completion detection ──────────────────
             # Claude may report state=working, process_status=idle even
@@ -316,11 +381,7 @@ def _run_adapter_job(
             try:
                 current_logs = adapter.get_logs(runner, session_id)
                 if current_logs:
-                    delta = (
-                        current_logs[len(last_logs) :]
-                        if current_logs.startswith(last_logs)
-                        else current_logs
-                    )
+                    delta, last_logs = _incremental_log_delta(last_logs, current_logs)
                     clean_delta = _clean_provider_logs(delta)
                     if clean_delta:
                         store.send_event(
@@ -330,7 +391,6 @@ def _run_adapter_job(
                             message="Incremental provider output",
                             data={"text": clean_delta},
                         )
-                    last_logs = current_logs
             except Exception:
                 # A transient logs failure must not interrupt the job monitor.
                 # Keep the previous cursor so the next successful poll emits

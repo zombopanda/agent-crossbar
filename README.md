@@ -65,7 +65,7 @@ Claude Code's `.mcp.json` format.
 
 #### Claude Code
 
-Claude Code uses the native `claude_bg` noninteractive backend (`claude` profile). Interactive and print mode are **disabled** in v0.2.0 because `claude -p` uses separate Agent SDK credit/metered billing — read [Claude Billing](#claude-subscription-vs-print-sdk-billing) below.
+Claude Code uses the native `claude_bg` backend (`claude` profile). Interactive follow-ups attach a harness-owned terminal to the same background session; print mode remains disabled because `claude -p` uses separate Agent SDK credit/metered billing — read [Claude Billing](#claude-subscription-vs-print-sdk-billing) below.
 
 For a user-wide installation:
 
@@ -131,6 +131,28 @@ With the MCP server running, from any MCP client:
 
 **Exact 8-tool MCP surface.** No hidden tools, no deprecated aliases.
 
+### Session Isolation
+
+By default, all job-access tools (`job_tail`, `job_result`, `job_stop`,
+`job_send`, `job_list`) are scoped to the requesting `client_session_id`.
+A client session can only see and operate on its own jobs; foreign jobs
+return `"error": "job_not_found"` with a `cross_session_note` hint:
+
+```json
+{
+  "ok": false,
+  "error": "job_not_found",
+  "cross_session_note": "pass the configured operator token as client_session_id for local cross-session access"
+}
+```
+
+#### Explicit Local Cross-Session Access
+
+Set `AGENT_CROSSBAR_OPERATOR_TOKEN` to a local secret and pass that value as
+`client_session_id`. Only the matching token may access jobs from another
+session, including through `job_tail`, `job_result`, `job_stop`, `job_send`,
+and `job_list`. The token is redacted from telemetry metadata.
+
 ## Support Matrix
 
 ### Supported Profiles
@@ -138,7 +160,7 @@ With the MCP server running, from any MCP client:
 | Profile | Tasks | Backend | OS | Model selection |
 |---------|-------|---------|-----|-----------------|
 | `codex` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
-| `claude` | ask, review, dev | Native `claude_bg` (noninteractive only; `claude -p` disabled; no `job_send`) | macOS, Linux | Required on every call |
+| `claude` | ask, review, dev | Native `claude_bg`; interactive follow-ups via `job_send` (no `claude -p`) | macOS, Linux | Required on every call |
 | `opencode` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
 
 `model` is mandatory for every `agent_start` request. Agent Crossbar never
@@ -163,11 +185,11 @@ currently available model IDs before starting a job.
 
 ## Claude Subscription vs Print SDK Billing
 
-Agent Crossbar uses Claude's native `claude --bg` (noninteractive) subscription path. This uses your ordinary Claude plan — no separate API billing.
+Agent Crossbar uses Claude's native `claude --bg` subscription path. This uses your ordinary Claude plan — no separate API billing.
 
 - `claude -p` (print/SDK mode) is **disabled** — it uses separate Agent SDK metered billing
-- `job_send` (interactive send) is **not available** for Claude bg jobs today
-- Profile `claude` maps to the noninteractive `claude_bg` backend
+- With `interactive: true`, Agent Crossbar opens a harness-owned `claude attach <session-id>` tmux session; `job_send` writes the next turn into that same native session
+- Profile `claude` maps to `claude_bg` for one-shot calls and `claude_bg_pty` internally for attach-backed interactive calls
 - Readiness is validated via `claude auth status --json` before job creation
 
 ## Timeouts

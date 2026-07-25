@@ -26,26 +26,21 @@ _OUTPUT_TAIL_FALLBACK_BYTES = 12000
 
 
 def _operator_token() -> str | None:
-    """Return the configured operator token, or None if not set.
-
-    When AGENT_CROSSBAR_OPERATOR_TOKEN is set, a trusted local operator
-    may pass its value as client_session_id to retrieve, tail, stop, or
-    list jobs owned by *any* session.  This is a deliberate opt-in; the
-    default remains strict per-session isolation.
-    """
+    """Return the configured local operator token, if any."""
     from agent_crossbar.env_compat import getenv
 
     return getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
 
 
 def _is_operator_session(client_session_id: str | None) -> bool:
-    """Return True when *client_session_id* matches the configured operator token."""
+    """Return true only for the configured, secret-backed operator session."""
     if client_session_id is None:
         return False
     token = _operator_token()
     if token is None:
         return False
     import secrets
+
     return secrets.compare_digest(client_session_id, token)
 
 
@@ -396,19 +391,35 @@ class JobStore:
             sensitivity=meta.get("sensitivity", "normal"),
         )
 
-    def _get_owned_job(self, job_id: str, client_session_id: str | None = None) -> Job | None:
+    def _get_owned_job(
+        self, job_id: str, client_session_id: str | None = None,
+    ) -> tuple[Job | None, str | None]:
+        """Return (job, cross_session_note).
+
+        *cross_session_note* is a non-secret hint string when the job
+        exists on disk but belongs to a different session.  Callers
+        SHOULD include it in error responses so the client sees an
+        actionable path to authenticated local cross-session access.
+        """
         job = self.get_job(job_id)
         if job is None:
-            return job
+            return None, None
         owner = self._read_job_meta(job.path).get("client_session_id")
         if owner is None or owner == client_session_id:
-            return job
-        # Operator token bypass: a trusted local operator may access any job
-        # by presenting the configured AGENT_CROSSBAR_OPERATOR_TOKEN as their
-        # client_session_id.
+            return job, None
         if _is_operator_session(client_session_id):
-            return job
-        return None
+            return job, None
+        return None, (
+            "pass the configured operator token as client_session_id for local cross-session access"
+        )
+
+    @staticmethod
+    def _inject_cross_session_note(
+        result: dict[str, Any], note: str | None,
+    ) -> None:
+        """Add *note* to *result* when non-None."""
+        if note is not None:
+            result["cross_session_note"] = note
 
     # ── tail ──────────────────────────────────────────────────────────────
 
@@ -434,9 +445,9 @@ class JobStore:
                 "events": [],
             }
 
-        job = self._get_owned_job(job_id, client_session_id)
+        job, cross_session_note = self._get_owned_job(job_id, client_session_id)
         if job is None:
-            return {
+            result = {
                 "ok": False,
                 "error": "job_not_found",
                 "job_id": job_id,
@@ -446,6 +457,8 @@ class JobStore:
                 "truncated": False,
                 "events": [],
             }
+            self._inject_cross_session_note(result, cross_session_note)
+            return result
 
         meta = self._read_job_meta(job.path)
         if meta.get("status", "running") == "running":
@@ -479,7 +492,11 @@ class JobStore:
             truncated = True
 
         if truncated:
-            next_seq = int(clipped[-1]["seq"]) + 1 if clipped else since_seq + 1
+            # ``last_seq`` describes the last event in this response, not an
+            # unseen global high-water mark.  Clients can safely continue with
+            # ``since_seq=last_seq`` when ``truncated`` is true.
+            last_seq = int(clipped[-1]["seq"]) if clipped else since_seq
+            next_seq = last_seq + 1
         meta = self._read_job_meta(job.path)
         output_tail = None
         output_next_bytes = output_since_bytes
@@ -681,15 +698,17 @@ class JobStore:
 
     def get_result(self, job_id: str, client_session_id: str | None = None) -> dict[str, Any]:
         """Read the final result for a job (public API)."""
-        job = self._get_owned_job(job_id, client_session_id)
+        job, cross_session_note = self._get_owned_job(job_id, client_session_id)
         if job is None:
-            return {
+            result = {
                 "ok": False,
                 "error": "job_not_found",
                 "job_id": job_id,
                 "warnings": [],
                 "job_created": False,
             }
+            self._inject_cross_session_note(result, cross_session_note)
+            return result
         meta = self._read_job_meta(job.path)
         result_path = job.path / "result.json"
         if not result_path.exists():
@@ -758,15 +777,17 @@ class JobStore:
         The *_sleep* callable (default ``time.sleep``) is injected for
         deterministic test control of inter-keystroke settle delays.
         """
-        job = self._get_owned_job(job_id, client_session_id)
+        job, cross_session_note = self._get_owned_job(job_id, client_session_id)
         if job is None:
-            return {
+            result = {
                 "ok": False,
                 "error": "job_not_found",
                 "job_id": job_id,
                 "warnings": [],
                 "job_created": False,
             }
+            self._inject_cross_session_note(result, cross_session_note)
+            return result
         meta = self._read_job_meta(job.path)
         interactive = bool(meta.get("interactive", job.interactive))
         if not interactive:
@@ -820,6 +841,13 @@ class JobStore:
                     "job_created": False,
                 }
 
+        # A successful reply starts another provider turn.  This matters for
+        # adapters that previously surfaced a native `awaiting_input` state.
+        if meta.get("status") == "awaiting_input":
+            meta["status"] = "running"
+            meta.pop("waiting_for", None)
+            self._write_job_meta(job.path, meta)
+
         return {"ok": True, "job_id": job_id, "seq": seq}
 
     # ── stop / list ───────────────────────────────────────────────────────
@@ -832,9 +860,11 @@ class JobStore:
         client_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Write a stopped event for a job."""
-        job = self._get_owned_job(job_id, client_session_id)
+        job, cross_session_note = self._get_owned_job(job_id, client_session_id)
         if job is None:
-            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+            result = {"ok": False, "error": "job_not_found", "job_id": job_id}
+            self._inject_cross_session_note(result, cross_session_note)
+            return result
         meta = self._read_job_meta(job.path)
         data: dict[str, Any] = {"reason": reason}
         tmux_session = meta.get("tmux_session")
@@ -898,7 +928,11 @@ class JobStore:
                     meta = json.loads(meta_path.read_text())
                 except (json.JSONDecodeError, OSError):
                     pass
-            if client_session_id is not None and not _is_operator_session(client_session_id) and meta.get("client_session_id") != client_session_id:
+            if (
+                client_session_id is not None
+                and not _is_operator_session(client_session_id)
+                and meta.get("client_session_id") != client_session_id
+            ):
                 continue
             if meta.get("status", "running") == "running":
                 job = self.get_job(job_id)

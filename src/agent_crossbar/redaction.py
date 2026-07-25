@@ -64,21 +64,3 @@ def _stable_redacted_path(original_path: str) -> str:
 
     digest = hashlib.sha256(original_path.encode("utf-8")).hexdigest()[:12]
     return f"[REDACTED:{digest}]"
-
-def _operator_token() -> str | None:
-    """Return the configured operator token, or None if not set."""
-    from agent_crossbar.env_compat import getenv
-
-    return getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
-
-
-def redact_operator_token_from_text(text: str) -> str:
-    """Replace occurrences of the operator token with a redaction marker.
-
-    Returns *text* unchanged when no operator token is configured or
-    the token is empty.
-    """
-    token = _operator_token()
-    if not token:
-        return text
-    return text.replace(token, "[REDACTED:operator_token]")

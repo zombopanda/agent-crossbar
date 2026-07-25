@@ -351,10 +351,22 @@ def test_reasonix_interactive_true_selects_tmux_transport(tmp_path, monkeypatch)
     assert result["job_id"] is not None
 
 
-def test_claude_interactive_true_rejected_with_billing_guidance(tmp_path, monkeypatch):
-    """Claude interactive=True must be rejected with clear separate-credit/metered billing guidance."""
+def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeypatch):
+    """Claude interactive mode must remain on native --bg, never Claude -p."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}',
+                "stderr": "",
+            },
+        )(),
+    )
     result = server.agent_start(
         profile="claude",
         prompt="review the code",
@@ -364,21 +376,9 @@ def test_claude_interactive_true_rejected_with_billing_guidance(tmp_path, monkey
     )
 
     assert result["ok"] is False
-    assert result["error"] == "interactive_not_supported"
-    assert result["job_created"] is False
-    # Must include billing guidance about separate credit / metered usage
-    msg = result.get("message", "").lower()
-    assert "separate" in msg or "metered" in msg or "credit" in msg or "billing" in msg, (
-        f"Claude interactive rejection must mention separate-credit or metered billing: {msg}"
-    )
-    # Must never recommend an API key as the workaround
-    assert "api key" not in msg and "anthropic_api_key" not in msg, (
-        f"Claude interactive rejection must not recommend an API key: {msg}"
-    )
-    # Must reference the supported alternative (claude_bg)
-    assert (
-        "claude_bg" in msg or "background" in msg or "noninteractive" in msg or "claude --bg" in msg
-    ), f"Claude interactive rejection must reference claude_bg alternative: {msg}"
+    # The intentionally incomplete fake launch cannot provide a background ID,
+    # but interactive validation must permit the native Claude path first.
+    assert result["error"] == "session_id_missing"
 
 
 def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):

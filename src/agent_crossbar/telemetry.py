@@ -8,8 +8,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_crossbar.redaction import redact_operator_token_from_text
-
 _RETENTION_DAYS = 14
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -265,7 +263,6 @@ class TelemetryStore:
             path.touch(mode=_FILE_MODE)
         with open(path, "a") as f:
             json_str = json.dumps(entry, default=str)
-            json_str = redact_operator_token_from_text(json_str)
             f.write(json_str + "\n")
         # Ensure permissions are correct even on existing files
         path.chmod(_FILE_MODE)
