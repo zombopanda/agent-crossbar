@@ -304,8 +304,10 @@ def test_monitor_polls_status_until_done_and_normalizes_result(
             _launch_ok("a1b2c3d4"),
             # status poll 1: working
             _agents_entry("working", "a1b2c3d4"),
+            _logs_ok(""),
             # status poll 2: working
             _agents_entry("working", "a1b2c3d4"),
+            _logs_ok(""),
             # status poll 3: done
             _agents_entry("done", "a1b2c3d4"),
             # get_logs
@@ -974,6 +976,7 @@ def test_monitor_persists_full_session_id_on_every_poll_not_only_terminal(
             _launch_ok("abc12345"),
             # Poll 1: working, with full session_id
             _agents_entry("working", "abc12345"),
+            _logs_ok(""),
             # Poll 2: done
             _agents_entry("done", "abc12345"),
             _logs_ok("success"),
@@ -1058,3 +1061,213 @@ def test_monitor_failure_diagnostics_bounded_and_no_secrets(
     assert "SECRET" not in flat
     assert "API_KEY" not in flat
     assert "env" not in diag
+
+
+# ---------------------------------------------------------------------------
+# Test 10: incremental log_delta events during execution
+# ---------------------------------------------------------------------------
+
+def test_monitor_emits_log_delta_events_during_working_state(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """Prove incremental get_logs deltas are emitted as log_delta events during working state."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00001"),
+            # status poll 1: working → logs have "line 1"
+            _agents_entry("working", "a1b00001"),
+            _logs_ok("line 1\n"),
+            # status poll 2: working → logs grew to "line 1\nline 2\n"
+            _agents_entry("working", "a1b00001"),
+            _logs_ok("line 1\nline 2\n"),
+            # status poll 3: done
+            _agents_entry("done", "a1b00001"),
+            _logs_ok("line 1\nline 2\nfinal output"),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude",
+        prompt="stream this",
+        task="ask",
+        interactive=False,
+        client_name="test",
+    )
+    assert result.get("ok") is True, result
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    adapter = reg.get_adapter("claude")
+    monitor_agent_job(store, job_id, adapter, poll_interval_sec=0.01)
+
+    # Check events
+    tail = store.job_tail(job_id)
+    delta_events = [e for e in tail["events"] if e["type"] == "log_delta"]
+    assert len(delta_events) >= 1, f"Expected at least 1 log_delta event, got {tail['events']}"
+
+    # First delta: "line 1"
+    assert any("line 1" in e["data"].get("text", "") for e in delta_events), (
+        f"Expected 'line 1' in delta events: {delta_events}"
+    )
+
+    # Final result still captured
+    final = store.get_result(job_id)
+    assert final.get("ok") is True
+    assert "final output" in final.get("summary", "")
+
+
+def test_monitor_log_delta_handles_empty_or_identical_logs_gracefully(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """Prove that get_logs returning empty or unchanged logs doesn't crash or emit noise."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00002"),
+            # poll 1: working, logs empty
+            _agents_entry("working", "a1b00002"),
+            _logs_ok(""),
+            # poll 2: working, logs empty again (no change)
+            _agents_entry("working", "a1b00002"),
+            _logs_ok(""),
+            # poll 3: done with content
+            _agents_entry("done", "a1b00002"),
+            _logs_ok("final result"),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude",
+        prompt="quiet task",
+        task="ask",
+        interactive=False,
+        client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    tail = store.job_tail(job_id)
+    delta_events = [e for e in tail["events"] if e["type"] == "log_delta"]
+    assert len(delta_events) == 0, f"Expected zero log_delta events for empty logs, got {delta_events}"
+
+    final = store.get_result(job_id)
+    assert final.get("ok") is True
+    assert final.get("summary") == "final result"
+
+
+def test_monitor_log_delta_survives_get_logs_failure(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """Prove that a failing get_logs call during polling doesn't crash the monitor."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00003"),
+            # poll 1: working, get_logs fails (non-zero rc)
+            _agents_entry("working", "a1b00003"),
+            RunResult(1, "", "permission denied"),
+            # poll 2: working, get_logs works
+            _agents_entry("working", "a1b00003"),
+            _logs_ok("recovered output"),
+            # poll 3: done
+            _agents_entry("done", "a1b00003"),
+            _logs_ok("recovered output\ndone"),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude",
+        prompt="flaky logs",
+        task="ask",
+        interactive=False,
+        client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    # Must not raise
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    final = store.get_result(job_id)
+    assert final.get("ok") is True
+    assert "done" in final.get("summary", "")
+
+
+def test_monitor_log_delta_sanitizes_ansi_control_chars(
+    claude_state_root, monkeypatch, suppress_background_monitor
+):
+    """Prove that ANSI escape sequences and control chars are stripped from delta events."""
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("a1b00004"),
+            # poll 1: working, raw logs with ANSI
+            _agents_entry("working", "a1b00004"),
+            _logs_ok("\x1b[32mOK\x1b[0m\nprocessing...\x07"),
+            # poll 2: done
+            _agents_entry("done", "a1b00004"),
+            _logs_ok("\x1b[32mOK\x1b[0m\nprocessing...\x07\nfinal"),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude",
+        prompt="colorful",
+        task="ask",
+        interactive=False,
+        client_name="test",
+    )
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    tail = store.job_tail(job_id)
+    delta_events = [e for e in tail["events"] if e["type"] == "log_delta"]
+    assert len(delta_events) >= 1
+
+    for e in delta_events:
+        text = e["data"].get("text", "")
+        # No raw ANSI escape sequences
+        assert "\x1b" not in text, f"ANSI escape in delta: {repr(text)}"
+        # No BEL control char
+        assert "\x07" not in text, f"Control char in delta: {repr(text)}"

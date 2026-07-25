@@ -79,6 +79,8 @@ def _run_adapter_job(
     )
     deadline: float = time.monotonic() + effective_max_runtime
 
+    last_logs = ""
+
     try:
         while True:
             if deadline and time.monotonic() > deadline:
@@ -257,6 +259,33 @@ def _run_adapter_job(
                         data={"waiting_for": status.get("waiting_for")},
                     )
                     return
+
+            # Provider logs are append-only in the normal case.  Polling them
+            # here makes output available through the existing job event
+            # cursor, without changing the public MCP surface.
+            try:
+                current_logs = adapter.get_logs(runner, session_id)
+                if current_logs:
+                    delta = (
+                        current_logs[len(last_logs) :]
+                        if current_logs.startswith(last_logs)
+                        else current_logs
+                    )
+                    clean_delta = _clean_provider_logs(delta)
+                    if clean_delta:
+                        store.send_event(
+                            job_id,
+                            level="info",
+                            type="log_delta",
+                            message="Incremental provider output",
+                            data={"text": clean_delta},
+                        )
+                    last_logs = current_logs
+            except Exception:
+                # A transient logs failure must not interrupt the job monitor.
+                # Keep the previous cursor so the next successful poll emits
+                # every log byte it can recover.
+                pass
 
             time.sleep(poll_interval_sec)
 
