@@ -373,6 +373,16 @@ def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeyp
             timestamp=time.time(),
         ),
     )
+    monkeypatch.setattr(
+        server,
+        "validate_start_request",
+        lambda _request, state_root: {
+            "ok": True,
+            "profile": "claude",
+            "operation": "review",
+            "warnings": [],
+        },
+    )
 
     class FakeClaudeAdapter:
         name = "claude"
@@ -420,6 +430,16 @@ def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
             probe_version=1,
             timestamp=time.time(),
         ),
+    )
+    monkeypatch.setattr(
+        server,
+        "validate_start_request",
+        lambda _request, state_root: {
+            "ok": True,
+            "profile": "claude",
+            "operation": "review",
+            "warnings": [],
+        },
     )
 
     class FakeClaudeAdapter:
