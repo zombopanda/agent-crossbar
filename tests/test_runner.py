@@ -476,7 +476,7 @@ def test_run_tmux_job_resolves_claude_binary_and_opus_model_for_claude_profile(
             "profile": "claude",
             "operation": "dev",
             "transport": "tmux",
-            "model": "opus",
+            "model": "claude-opus-5",
             "prompt": "Reply READY.",
             "cwd": str(tmp_path),
         },

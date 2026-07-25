@@ -360,7 +360,7 @@ def test_claude_interactive_true_rejected_with_billing_guidance(tmp_path, monkey
         prompt="review the code",
         task="review",
         interactive=True,
-        model="sonnet",
+        model="claude-sonnet-5",
     )
 
     assert result["ok"] is False
@@ -433,7 +433,7 @@ def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
         profile="claude",
         prompt="review the code",
         task="review",
-        model="sonnet",
+        model="claude-sonnet-5",
     )
 
     assert result["ok"] is True

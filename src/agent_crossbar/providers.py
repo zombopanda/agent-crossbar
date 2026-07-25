@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from agent_crossbar.profiles import (
-    CLAUDE_MODEL_IDS,
     CODEX_DEFAULT_EFFORT,
     OPENCODE_MODELS,
     OPENCODE_PROVIDER_ID,
@@ -331,13 +331,16 @@ def _claude_plan(
     prompt: str,
     model: str | None,
 ) -> LaunchPlan:
-    selected_model = model or "opus"
-    if selected_model not in CLAUDE_MODEL_IDS:
+    selected_model = model or ""
+    if not re.fullmatch(r"claude-[a-z][a-z0-9-]*-\d+(?:-\d+)*", selected_model):
         return LaunchPlan(
             error="invalid_model",
-            message=f"Model '{selected_model}' not allowed for profile '{profile}'. Allowed: {sorted(CLAUDE_MODEL_IDS)}",
+            message=(
+                f"Model '{selected_model}' is not a versioned Claude CLI model ID. "
+                "Discover models through profiles_list and pass that exact ID."
+            ),
         )
-    model_id = CLAUDE_MODEL_IDS[selected_model]
+    model_id = selected_model
     if transport != "tmux":
         return LaunchPlan(
             error="unsupported_transport",

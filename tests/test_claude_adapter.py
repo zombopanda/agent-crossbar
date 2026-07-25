@@ -115,7 +115,7 @@ def test_native_states_are_normalized(native: str, normalized: str) -> None:
 
 def test_launch_uses_subprocess_cwd_and_never_invents_cwd_flag() -> None:
     plan = build_claude_launch(
-        model="opus",
+        model="claude-opus-5",
         task="review",
         prompt="review this",
         cwd="/repo",
@@ -142,7 +142,9 @@ def test_launch_without_model_uses_cli_default_without_inventing_opus() -> None:
 
 
 def test_review_launch_is_noninteractive_read_only_and_uses_empty_mcp_surface() -> None:
-    plan = build_claude_launch(model="opus", task="review", prompt="review", cwd="/repo")
+    plan = build_claude_launch(
+        model="claude-opus-5", task="review", prompt="review", cwd="/repo"
+    )
 
     assert plan.permission_mode == "dontAsk"
     assert plan.args[plan.args.index("--permission-mode") + 1] == "dontAsk"
@@ -157,7 +159,9 @@ def test_review_launch_is_noninteractive_read_only_and_uses_empty_mcp_surface() 
 
 
 def test_dev_launch_never_bypasses_permissions_and_disables_bg_worktree_isolation() -> None:
-    plan = build_claude_launch(model="sonnet", task="dev", prompt="implement", cwd="/repo")
+    plan = build_claude_launch(
+        model="claude-sonnet-5", task="dev", prompt="implement", cwd="/repo"
+    )
 
     assert "bypassPermissions" not in plan.args
     assert "--dangerously-skip-permissions" not in plan.args
@@ -174,7 +178,7 @@ def test_launch_extracts_real_short_id_and_preserves_native_metadata() -> None:
 
     result = adapter.launch(
         runner,
-        model="opus",
+        model="claude-opus-5",
         task="ask",
         prompt="hello",
         cwd="/repo",
@@ -271,7 +275,7 @@ def test_claude_launch_includes_effort_in_argv(effort):
     from agent_crossbar.adapters.claude import build_claude_launch
 
     result = build_claude_launch(
-        model="opus",
+        model="claude-opus-5",
         task="ask",
         prompt="hello",
         cwd="/tmp",
@@ -288,7 +292,7 @@ def test_claude_launch_rejects_unknown_effort():
     from agent_crossbar.adapters.claude import build_claude_launch
 
     result = build_claude_launch(
-        model="opus",
+        model="claude-opus-5",
         task="ask",
         prompt="hello",
         cwd="/tmp",
@@ -402,12 +406,14 @@ $Worked for 2s
     assert result.error == "Claude completed without a recoverable final response."
 
 
-def test_claude_static_model_ids_do_not_contain_terminal_formatting():
-    from agent_crossbar.profiles.claude import CLAUDE_MODEL_IDS
-
-    for model_id in CLAUDE_MODEL_IDS.values():
-        assert "\x1b" not in model_id
-        assert not re.search(r"\[[0-9;]*m", model_id)
+def test_claude_full_model_id_is_passed_to_the_cli_unchanged():
+    plan = build_claude_launch(
+        model="claude-opus-5", task="review", prompt="review", cwd="/repo"
+    )
+    model_id = plan.args[plan.args.index("--model") + 1]
+    assert model_id == "claude-opus-5"
+    assert "\x1b" not in model_id
+    assert not re.search(r"\[[0-9;]*m", model_id)
 
 
 def test_normalize_claude_result_clean_error_field():

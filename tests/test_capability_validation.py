@@ -2,6 +2,7 @@
 
 import pytest
 
+from agent_crossbar.adapters.base import ModelCatalog
 from agent_crossbar.server import profiles_list
 from agent_crossbar.validation import validate_start_request
 
@@ -34,6 +35,18 @@ def _no_live_model_discovery(tmp_path, monkeypatch):
     import agent_crossbar.discovery as _disc
 
     def _boom(state_root, profile, *, refresh=False):
+        if profile == "claude":
+            return ModelCatalog(
+                models=(
+                    "claude-opus-5",
+                    "claude-sonnet-5",
+                    "claude-fable-5",
+                    "claude-haiku-4-5",
+                ),
+                default_model="claude-opus-5",
+                native_efforts=("low", "medium", "high"),
+                source="test",
+            )
         raise RuntimeError(f"no live {profile} probe in unit tests")
 
     monkeypatch.setattr(_disc, "discover_profile_models", _boom)
@@ -53,9 +66,9 @@ def _base_request(**overrides):
         "model",
         {
             "codex": "gpt-5.6-sol",
-            "claude": "sonnet",
-            "opus": "opus",
-            "fable": "fable",
+            "claude": "claude-sonnet-5",
+            "opus": "claude-opus-5",
+            "fable": "claude-fable-5",
             "opencode": "opencode/deepseek-v4-flash-free",
             "reasonix": "deepseek-v4-flash",
             "chatgpt_pro": "manual",
@@ -167,7 +180,12 @@ def test_claude_aliases_and_models(tmp_path):
     profiles = profiles_list(client_name="codex")["profile_details"]
 
     assert profiles["claude"]["aliases"] == ["opus", "fable"]
-    assert profiles["claude"]["models"] == ["opus", "fable", "sonnet", "haiku"]
+    assert profiles["claude"]["models"] == [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    ]
     assert profiles["claude"]["operations"] == ["review", "advice", "dev"]
     assert profiles["claude"]["interactive"] is False
 

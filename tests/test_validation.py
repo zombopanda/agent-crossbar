@@ -150,13 +150,26 @@ def test_alias_deepseek_resolves_to_reasonix(tmp_path):
 
 @pytest.mark.parametrize(
     ("profile", "model"),
-    [("claude", "opus"), ("opus", "opus"), ("fable", "fable")],
+    [
+        ("claude", "claude-opus-5"),
+        ("opus", "claude-opus-5"),
+        ("fable", "claude-fable-5"),
+    ],
 )
 def test_claude_profile_names_resolve_with_expected_model(tmp_path, profile, model):
-    result = validate_start_request(
-        _make_base_req(profile=profile, transport="print", model=model),
-        state_root=tmp_path,
+    catalog = ModelCatalog(
+        models=("claude-opus-5", "claude-fable-5"),
+        default_model="claude-opus-5",
+        native_efforts=("low", "medium", "high"),
+        source="test",
     )
+    import agent_crossbar.discovery as _disc
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        result = validate_start_request(
+            _make_base_req(profile=profile, transport="print", model=model),
+            state_root=tmp_path,
+        )
 
     assert result["ok"] is True
     assert result["profile"] == "claude"
@@ -247,7 +260,17 @@ def test_opencode_profile_exposes_all_opencode_go_models_and_defaults(tmp_path):
 
     import agent_crossbar.discovery as _disc
 
-    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+    claude_catalog = ModelCatalog(
+        models=("claude-sonnet-5",),
+        default_model="claude-sonnet-5",
+        native_efforts=("low", "medium", "high"),
+        source="test",
+    )
+
+    def discover(state_root, profile, *, refresh=False):
+        return claude_catalog if profile == "claude" else catalog
+
+    with patch.object(_disc, "discover_profile_models", side_effect=discover):
         for operation, overrides in (
             ("review", {"transport": "print", "autonomy": "read_only", "model": "kimi-k2.7-code"}),
             ("advice", {"transport": "print", "autonomy": "read_only", "model": "kimi-k2.7-code"}),
@@ -396,12 +419,22 @@ def test_model_is_explicitly_passed_for_all_profiles(tmp_path):
 
     import agent_crossbar.discovery as _disc
 
-    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+    claude_catalog = ModelCatalog(
+        models=("claude-sonnet-5",),
+        default_model="claude-sonnet-5",
+        native_efforts=("low", "medium", "high"),
+        source="test",
+    )
+
+    def discover(state_root, profile, *, refresh=False):
+        return claude_catalog if profile == "claude" else catalog
+
+    with patch.object(_disc, "discover_profile_models", side_effect=discover):
         # All profiles with explicit model should work
         tests = [
             {"profile": "reasonix", "model": "deepseek-v4-flash"},
             {"profile": "codex", "model": "gpt-5.6-sol"},
-            {"profile": "claude", "model": "sonnet"},
+            {"profile": "claude", "model": "claude-sonnet-5"},
             {"profile": "opencode", "model": "kimi-k2.7-code"},
         ]
         for t in tests:

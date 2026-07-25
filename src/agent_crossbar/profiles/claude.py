@@ -6,19 +6,13 @@ from __future__ import annotations
 # module re-exports this constant rather than hardcoding its own literal.
 SUPPORT_TIER = "supported"
 
-CLAUDE_MODEL_IDS = {
-    "opus": "claude-opus-5",
-    "fable": "claude-fable-5",
-    "sonnet": "claude-sonnet-4-5",
-    "haiku": "claude-haiku-4-5",
-}
-CLAUDE_MODELS = list(CLAUDE_MODEL_IDS)
-
-
 def build_entry() -> dict:
     return {
         "aliases": ["opus", "fable"],
-        "models": CLAUDE_MODELS,
+        # Claude models are discovered from its live /model picker. A static
+        # fallback would make the public model surface stale after a CLI/model
+        # rollout, so an unavailable probe is represented by an empty list.
+        "models": [],
         "operations": ["review", "advice", "dev"],
         "interactive": False,
         "support_tier": SUPPORT_TIER,

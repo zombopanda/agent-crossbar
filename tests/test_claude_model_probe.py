@@ -157,43 +157,55 @@ def test_strip_ansi_handles_control_redraws() -> None:
 
 def test_match_opus_line() -> None:
     canonical, is_default = _match_model_line("● Opus 4.8 (1M context)  (Default)")
-    assert canonical == "opus"
+    assert canonical == "claude-opus-4-8"
     assert is_default is True
 
 
 def test_match_sonnet_line() -> None:
     canonical, is_default = _match_model_line("  Sonnet 5")
-    assert canonical == "sonnet"
+    assert canonical == "claude-sonnet-5"
     assert is_default is False
 
 
 def test_match_fable_line() -> None:
     canonical, is_default = _match_model_line("  Fable 5")
-    assert canonical == "fable"
+    assert canonical == "claude-fable-5"
     assert is_default is False
 
 
 def test_match_haiku_line() -> None:
     canonical, is_default = _match_model_line("  Haiku 4.5")
-    assert canonical == "haiku"
+    assert canonical == "claude-haiku-4-5"
     assert is_default is False
 
 
 def test_match_default_with_gt_marker() -> None:
     canonical, is_default = _match_model_line("> Sonnet 5  (default)")
-    assert canonical == "sonnet"
+    assert canonical == "claude-sonnet-5"
     assert is_default is True
 
 
 def test_match_opus_without_context_note() -> None:
     canonical, is_default = _match_model_line("  Opus 4.8")
-    assert canonical == "opus"
+    assert canonical == "claude-opus-4-8"
     assert is_default is False
 
 
 def test_match_case_insensitive() -> None:
     canonical, is_default = _match_model_line("  opus 4.8")
-    assert canonical == "opus"
+    assert canonical == "claude-opus-4-8"
+
+
+def test_match_new_picker_version_without_a_crossbar_release() -> None:
+    canonical, is_default = _match_model_line("  Opus 6.2")
+    assert canonical == "claude-opus-6-2"
+    assert is_default is False
+
+
+def test_match_new_picker_family_without_a_crossbar_release() -> None:
+    canonical, is_default = _match_model_line("  Nimbus 1.0")
+    assert canonical == "claude-nimbus-1-0"
+    assert is_default is False
 
 
 def test_non_model_line_returns_none() -> None:
@@ -266,11 +278,16 @@ def test_parse_realistic_picker_output() -> None:
     assert error is None
     assert len(entries) == 4
     model_ids = {e["id"] for e in entries}
-    assert model_ids == {"opus", "sonnet", "fable", "haiku"}
-    assert default_id == "opus"
+    assert model_ids == {
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
+    assert default_id == "claude-opus-4-8"
 
     # Default entry
-    opus_entry = next(e for e in entries if e["id"] == "opus")
+    opus_entry = next(e for e in entries if e["id"] == "claude-opus-4-8")
     assert opus_entry["is_default"] is True
     assert "Default" in opus_entry["display_name"] or "Opus" in opus_entry["display_name"]
 
@@ -280,9 +297,9 @@ def test_parse_alt_picker_with_different_default() -> None:
 
     assert error is None
     assert len(entries) == 4
-    assert default_id == "sonnet"
+    assert default_id == "claude-sonnet-5"
 
-    sonnet_entry = next(e for e in entries if e["id"] == "sonnet")
+    sonnet_entry = next(e for e in entries if e["id"] == "claude-sonnet-5")
     assert sonnet_entry["is_default"] is True
 
 
@@ -292,7 +309,7 @@ def test_parse_picker_with_redraws() -> None:
 
     assert error is None
     assert len(entries) >= 2  # At minimum Opus + Sonnet
-    assert default_id == "opus"
+    assert default_id == "claude-opus-4-8"
 
 
 def test_parse_empty_output() -> None:
@@ -389,7 +406,7 @@ def test_probe_to_catalog_success() -> None:
     assert data["error"] is None
     assert data["source"] == "claude interactive /model picker"
     assert len(data["models"]) == 4
-    assert data["default_model"] == "opus"
+    assert data["default_model"] == "claude-opus-4-8"
     assert len(data["model_info"]) == 4
 
 
@@ -422,9 +439,14 @@ def test_adapter_discover_models_with_fake_probe() -> None:
     catalog = adapter.discover_models(probe=probe)
 
     # Order follows picker layout (Opus first, as in the fixture)
-    assert set(catalog.models) == {"opus", "sonnet", "fable", "haiku"}
+    assert set(catalog.models) == {
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-haiku-4-5",
+    }
     assert len(catalog.models) == 4
-    assert catalog.default_model == "opus"
+    assert catalog.default_model == "claude-opus-4-8"
     assert catalog.source == "claude interactive /model picker"
     assert catalog.error is None
     assert len(catalog.model_info) == 4
@@ -584,29 +606,29 @@ STANDALONE_DEFAULT_PICKER = (
 
 
 def test_match_standalone_default_entry() -> None:
-    """Standalone Default is recognized as its own entry, not misclassified."""
+    """Standalone Default resolves its displayed version to a full CLI ID."""
     model_id, is_default = _match_model_line("● Default (currently Opus 4.8)")
-    assert model_id == "default"
+    assert model_id == "claude-opus-4-8"
     assert is_default is True
 
 
 def test_match_standalone_default_plain() -> None:
-    """Plain 'Default' as primary label."""
+    """A bare Default is unusable without a versioned model description."""
     model_id, is_default = _match_model_line("  Default")
-    assert model_id == "default"
-    assert is_default is True
+    assert model_id is None
+    assert is_default is False
 
 
 def test_parse_standalone_default_picker() -> None:
-    """Picker with standalone Default entry — it appears as a model."""
+    """Standalone Default is deduplicated into its versioned model ID."""
     entries, default_id, error = parse_model_picker_output(STANDALONE_DEFAULT_PICKER)
     assert error is None
-    assert len(entries) == 4  # default + opus + sonnet + haiku
+    assert len(entries) == 3
     model_ids = {e["id"] for e in entries}
-    assert "default" in model_ids
-    assert default_id == "default"
+    assert "claude-opus-4-8" in model_ids
+    assert default_id == "claude-opus-4-8"
 
-    default_entry = next(e for e in entries if e["id"] == "default")
+    default_entry = next(e for e in entries if e["id"] == "claude-opus-4-8")
     assert default_entry["is_default"] is True
 
 
@@ -614,7 +636,7 @@ def test_standalone_default_does_not_collide_with_marker() -> None:
     """Default-as-marker on a model line is NOT treated as standalone."""
     # "● Opus 4.8 (Default)" — Default is a marker, not the primary label
     model_id, is_default = _match_model_line("● Opus 4.8 (1M context)  (Default)")
-    assert model_id == "opus"  # NOT "default"
+    assert model_id == "claude-opus-4-8"
     assert is_default is True
 
 
@@ -694,14 +716,16 @@ def test_parse_real_211_picker() -> None:
 
     assert error is None
     model_ids = [e["id"] for e in entries]
-    assert model_ids == ["default", "sonnet", "fable", "opus", "haiku"]
-    assert default_id == "sonnet"
+    assert model_ids == [
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-haiku-4-5",
+    ]
+    assert default_id == "claude-sonnet-5"
 
     # Each entry sanity
-    default_entry = next(e for e in entries if e["id"] == "default")
-    assert default_entry["is_default"] is False  # not the selected default
-
-    sonnet_entry = next(e for e in entries if e["id"] == "sonnet")
+    sonnet_entry = next(e for e in entries if e["id"] == "claude-sonnet-5")
     assert sonnet_entry["is_default"] is True  # (selected) marker
 
 
@@ -709,9 +733,9 @@ def test_parse_real_211_no_banner_pollution() -> None:
     """Startup banner 'Sonnet 5 with high effort' does NOT produce a model."""
     entries, default_id, error = parse_model_picker_output(REAL_211_PICKER)
     assert error is None
-    # Only 5 models, no duplicate sonnet from banner
-    assert len(entries) == 5
-    sonnet_entries = [e for e in entries if e["id"] == "sonnet"]
+    # Default/Sonnet collapse to one versioned model, with no banner duplicate.
+    assert len(entries) == 4
+    sonnet_entries = [e for e in entries if e["id"] == "claude-sonnet-5"]
     assert len(sonnet_entries) == 1
 
 
@@ -719,10 +743,7 @@ def test_parse_real_211_selected_not_default_marker() -> None:
     """(selected) sets default_model; '1. Default' entry does not."""
     entries, default_id, error = parse_model_picker_output(REAL_211_PICKER)
     assert error is None
-    assert default_id == "sonnet"  # from (selected), not from "1. Default"
-
-    default_entry = next(e for e in entries if e["id"] == "default")
-    assert default_entry["is_default"] is False
+    assert default_id == "claude-sonnet-5"
 
 
 def test_parse_real_211_high_effort_footer_ignored() -> None:
@@ -733,7 +754,7 @@ def test_parse_real_211_high_effort_footer_ignored() -> None:
     model_ids = [e["id"] for e in entries]
     assert "high" not in model_ids
     # The footer "(default)" does not change default_model
-    assert default_id == "sonnet"
+    assert default_id == "claude-sonnet-5"
 
 
 def test_parse_numbered_no_selected_no_default_entry() -> None:
@@ -764,8 +785,8 @@ def test_parse_numbered_selected_without_default_entry() -> None:
     )
     entries, default_id, error = parse_model_picker_output(output)
     assert error is None
-    assert default_id == "opus"
-    opus_entry = next(e for e in entries if e["id"] == "opus")
+    assert default_id == "claude-opus-4-8"
+    opus_entry = next(e for e in entries if e["id"] == "claude-opus-4-8")
     assert opus_entry["is_default"] is True
 
 
@@ -780,10 +801,10 @@ def test_parse_numbered_only_default_no_selected() -> None:
     )
     entries, default_id, error = parse_model_picker_output(output)
     assert error is None
-    # "Default" is a model entry, but without (selected) there is no active default
+    # Default/Sonnet share one full ID, but without (selected) there is no active default.
     assert default_id is None
-    default_entry = next(e for e in entries if e["id"] == "default")
-    assert default_entry["is_default"] is False
+    sonnet_entry = next(e for e in entries if e["id"] == "claude-sonnet-5")
+    assert sonnet_entry["is_default"] is False
 
 
 def test_legacy_deduplication_removes_banner_dupe() -> None:
@@ -793,9 +814,9 @@ def test_legacy_deduplication_removes_banner_dupe() -> None:
     # 4 unique models, no duplicate sonnet
     assert len(entries) == 4
     model_ids = [e["id"] for e in entries]
-    assert model_ids.count("sonnet") == 1
+    assert model_ids.count("claude-sonnet-5") == 1
     # Default from the legacy (Default) marker
-    assert default_id == "opus"
+    assert default_id == "claude-opus-4-8"
 
 
 def test_legacy_deduplication_keeps_first_default() -> None:
@@ -807,7 +828,7 @@ def test_legacy_deduplication_keeps_first_default() -> None:
     )
     entries, default_id, error = parse_model_picker_output(output)
     assert error is None
-    assert default_id == "opus"  # first default wins
+    assert default_id == "claude-opus-4-8"  # first default wins
 
 
 def test_section_bounds_found_in_real_211() -> None:

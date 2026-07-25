@@ -128,7 +128,7 @@ def validate_start_request(
     # Validate model against the profile's known allowlist.
     # Profiles with no model allowlist (e.g. chatgpt_pro) skip this check —
     # model is still required but the value is accepted as-is.
-    if resolved != "opencode" and models and model not in models:
+    if resolved not in {"opencode", "claude"} and models and model not in models:
         return fail("invalid_model", f"Model '{model}' is not supported for profile '{resolved}'")
     normalized_model = model
 
@@ -213,6 +213,31 @@ def validate_start_request(
             if err is not None:
                 return fail("unsupported_effort_for_model", err)
             normalized_effort = effort
+
+    # Claude's public model values are live, versioned CLI IDs parsed from the
+    # /model picker. Do not accept mutable family aliases or static fallbacks.
+    if resolved == "claude":
+        if state_root is None:
+            return fail("discovery_error", "state_root is required for Claude model discovery")
+
+        from agent_crossbar.discovery import discover_profile_models
+
+        sr = Path(state_root) if not isinstance(state_root, Path) else state_root
+        try:
+            catalog = discover_profile_models(sr, "claude")
+        except Exception as exc:
+            return fail("discovery_error", f"Claude model discovery failed: {exc}")
+
+        if catalog.error:
+            return fail("discovery_error", f"Claude model discovery failed: {catalog.error}")
+        if not catalog.models:
+            return fail("discovery_error", "No Claude models discovered")
+        if model not in catalog.models:
+            return fail(
+                "invalid_model",
+                f"Model '{model}' is not available in Claude "
+                f"(discovered: {', '.join(catalog.models)})",
+            )
 
     return {
         "ok": True,

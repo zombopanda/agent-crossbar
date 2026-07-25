@@ -386,6 +386,14 @@ _EXPLICIT_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The picker exposes human-readable names such as "Opus 4.8" and "Sonnet 5".
+# Claude CLI's documented full-ID convention is ``claude-<family>-<version>``;
+# normalize the live picker version rather than exposing mutable family aliases.
+_DISPLAY_VERSION_RE = re.compile(
+    r"\b(?P<family>[a-z][a-z0-9-]*)\s+(?P<version>\d+(?:\.\d+)*)\b",
+    re.IGNORECASE,
+)
+
 # Display-name patterns for matching picker lines → alias.
 # Order matters — more specific patterns first.
 _MODEL_DISPLAY_PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -466,13 +474,15 @@ def _resolve_numbered_label(label_text: str) -> tuple[str | None, bool]:
     if label_lower == "default":
         return "default", is_selected
 
-    # Known model family by exact label match
+    # Numbered picker labels use family aliases. They are only an internal
+    # classification aid: _parse_numbered_section resolves the version from
+    # the corresponding description before emitting a public model ID.
     if label_lower in _MODEL_FAMILIES:
         return label_lower, is_selected
 
     # Fall back to _match_model_line for the label text
     canonical, _ = _match_model_line(label_text)
-    if canonical and canonical != "default":
+    if canonical:
         return canonical, is_selected
 
     return None, is_selected
@@ -501,7 +511,23 @@ def _parse_numbered_section(
         # Extract label portion (before em-dash / en-dash / hyphen separator)
         label_only = re.split(r"\s*[-–—]\s*", current_text, maxsplit=1)[0]
         model_id, is_selected = _resolve_numbered_label(label_only)
-        if model_id is None or model_id in seen_ids:
+        # Numbered picker labels are aliases (for example, "Opus"); the
+        # description after the dash contains the live version to publish.
+        full_model_id, _ = _match_model_line(current_text)
+        if full_model_id is not None:
+            model_id = full_model_id
+        if model_id is None:
+            return
+        if model_id in seen_ids:
+            # "Default — Sonnet 5" and "(selected) Sonnet — Sonnet 5"
+            # describe one model. Preserve one entry but let the selected
+            # marker set its public default_model.
+            if is_selected:
+                default_id = model_id
+                for entry in models:
+                    if entry["id"] == model_id:
+                        entry["is_default"] = True
+                        break
             return
         seen_ids.add(model_id)
         if is_selected:
@@ -635,12 +661,8 @@ def _match_model_line(line: str) -> tuple[str | None, bool]:
     2. Extract an explicit full ID like ``claude-sonnet-5`` if present.
     3. Otherwise match display-name patterns → stable alias (opus/sonnet/…).
     """
-    # 1. Standalone "Default" entry: "Default" is the primary label
-    standalone_default = bool(re.search(r"^\s*[>●✓*]?\s*Default\b", line, re.IGNORECASE))
-    if standalone_default:
-        return "default", True
-
-    # Default marker anywhere on the line (e.g. "Opus 4.8 (Default)")
+    # Default marker anywhere on the line (e.g. "Opus 4.8 (Default)").
+    # A ``Default — Sonnet 5`` entry is resolved from its description too.
     has_default_marker = bool(re.search(r"\bDefault\b", line, re.IGNORECASE))
 
     # 2. Explicit full ID (e.g. "claude-sonnet-5" in the picker text)
@@ -648,10 +670,12 @@ def _match_model_line(line: str) -> tuple[str | None, bool]:
     if explicit:
         return explicit.group(1).lower(), has_default_marker
 
-    # 3. Display-name pattern → stable alias
-    for alias, pattern in _MODEL_DISPLAY_PATTERNS:
-        if pattern.search(line):
-            return alias, has_default_marker
+    # 3. Display-name version → documented full CLI ID.
+    display = _DISPLAY_VERSION_RE.search(line)
+    if display:
+        family = display.group("family").lower()
+        version = display.group("version").replace(".", "-")
+        return f"claude-{family}-{version}", has_default_marker
 
     return None, False
 

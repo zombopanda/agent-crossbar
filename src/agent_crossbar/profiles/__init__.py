@@ -15,8 +15,6 @@ from agent_crossbar.profiles import chatgpt_pro, claude, codex, opencode, reason
 
 # Per-profile constants (re-exported for backward compatibility)
 REASONIX_MODELS = reasonix.REASONIX_MODELS
-CLAUDE_MODEL_IDS = claude.CLAUDE_MODEL_IDS
-CLAUDE_MODELS = claude.CLAUDE_MODELS
 CODEX_MODELS = codex.CODEX_MODELS
 CODEX_EFFORTS = codex.CODEX_EFFORTS
 CODEX_EFFORT_ALIASES = codex.CODEX_EFFORT_ALIASES

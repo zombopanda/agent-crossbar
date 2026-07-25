@@ -22,7 +22,7 @@ from agent_crossbar.server import job_send, job_stop
 
 def agent_start(*args, **kwargs):
     """Claude integration tests always exercise an explicit Sonnet selection."""
-    kwargs.setdefault("model", "sonnet")
+    kwargs.setdefault("model", "claude-sonnet-5")
     return _agent_start(*args, **kwargs)
 
 
@@ -195,7 +195,7 @@ def test_agent_start_claude_uses_adapter_not_legacy_providers(
     assert launch_call[0:2] == ["claude", "--bg"]
     assert "-p" not in launch_call
     assert "bypassPermissions" not in launch_call
-    assert launch_call[launch_call.index("--model") + 1] == "claude-sonnet-4-5"
+    assert launch_call[launch_call.index("--model") + 1] == "claude-sonnet-5"
 
     # Verify job directory was created with proper metadata
     store = JobStore(claude_state_root)
@@ -264,7 +264,7 @@ def test_launch_stores_native_session_ids_and_resolved_settings(
         profile="claude",
         prompt="implement foo",
         task="dev",
-        model="sonnet",
+        model="claude-sonnet-5",
         effort="high",
         cwd="/tmp/test-repo",
         interactive=False,
@@ -281,7 +281,7 @@ def test_launch_stores_native_session_ids_and_resolved_settings(
 
     assert meta.get("native_session_id") == "deadbeef"
     assert meta.get("backend") == "claude_bg"
-    assert meta.get("model") == "sonnet"
+    assert meta.get("model") == "claude-sonnet-5"
     assert meta.get("effort") == "high"
     assert meta.get("task") == "dev"
     assert meta.get("interactive") is False
@@ -850,7 +850,7 @@ def test_monitor_runtime_deadline_produces_execution_failure_with_timeout_layer(
         {
             "backend": "claude_bg",
             "native_session_id": "deadbeef",
-            "model": "sonnet",
+            "model": "claude-sonnet-5",
             "effort": "medium",
             "task": "ask",
             "interactive": False,

@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ..profiles.claude import CLAUDE_MODEL_IDS, SUPPORT_TIER
+from ..profiles.claude import SUPPORT_TIER
 from .base import ModelCatalog, ModelInfo, StaticAdapter, normalize_effort
 from .claude_model_probe import (
     ClaudeModelProbe,
@@ -26,6 +26,10 @@ CLAUDE_EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high", "max": "m
 _CLAUDE_HELP_EFFORT_RE = re.compile(
     r"--effort\s+\S+\s+.*?\(([^)]+)\)",
     re.IGNORECASE | re.DOTALL,
+)
+_CLAUDE_VERSIONED_MODEL_ID_RE = re.compile(
+    r"claude-[a-z][a-z0-9-]*-\d+(?:-\d+)*\Z",
+    re.IGNORECASE,
 )
 _SCREEN_READER_UI_LINE_RE = re.compile(
     r"^(?:"
@@ -289,6 +293,13 @@ def build_claude_launch(
         return LaunchResult(None, "claude_bg", error="invalid_effort", message=str(exc))
     if model is not None and not model.strip():
         return LaunchResult(None, "claude_bg", error="invalid_model", message="model is required")
+    if model is not None and not _CLAUDE_VERSIONED_MODEL_ID_RE.fullmatch(model):
+        return LaunchResult(
+            None,
+            "claude_bg",
+            error="invalid_model",
+            message="model must be a versioned Claude CLI ID discovered from profiles_list",
+        )
     if task not in {"ask", "review", "dev"}:
         return LaunchResult(
             None, "claude_bg", error="invalid_task", message=f"Unknown task: {task}"
@@ -303,10 +314,7 @@ def build_claude_launch(
         "--ax-screen-reader",
     ]
     if model is not None:
-        # Public model values are stable family aliases. Resolve them here so
-        # launches are pinned to this profile's supported CLI model rather
-        # than relying on a mutable Claude CLI alias.
-        args.extend(["--model", CLAUDE_MODEL_IDS.get(model, model)])
+        args.extend(["--model", model])
     if task != "dev":
         args.extend(
             [
