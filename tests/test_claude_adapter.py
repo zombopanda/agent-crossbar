@@ -127,6 +127,7 @@ def test_launch_uses_subprocess_cwd_and_never_invents_cwd_flag() -> None:
     assert "--cwd" not in plan.args
     assert plan.cwd == "/repo"
     assert plan.args[:2] == ["claude", "--bg"]
+    assert plan.args[plan.args.index("--model") + 1] == "claude-opus-5"
     assert "-p" not in plan.args and "--print" not in plan.args
 
 

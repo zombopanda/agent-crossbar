@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from ..profiles.claude import SUPPORT_TIER
+from ..profiles.claude import CLAUDE_MODEL_IDS, SUPPORT_TIER
 from .base import ModelCatalog, ModelInfo, StaticAdapter, normalize_effort
 from .claude_model_probe import (
     ClaudeModelProbe,
@@ -303,7 +303,10 @@ def build_claude_launch(
         "--ax-screen-reader",
     ]
     if model is not None:
-        args.extend(["--model", model])
+        # Public model values are stable family aliases. Resolve them here so
+        # launches are pinned to this profile's supported CLI model rather
+        # than relying on a mutable Claude CLI alias.
+        args.extend(["--model", CLAUDE_MODEL_IDS.get(model, model)])
     if task != "dev":
         args.extend(
             [

@@ -208,6 +208,17 @@ def test_agent_start_always_creates_async_job_and_returns_job_id(
 
     monkeypatch.setattr(server, "start_print_job", fake_start_print_job)
 
+    # codex/dev with no explicit effort routes via ACP, not start_print_job —
+    # this must be mocked too, or the fire-and-forget background thread calls
+    # the real ACP bridge (pnpm dlx @agentclientprotocol/codex-acp).
+    acp_calls: list[dict] = []
+
+    async def fake_run_acp_job(store, job_id, **kwargs):
+        acp_calls.append(kwargs)
+        store.set_result(job_id, ok=True, summary="ACP_OK\n")
+
+    monkeypatch.setattr(server, "_run_acp_job", fake_run_acp_job)
+
     # Mock the readiness probe — real probe requires ACP bridge locally cached
     import agent_crossbar.readiness as rmod
 
@@ -242,6 +253,7 @@ def test_agent_start_always_creates_async_job_and_returns_job_id(
     assert result["job_id"] is not None
     assert (tmp_path / "jobs").exists()
     assert (tmp_path / "jobs" / result["job_id"]).exists()
+    assert len(acp_calls) == 1, "real ACP bridge must not be invoked from unit tests"
 
 
 def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
@@ -252,6 +264,17 @@ def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
         pass
 
     monkeypatch.setattr(server, "start_print_job", fake_start_print_job)
+
+    # codex/ask with no explicit effort routes via ACP, not start_print_job —
+    # this must be mocked too, or the fire-and-forget background thread calls
+    # the real ACP bridge (pnpm dlx @agentclientprotocol/codex-acp).
+    acp_calls: list[dict] = []
+
+    async def fake_run_acp_job(store, job_id, **kwargs):
+        acp_calls.append(kwargs)
+        store.set_result(job_id, ok=True, summary="ACP_OK\n")
+
+    monkeypatch.setattr(server, "_run_acp_job", fake_run_acp_job)
 
     import agent_crossbar.readiness as rmod
 
@@ -286,6 +309,7 @@ def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
     assert result["job_id"] is not None
     # The resolved operation must be 'text', not 'advice'
     assert result.get("operation") == "text", f"expected text, got {result.get('operation')}"
+    assert len(acp_calls) == 1, "real ACP bridge must not be invoked from unit tests"
 
 
 def test_reasonix_interactive_true_selects_tmux_transport(tmp_path, monkeypatch):

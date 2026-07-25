@@ -25,6 +25,7 @@ def agent_start(*args, **kwargs):
     kwargs.setdefault("model", "sonnet")
     return _agent_start(*args, **kwargs)
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -194,7 +195,7 @@ def test_agent_start_claude_uses_adapter_not_legacy_providers(
     assert launch_call[0:2] == ["claude", "--bg"]
     assert "-p" not in launch_call
     assert "bypassPermissions" not in launch_call
-    assert launch_call[launch_call.index("--model") + 1] == "sonnet"
+    assert launch_call[launch_call.index("--model") + 1] == "claude-sonnet-4-5"
 
     # Verify job directory was created with proper metadata
     store = JobStore(claude_state_root)
