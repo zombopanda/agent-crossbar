@@ -137,7 +137,7 @@ With the MCP server running, from any MCP client:
 
 | Profile | Tasks | Backend | OS | Model selection |
 |---------|-------|---------|-----|-----------------|
-| `codex` | ask, review, dev | ACP one-shot (fallback to print for explicit effort) | macOS, Linux | Required on every call |
+| `codex` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
 | `claude` | ask, review, dev | Native `claude_bg` (noninteractive only; `claude -p` disabled; no `job_send`) | macOS, Linux | Required on every call |
 | `opencode` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
 

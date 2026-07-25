@@ -46,14 +46,26 @@ def test_public_tool_signatures_match_audited_argument_surface():
 
 
 def test_agent_start_preserves_cwd_and_effort(tmp_path, monkeypatch):
-    """agent_start cwd/effort reach the backend; explicit effort routes via print."""
+    """agent_start forwards cwd/effort to print and ACP backends."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
     captured: dict[str, dict] = {}
+    captured_acp: list[dict] = []
 
     def fake_start_print_job(store, job_id, req, **kwargs):
         captured[req.get("operation", "unknown")] = dict(req)
 
     monkeypatch.setattr(server, "start_print_job", fake_start_print_job)
+
+    import threading
+
+    acp_started = threading.Event()
+
+    async def fake_run_acp_job(store, job_id, **kwargs):
+        captured_acp.append(kwargs)
+        store.set_result(job_id, ok=True, summary="ACP_OK\n")
+        acp_started.set()
+
+    monkeypatch.setattr(server, "_run_acp_job", fake_run_acp_job)
 
     # Mock the readiness probe for all profiles
     import agent_crossbar.readiness as rmod
@@ -98,7 +110,7 @@ def test_agent_start_preserves_cwd_and_effort(tmp_path, monkeypatch):
     assert captured["review"]["cwd"] == "/other"
     assert captured["review"]["effort"] == "medium"
 
-    # dev task with explicit effort on ACP-backed codex — must route via print
+    # dev task with explicit effort on ACP-backed Codex
     server.agent_start(
         profile="codex",
         prompt="implement it",
@@ -107,8 +119,19 @@ def test_agent_start_preserves_cwd_and_effort(tmp_path, monkeypatch):
         cwd="/repo",
         effort="high",
     )
-    assert captured["dev"]["cwd"] == "/repo"
-    assert captured["dev"]["effort"] == "high"
+    assert acp_started.wait(2), "ACP job did not start"
+    assert captured_acp == [
+        {
+            "provider": "codex",
+            "prompt": "implement it",
+            "cwd": "/repo",
+            "task": "dev",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "autonomy": "edit_local",
+            "max_runtime_sec": None,
+        }
+    ]
 
 
 def test_every_advertised_transport_has_server_routing():

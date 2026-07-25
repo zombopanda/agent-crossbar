@@ -559,28 +559,8 @@ class TestAgentStartAcpRouting:
         )
         assert len(self.print_job_calls) == 0, "start_print_job must NOT be called for ACP path"
 
-    def test_codex_explicit_effort_uses_legacy_print(self, tmp_path, monkeypatch):
-        """Codex with explicit effort must route to legacy print backend, NOT ACP."""
-        monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
-        from agent_crossbar import server
-
-        result = server.agent_start(
-            profile="codex",
-            prompt="test task",
-            task="dev",
-            model="gpt-5.6-sol",
-            effort="high",  # explicit effort → legacy print
-            cwd=str(tmp_path),
-        )
-        assert result["ok"] is True, f"agent_start failed: {result}"
-        assert len(self.acp_calls) == 0, "ACP must NOT be called when effort is explicit"
-        assert len(self.print_job_calls) == 1, (
-            f"Expected 1 print_job call, got {len(self.print_job_calls)}"
-        )
-        assert self.print_job_calls[0]["req"]["effort"] == "high"
-
-    def test_explicit_effort_produces_print_fallback_warning(self, tmp_path, monkeypatch):
-        """Explicit effort must produce a machine-readable fallback warning."""
+    def test_codex_explicit_effort_uses_acp(self, tmp_path, monkeypatch):
+        """Codex configures explicit effort through its ACP session selector."""
         monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
         from agent_crossbar import server
 
@@ -593,22 +573,61 @@ class TestAgentStartAcpRouting:
             cwd=str(tmp_path),
         )
         assert result["ok"] is True, f"agent_start failed: {result}"
-        assert result["backend"] == "print"
+        assert result["backend"] == "acp"
+        assert len(self.acp_calls) == 1
+        assert self.acp_calls[0]["effort"] == "high"
+        assert len(self.print_job_calls) == 0
+
+    def test_codex_explicit_effort_does_not_produce_print_fallback_warning(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex ACP effort must not be reported as a print fallback."""
+        monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+        from agent_crossbar import server
+
+        result = server.agent_start(
+            profile="codex",
+            prompt="test task",
+            task="dev",
+            model="gpt-5.6-sol",
+            effort="high",
+            cwd=str(tmp_path),
+        )
+        assert result["ok"] is True, f"agent_start failed: {result}"
+        assert result["backend"] == "acp"
         warnings = result.get("warnings", [])
         codes = {w.get("code") for w in warnings if isinstance(w, dict)}
-        assert "effort_forced_print_fallback" in codes, (
-            f"Expected effort_forced_print_fallback warning, got warnings={warnings}"
+        assert "effort_forced_print_fallback" not in codes
+
+    def test_codex_explicit_effort_falls_back_when_acp_version_is_too_old(
+        self, tmp_path, monkeypatch
+    ):
+        """Older codex-acp keeps the established print path for explicit effort."""
+        monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+        from agent_crossbar import server
+
+        monkeypatch.setattr(
+            "agent_crossbar.acp_lifecycle.check_codex_acp_readiness",
+            lambda _runner: {
+                "ready": False,
+                "state": "version_too_low",
+                "error_code": "codex_acp_version_too_low",
+            },
         )
-        match = [
-            w
-            for w in warnings
-            if isinstance(w, dict) and w.get("code") == "effort_forced_print_fallback"
-        ]
-        assert len(match) == 1
-        w = match[0]
-        assert isinstance(w.get("message"), str) and len(w["message"]) > 0
-        assert w.get("profile") == "codex"
-        assert w.get("requested_effort") == "high"
+
+        result = server.agent_start(
+            profile="codex",
+            prompt="test task",
+            task="dev",
+            model="gpt-5.6-sol",
+            effort="high",
+            cwd=str(tmp_path),
+        )
+        assert result["ok"] is True, result
+        assert result["backend"] == "print"
+        assert len(self.acp_calls) == 0
+        assert len(self.print_job_calls) == 1
+        assert result["warnings"][0]["code"] == "effort_forced_print_fallback"
 
     def test_opencode_omitted_effort_uses_acp(self, tmp_path, monkeypatch):
         """OpenCode without explicit effort must use ACP backend."""

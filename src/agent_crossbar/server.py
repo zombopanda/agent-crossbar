@@ -632,11 +632,29 @@ def agent_start(
         adapter = get_adapter(result["profile"])
         _acp_profiles = frozenset({"codex", "opencode"})
         if result["profile"] in _acp_profiles and getattr(adapter, "backend", None) == "acp":
+            # ── Preflight: provider-specific readiness before any state mutation ──
+            # Explicit effort may fall back to print when the installed ACP
+            # agent cannot prove support for the session config selector. This
+            # preserves the legacy path for an older/unavailable ACP bridge.
+            from agent_crossbar.acp_lifecycle import (
+                check_codex_acp_readiness,
+                check_opencode_acp_readiness,
+            )
+
+            preflight_runner = LocalSubprocessRunner()
+            if result["profile"] == "codex":
+                readiness = check_codex_acp_readiness(preflight_runner)
+            else:
+                readiness = check_opencode_acp_readiness(preflight_runner)
+
             # ── Effort routing ──
             # Some ACP agents do not advertise a session config selector for
             # effort. Keep their proven print path; agents that do advertise
-            # it (currently OpenCode) stay on ACP and configure it per session.
-            if effort is not None and not getattr(adapter, "supports_acp_effort", False):
+            # it stay on ACP only after their version/readiness gate passes.
+            acp_effort_available = bool(getattr(adapter, "supports_acp_effort", False)) and bool(
+                readiness.get("ready")
+            )
+            if effort is not None and not acp_effort_available:
                 # Route to print backend with explicit effort
                 store = _job_store()
                 job = store.create_job(
@@ -696,18 +714,6 @@ def agent_start(
                     "effort_routing": "explicit_effort_print_fallback",
                     "warnings": warnings,
                 }
-
-            # ── Preflight: provider-specific readiness before any state mutation ──
-            from agent_crossbar.acp_lifecycle import (
-                check_codex_acp_readiness,
-                check_opencode_acp_readiness,
-            )
-
-            preflight_runner = LocalSubprocessRunner()
-            if result["profile"] == "codex":
-                readiness = check_codex_acp_readiness(preflight_runner)
-            else:
-                readiness = check_opencode_acp_readiness(preflight_runner)
 
             if not readiness.get("ready"):
                 return _tool_error(

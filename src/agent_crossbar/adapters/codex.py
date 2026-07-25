@@ -86,6 +86,9 @@ class CodexAdapter(StaticAdapter):
             backend="acp",
             supports_interactive=False,
             effort_map={"low": "low", "medium": "medium", "high": "high", "max": "max"},
+            # codex-acp v1.1.7 exposes `reasoning_effort` as a
+            # `thought_level` session config option.
+            supports_acp_effort=True,
         )
 
     def discover_models(self, runner: Any) -> ModelCatalog:

@@ -740,6 +740,40 @@ class TestRunAcpPromptModelSelection:
             ("effort", "session-1", "high"),
         ]
 
+    def test_codex_reasoning_effort_uses_thought_level_config_option(self):
+        """Codex ACP exposes `reasoning_effort`, not OpenCode's `effort` id."""
+        model_opt = _config_with_category(
+            option_id="model",
+            category="model",
+            values=["gpt-5.6-sol"],
+        )
+        reasoning_opt = _config_with_category(
+            option_id="reasoning_effort",
+            category="thought_level",
+            values=["low", "medium", "high", "max"],
+            current_value="high",
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, reasoning_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="gpt-5.6-sol",
+                    effort="max",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "gpt-5.6-sol"),
+            ("reasoning_effort", "session-1", "max"),
+        ]
+
     def test_effort_without_advertised_selector_is_rejected_before_prompt(self):
         """Explicit effort must never be silently ignored by an ACP agent."""
         model_opt = _config_with_category(
