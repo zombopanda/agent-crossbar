@@ -2034,19 +2034,36 @@ def run_print_job(
             kwargs.pop("text", None)
             kwargs.setdefault("stdin", subprocess.DEVNULL)
             with open(output_path, "wb") as out_f:
-                completed = subprocess.run(
+                timeout = kwargs.pop("timeout", None)
+                process = subprocess.Popen(
                     argv,
                     stdout=out_f,
                     stderr=subprocess.STDOUT,
+                    start_new_session=True,
                     **kwargs,
                 )
+                store.update_job_meta(
+                    job_id,
+                    {
+                        "print_pid": process.pid,
+                        "print_pgid": process.pid,
+                    },
+                )
+                try:
+                    returncode = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise
+                finally:
+                    store.update_job_meta(job_id, {"print_pid": None, "print_pgid": None})
             # Read back the captured text for the caller.
             try:
                 stdout_text = output_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 stdout_text = ""
             return SimpleNamespace(
-                returncode=completed.returncode,
+                returncode=returncode,
                 stdout=stdout_text,
                 stderr="",
             )

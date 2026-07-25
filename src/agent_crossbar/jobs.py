@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -909,6 +910,27 @@ class JobStore:
             except (OSError, subprocess.SubprocessError) as exc:
                 data["tmux_stop"] = "error"
                 data["tmux_stop_error"] = str(exc)
+
+        print_pid = meta.get("print_pid")
+        print_pgid = meta.get("print_pgid")
+        if job.transport == "print" and isinstance(print_pid, int) and isinstance(print_pgid, int):
+            try:
+                if os.name == "posix":
+                    if os.getpgid(print_pid) != print_pgid:
+                        data["print_stop"] = "stale_process"
+                    else:
+                        os.killpg(print_pgid, signal.SIGTERM)
+                        data["print_stop"] = "terminated"
+                        data["print_pid"] = print_pid
+                else:
+                    os.kill(print_pid, signal.SIGTERM)
+                    data["print_stop"] = "terminated"
+                    data["print_pid"] = print_pid
+            except ProcessLookupError:
+                data["print_stop"] = "missing"
+            except OSError as exc:
+                data["print_stop"] = "error"
+                data["print_stop_error"] = str(exc)
 
         meta["status"] = "stopped"
         meta["stop_reason"] = reason

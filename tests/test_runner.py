@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -383,6 +384,49 @@ def test_run_print_job_writes_stdout_log_for_incremental_tail(tmp_path):
     assert tail["ok"] is True
     assert tail["output_tail"] is not None
     assert tail["output_tail"]["text"] == "line1\nline2\n"
+
+
+def test_run_print_job_records_process_group_while_streaming(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    job = store.create_job(
+        profile="reasonix",
+        operation="review",
+        transport="print",
+        sensitivity="normal",
+    )
+
+    class FakeProcess:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            meta = store._read_job_meta(job.path)
+            assert meta["print_pid"] == self.pid
+            assert meta["print_pgid"] == self.pid
+            return 0
+
+        def kill(self):
+            raise AssertionError("successful process must not be killed")
+
+    monkeypatch.setattr(
+        "agent_crossbar.runner.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    result = run_print_job(
+        store,
+        job.job_id,
+        {
+            "profile": "reasonix",
+            "operation": "review",
+            "transport": "print",
+            "model": "deepseek-v4-pro",
+            "prompt": "review",
+        },
+    )
+
+    assert result["ok"] is True
+    meta = store._read_job_meta(job.path)
+    assert meta["print_pid"] is None
+    assert meta["print_pgid"] is None
 
 
 def test_run_print_job_output_tail_visible_while_running(tmp_path):
@@ -1045,6 +1089,28 @@ def test_job_stop_kills_recorded_tmux_session(tmp_path, monkeypatch):
     stopped = [event for event in tail["events"] if event["type"] == "stopped"][-1]
     assert stopped["data"]["tmux_session"] == "agents-test-session"
     assert stopped["data"]["tmux_stop"] == "killed"
+
+
+def test_job_stop_terminates_recorded_print_process_group(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="reasonix", operation="review", transport="print")
+    store.update_job_meta(job.job_id, {"print_pid": 4242, "print_pgid": 4242})
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("agent_crossbar.jobs.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        "agent_crossbar.jobs.os.killpg", lambda pgid, sig: killed.append((pgid, sig))
+    )
+
+    response = store.stop_job(job.job_id, reason="user_cancelled")
+
+    assert response["ok"] is True
+    assert killed == [(4242, signal.SIGTERM)]
+    stopped = [
+        event for event in store.job_tail(job.job_id)["events"] if event["type"] == "stopped"
+    ][-1]
+    assert stopped["data"]["print_stop"] == "terminated"
+    assert stopped["data"]["print_pid"] == 4242
 
 
 def test_tmux_monitor_preserves_stopped_status(tmp_path):
