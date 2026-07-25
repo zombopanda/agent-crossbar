@@ -87,4 +87,3 @@ class TestRedactionIdempotency:
         twice, changed_again = redact_secrets(once)
         assert twice == once
         assert changed_again is False
-

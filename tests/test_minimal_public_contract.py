@@ -355,18 +355,19 @@ def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeyp
     """Claude interactive mode must remain on native --bg, never Claude -p."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
-    monkeypatch.setattr(
-        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
-        lambda *args, **kwargs: type(
-            "Result",
-            (),
-            {
-                "returncode": 0,
-                "stdout": '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}',
-                "stderr": "",
-            },
-        )(),
-    )
+    from agent_crossbar.adapters.claude import LaunchResult, ReadinessResult
+
+    class FakeClaudeAdapter:
+        name = "claude"
+        supports_interactive = True
+
+        def check_readiness(self, _runner):
+            return ReadinessResult(state="ready", authenticated=True)
+
+        def launch(self, _runner, **_kwargs):
+            return LaunchResult(session_id=None, backend="claude_bg")
+
+    monkeypatch.setattr(server, "get_adapter", lambda _profile: FakeClaudeAdapter())
     result = server.agent_start(
         profile="claude",
         prompt="review the code",
@@ -385,49 +386,29 @@ def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
     """Claude agent_start response must report backend='claude_bg', not 'print'."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
-    import agent_crossbar.readiness as rmod
+    from agent_crossbar.adapters.claude import LaunchResult, ReadinessResult
 
-    def fake_probe(profile, _runner=None, use_cache=True):
-        import time
+    class FakeClaudeAdapter:
+        name = "claude"
+        supports_interactive = True
 
-        from agent_crossbar.readiness import ReadinessResult
+        def check_readiness(self, _runner):
+            return ReadinessResult(state="ready", authenticated=True)
 
-        return ReadinessResult(
-            profile=profile,
-            state="ready",
-            support_tier="supported",
-            authenticated=True,
-            probe_version=1,
-            timestamp=time.time(),
-        )
+        def launch(self, _runner, **_kwargs):
+            return LaunchResult(
+                session_id="abc12345",
+                backend="claude_bg",
+                args=["claude", "--bg", "hello"],
+                cwd="/tmp",
+            )
 
-    monkeypatch.setattr(rmod, "probe_profile", fake_probe)
-    # Also need to fake the adapter readiness (Claude uses a different path)
+    monkeypatch.setattr(server, "get_adapter", lambda _profile: FakeClaudeAdapter())
 
-    def fake_adapter_readiness(_self, runner):
-        from agent_crossbar.adapters.claude import ReadinessResult as AdapterRR
+    def fake_start_agent_job(*_args, **_kwargs):
+        return None
 
-        return AdapterRR(state="ready", authenticated=True)
-
-    monkeypatch.setattr(
-        "agent_crossbar.adapters.claude.ClaudeAdapter.check_readiness",
-        fake_adapter_readiness,
-    )
-
-    def fake_launch(_self, runner, **kwargs):
-        from agent_crossbar.adapters.claude import LaunchResult
-
-        return LaunchResult(
-            session_id="abc12345",
-            backend="claude_bg",
-            args=["claude", "--bg", "hello"],
-            cwd="/tmp",
-        )
-
-    monkeypatch.setattr(
-        "agent_crossbar.adapters.claude.ClaudeAdapter.launch",
-        fake_launch,
-    )
+    monkeypatch.setattr(server, "start_agent_job", fake_start_agent_job)
 
     result = server.agent_start(
         profile="claude",

@@ -254,5 +254,3 @@ def test_record_response_without_client_name_does_not_write_client_usage(tmp_pat
     today = telemetry.today_dir()
     usage_path = today / "client_usage.jsonl"
     assert not usage_path.exists()
-
-

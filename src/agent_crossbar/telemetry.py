@@ -15,7 +15,6 @@ _FILE_MODE = 0o600
 _LOG_FILES = ("requests.jsonl", "responses.jsonl", "client_usage.jsonl", "errors.jsonl")
 
 
-
 def _now_iso() -> str:
     """Return the current UTC timestamp in ISO format."""
     return datetime.now(timezone.utc).isoformat()

@@ -238,9 +238,7 @@ def _run_adapter_job(
                     # response in logs → treat as terminal completion.
                     from agent_crossbar.adapters.claude import _screen_reader_final_response
 
-                    final_text = _screen_reader_final_response(
-                        _clean_provider_logs(idle_logs)
-                    )
+                    final_text = _screen_reader_final_response(_clean_provider_logs(idle_logs))
                     if final_text:
                         store.send_event(
                             job_id,
@@ -248,7 +246,6 @@ def _run_adapter_job(
                             type="idle_finalized",
                             message=(
                                 "Claude session idle with complete final response; "
-
                                 "finalizing as completed"
                             ),
                             data={

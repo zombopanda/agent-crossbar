@@ -721,6 +721,7 @@ def test_send_user_input_marks_awaiting_job_running(monkeypatch, tmp_path):
     assert meta["status"] == "running"
     assert "waiting_for" not in meta
 
+
 # ── Cross-session access: operator token ─────────────────────────────
 
 
@@ -728,6 +729,7 @@ def test_send_user_input_marks_awaiting_job_running(monkeypatch, tmp_path):
 def operator_session(monkeypatch):
     monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "operator-token")
     return "operator-token"
+
 
 def test_foreign_access_denied_by_default(tmp_path):
     """Without an operator token, foreign session access is rejected for all tools."""
@@ -744,7 +746,10 @@ def test_foreign_access_denied_by_default(tmp_path):
     # stop
     assert store.stop_job(job.job_id, client_session_id="thread-b")["error"] == "job_not_found"
     # send_user_input (uses _get_owned_job internally)
-    assert store.send_user_input(job.job_id, "hello", client_session_id="thread-b")["error"] == "job_not_found"
+    assert (
+        store.send_user_input(job.job_id, "hello", client_session_id="thread-b")["error"]
+        == "job_not_found"
+    )
     # None session (anonymous caller) is also rejected
     assert store.job_tail(job.job_id)["error"] == "job_not_found"
     assert store.get_result(job.job_id)["error"] == "job_not_found"
@@ -807,12 +812,18 @@ def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
     """job_list filters by client_session_id unless an operator token is used."""
     store = JobStore(tmp_path)
     store.create_job(
-        profile="claude", operation="review",
-        client_session_id="thread-a", client_name="codex", cwd="/a",
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+        client_name="codex",
+        cwd="/a",
     )
     store.create_job(
-        profile="claude", operation="review",
-        client_session_id="thread-b", client_name="codex", cwd="/b",
+        profile="claude",
+        operation="review",
+        client_session_id="thread-b",
+        client_name="codex",
+        cwd="/b",
     )
 
     listed_a = store.list_jobs(client_session_id="thread-a")
@@ -833,12 +844,18 @@ def test_job_list_operator_session_shows_all_jobs(tmp_path, operator_session):
     """An operator token lists jobs from all sessions."""
     store = JobStore(tmp_path)
     store.create_job(
-        profile="claude", operation="review",
-        client_session_id="thread-a", client_name="codex", cwd="/a",
+        profile="claude",
+        operation="review",
+        client_session_id="thread-a",
+        client_name="codex",
+        cwd="/a",
     )
     store.create_job(
-        profile="reasonix", operation="dev",
-        client_session_id="thread-b", client_name="claude", cwd="/b",
+        profile="reasonix",
+        operation="dev",
+        client_session_id="thread-b",
+        client_name="claude",
+        cwd="/b",
     )
 
     listed = store.list_jobs(client_session_id=operator_session)
@@ -856,8 +873,12 @@ def test_random_session_still_denied(tmp_path):
         client_session_id="thread-a",
     )
     # Random string as client_session_id should NOT grant access
-    assert store.job_tail(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
-    assert store.get_result(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
+    assert (
+        store.job_tail(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
+    )
+    assert (
+        store.get_result(job.job_id, client_session_id="some-random-id")["error"] == "job_not_found"
+    )
 
 
 def test_operator_session_does_not_leak_into_job_creation(tmp_path, operator_session):
@@ -878,6 +899,8 @@ def test_operator_session_bad_job_id_still_rejected(tmp_path, operator_session):
     store = JobStore(tmp_path)
     assert store.job_tail("../etc", client_session_id=operator_session)["error"] == "invalid_job_id"
     assert store.job_tail("abc", client_session_id=operator_session)["error"] == "invalid_job_id"
+
+
 # ── Shared default state root (regression) ──────────────────────────────────
 
 
@@ -888,9 +911,7 @@ def test_default_state_root_is_shared_not_per_session(monkeypatch):
     monkeypatch.delenv("AGENT_CROSSBAR_STATE_DIR", raising=False)
     monkeypatch.delenv("AGENT_HARNESS_STATE_DIR", raising=False)
     root = default_state_root()
-    assert root.name == "agent-crossbar", (
-        f"Expected .../agent-crossbar, got {root.name}"
-    )
+    assert root.name == "agent-crossbar", f"Expected .../agent-crossbar, got {root.name}"
     assert root.parent.name == "state", f"Expected .../state/agent-crossbar, got {root.parent}"
     assert ".local" in str(root), f"Expected ~/.local/... path, got {root}"
 
@@ -950,8 +971,8 @@ def test_list_jobs_sees_jobs_from_another_instance(tmp_path):
     assert any(j["client_name"] == "alice" for j in listed)
 
 
-
 # ── Cross-session note: response hint ────────────────────────────────────
+
 
 def test_cross_session_note_in_denied_responses(tmp_path):
     """Denied cross-session access includes an actionable non-secret hint."""
@@ -961,7 +982,9 @@ def test_cross_session_note_in_denied_responses(tmp_path):
         operation="review",
         client_session_id="thread-a",
     )
-    expected_note = "pass the configured operator token as client_session_id for local cross-session access"
+    expected_note = (
+        "pass the configured operator token as client_session_id for local cross-session access"
+    )
 
     # job_tail
     tail = store.job_tail(job.job_id, client_session_id="thread-b")

@@ -6,6 +6,7 @@ from __future__ import annotations
 # module re-exports this constant rather than hardcoding its own literal.
 SUPPORT_TIER = "supported"
 
+
 def build_entry() -> dict:
     return {
         "aliases": ["opus", "fable"],

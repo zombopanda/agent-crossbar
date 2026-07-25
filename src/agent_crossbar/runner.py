@@ -2027,9 +2027,8 @@ def run_print_job(
     # the final stdout text for result persistence, so read the file
     # back after the subprocess exits.
     if output_path is not None and run is subprocess.run:
-        def _file_streaming_run(
-            argv: list[str], **kwargs: Any
-        ) -> subprocess.CompletedProcess[str]:
+
+        def _file_streaming_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             # Drop capture_output / text — we handle those ourselves.
             kwargs.pop("capture_output", None)
             kwargs.pop("text", None)

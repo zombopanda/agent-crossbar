@@ -142,9 +142,7 @@ def test_launch_without_model_uses_cli_default_without_inventing_opus() -> None:
 
 
 def test_review_launch_is_noninteractive_read_only_and_uses_empty_mcp_surface() -> None:
-    plan = build_claude_launch(
-        model="claude-opus-5", task="review", prompt="review", cwd="/repo"
-    )
+    plan = build_claude_launch(model="claude-opus-5", task="review", prompt="review", cwd="/repo")
 
     assert plan.permission_mode == "dontAsk"
     assert plan.args[plan.args.index("--permission-mode") + 1] == "dontAsk"
@@ -159,9 +157,7 @@ def test_review_launch_is_noninteractive_read_only_and_uses_empty_mcp_surface() 
 
 
 def test_dev_launch_never_bypasses_permissions_and_disables_bg_worktree_isolation() -> None:
-    plan = build_claude_launch(
-        model="claude-sonnet-5", task="dev", prompt="implement", cwd="/repo"
-    )
+    plan = build_claude_launch(model="claude-sonnet-5", task="dev", prompt="implement", cwd="/repo")
 
     assert "bypassPermissions" not in plan.args
     assert "--dangerously-skip-permissions" not in plan.args
@@ -266,9 +262,8 @@ def test_result_normalization_uses_state_and_waiting_for() -> None:
     assert result.waiting_for == "permission prompt"
 
 
-
-
 # ── Interactive support ────────────────────────────────────────────────
+
 
 def test_adapter_supports_interactive():
     """ClaudeAdapter must report supports_interactive=True."""
@@ -350,6 +345,7 @@ def test_interactive_attach_fails_when_tty_output_cannot_be_piped(monkeypatch, t
 
     assert result.returncode == 1
     assert ["tmux", "kill-session", "-t", "agents-test-job"] in calls
+
 
 # ── Task 3.6: Claude effort in launch argv + catalog exposure (TDD) ──
 
@@ -492,9 +488,7 @@ $Worked for 2s
 
 
 def test_claude_full_model_id_is_passed_to_the_cli_unchanged():
-    plan = build_claude_launch(
-        model="claude-opus-5", task="review", prompt="review", cwd="/repo"
-    )
+    plan = build_claude_launch(model="claude-opus-5", task="review", prompt="review", cwd="/repo")
     model_id = plan.args[plan.args.index("--model") + 1]
     assert model_id == "claude-opus-5"
     assert "\x1b" not in model_id

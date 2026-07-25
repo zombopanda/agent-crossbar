@@ -888,9 +888,7 @@ class TestPreflightInAgentStart:
 
         monkeypatch.setattr(rmod, "probe_profile", fake_probe)
 
-        result = agent_start(
-            profile="codex", prompt="test", model="gpt-5.6-sol", task="ask"
-        )
+        result = agent_start(profile="codex", prompt="test", model="gpt-5.6-sol", task="ask")
         assert result["ok"] is False
         assert result["error"] == "codex_missing"
         assert result["job_created"] is False

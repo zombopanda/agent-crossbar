@@ -655,10 +655,15 @@ def agent_start(
                     "cwd": effective_cwd,
                     "adapter_name": adapter.name,
                     "max_runtime_sec": max_runtime_sec,
-                    **({"tmux_session": tmux_session_name,
-                        "tmux_output_path": str(output_path),
-                        "transport": "tmux",
-                       } if interactive else {}),
+                    **(
+                        {
+                            "tmux_session": tmux_session_name,
+                            "tmux_output_path": str(output_path),
+                            "transport": "tmux",
+                        }
+                        if interactive
+                        else {}
+                    ),
                 },
             )
             job.events.write(

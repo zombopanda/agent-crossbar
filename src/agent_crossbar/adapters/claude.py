@@ -386,7 +386,6 @@ def normalize_claude_result(entry: dict[str, Any], logs: str) -> NormalizedResul
     )
 
 
-
 def start_claude_interactive_tmux(
     *,
     session_id: str,
@@ -402,18 +401,33 @@ def start_claude_interactive_tmux(
     verifying the result and recording the session name in job meta.
     """
     args: list[str] = [
-        "tmux", "new-session", "-d", "-s", tmux_session_name,
-        "-c", cwd,
-        "claude", "attach", session_id,
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        tmux_session_name,
+        "-c",
+        cwd,
+        "claude",
+        "attach",
+        session_id,
     ]
     result = subprocess.run(args, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         return result
 
     pipe_result = subprocess.run(
-        ["tmux", "pipe-pane", "-t", tmux_session_name, "-o",
-         f"cat >> {shlex.quote(str(output_path))}"],
-        capture_output=True, text=True, timeout=10,
+        [
+            "tmux",
+            "pipe-pane",
+            "-t",
+            tmux_session_name,
+            "-o",
+            f"cat >> {shlex.quote(str(output_path))}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     if pipe_result.returncode == 0:
         return result

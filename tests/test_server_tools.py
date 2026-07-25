@@ -261,6 +261,3 @@ def test_job_stop_acp_persists_terminal_result(tmp_path, monkeypatch):
     assert result["status"] == "cancelled"
     assert result["stop_reason"] == "test_stop"
     assert result["technical"]["acp_stop"]["reason"] == "no_acp_pid_in_meta"
-
-
-

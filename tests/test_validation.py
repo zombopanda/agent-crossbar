@@ -80,7 +80,11 @@ def test_autonomy_propose_patch_accepted(tmp_path):
 
 def test_autonomy_edit_local_accepted(tmp_path):
     req = _make_base_req(
-        operation="dev", transport="tmux", autonomy="edit_local", profile="reasonix", model="deepseek-v4-pro"
+        operation="dev",
+        transport="tmux",
+        autonomy="edit_local",
+        profile="reasonix",
+        model="deepseek-v4-pro",
     )
     result = validate_start_request(req, state_root=tmp_path)
     assert result["ok"] is True
@@ -336,7 +340,9 @@ def test_list_profiles_excludes_aliases():
     # Only the five supported canonical profiles
     assert len(profiles) == 5
 
+
 # ── Model required tests ───────────────────────────────────────────────────
+
 
 def test_model_omitted_fails_validation(tmp_path):
     """Omitted model must fail before any provider process is created."""

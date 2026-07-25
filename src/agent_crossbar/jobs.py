@@ -392,7 +392,9 @@ class JobStore:
         )
 
     def _get_owned_job(
-        self, job_id: str, client_session_id: str | None = None,
+        self,
+        job_id: str,
+        client_session_id: str | None = None,
     ) -> tuple[Job | None, str | None]:
         """Return (job, cross_session_note).
 
@@ -415,7 +417,8 @@ class JobStore:
 
     @staticmethod
     def _inject_cross_session_note(
-        result: dict[str, Any], note: str | None,
+        result: dict[str, Any],
+        note: str | None,
     ) -> None:
         """Add *note* to *result* when non-None."""
         if note is not None:
@@ -504,9 +507,7 @@ class JobStore:
         if transport in ("tmux", "print"):
             fallback_name = "tmux-output.log" if transport == "tmux" else "stdout.log"
             meta_key = "tmux_output_path" if transport == "tmux" else "print_output_path"
-            output_path = self._safe_job_artifact_path(
-                job, meta.get(meta_key), fallback_name
-            )
+            output_path = self._safe_job_artifact_path(job, meta.get(meta_key), fallback_name)
             if output_since_bytes is None:
                 output_tail = self._read_output_tail(
                     output_path, max_bytes or _OUTPUT_TAIL_FALLBACK_BYTES
