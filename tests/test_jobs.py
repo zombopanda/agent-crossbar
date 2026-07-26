@@ -1,8 +1,6 @@
 import threading
 from types import SimpleNamespace
 
-import pytest
-
 import agent_crossbar.jobs as jobs_module
 from agent_crossbar.jobs import JobStore
 
@@ -824,12 +822,6 @@ def test_send_user_input_marks_awaiting_job_running(monkeypatch, tmp_path):
 # ── Cross-session access: operator token ─────────────────────────────
 
 
-@pytest.fixture
-def operator_session(monkeypatch):
-    monkeypatch.setenv("AGENT_CROSSBAR_OPERATOR_TOKEN", "operator-token")
-    return "operator-token"
-
-
 def test_foreign_access_denied_by_default(tmp_path):
     """Without an operator token, foreign session access is rejected for all tools."""
     store = JobStore(tmp_path)
@@ -854,22 +846,22 @@ def test_foreign_access_denied_by_default(tmp_path):
     assert store.get_result(job.job_id)["error"] == "job_not_found"
 
 
-def test_operator_session_allows_cross_session_tail(tmp_path, operator_session):
-    """The configured operator token allows cross-session job_tail."""
+def test_star_allows_cross_session_tail(tmp_path):
+    """client_session_id='*' allows cross-session job_tail."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
         operation="review",
         client_session_id="thread-a",
     )
-    result = store.job_tail(job.job_id, client_session_id=operator_session)
+    result = store.job_tail(job.job_id, client_session_id="*")
     assert result["ok"] is True
     assert result["job_id"] == job.job_id
     assert result["status"] == "running"
 
 
-def test_operator_session_allows_cross_session_result(tmp_path, operator_session):
-    """The configured operator token allows cross-session get_result."""
+def test_star_allows_cross_session_result(tmp_path):
+    """client_session_id='*' allows cross-session get_result."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -877,25 +869,25 @@ def test_operator_session_allows_cross_session_result(tmp_path, operator_session
         client_session_id="thread-a",
     )
     # Without result.json, it returns result_not_ready but NOT job_not_found
-    result = store.get_result(job.job_id, client_session_id=operator_session)
+    result = store.get_result(job.job_id, client_session_id="*")
     assert result["error"] == "result_not_ready"
 
 
-def test_operator_session_allows_cross_session_stop(tmp_path, operator_session):
-    """The configured operator token allows cross-session stop_job."""
+def test_star_allows_cross_session_stop(tmp_path):
+    """client_session_id='*' allows cross-session stop_job."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
         operation="review",
         client_session_id="thread-a",
     )
-    result = store.stop_job(job.job_id, client_session_id=operator_session)
+    result = store.stop_job(job.job_id, client_session_id="*")
     assert result["ok"] is True
     assert result["job_id"] == job.job_id
 
 
-def test_operator_session_allows_cross_session_send_input(tmp_path, operator_session):
-    """The configured operator token allows cross-session send_user_input."""
+def test_star_allows_cross_session_send_input(tmp_path):
+    """client_session_id='*' allows cross-session send_user_input."""
     store = JobStore(tmp_path)
     job = store.create_job(
         profile="claude",
@@ -903,11 +895,11 @@ def test_operator_session_allows_cross_session_send_input(tmp_path, operator_ses
         client_session_id="thread-a",
     )
     # Without interactive flag, it should return job_not_interactive, NOT job_not_found
-    result = store.send_user_input(job.job_id, "hello", client_session_id=operator_session)
+    result = store.send_user_input(job.job_id, "hello", client_session_id="*")
     assert result["error"] == "job_not_interactive"
 
 
-def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
+def test_job_list_stays_session_isolated_by_default(tmp_path):
     """job_list filters by client_session_id unless an operator token is used."""
     store = JobStore(tmp_path)
     store.create_job(
@@ -939,8 +931,8 @@ def test_job_list_stays_session_isolated_without_operator_token(tmp_path):
     assert len(listed_none) == 2  # store level returns all
 
 
-def test_job_list_operator_session_shows_all_jobs(tmp_path, operator_session):
-    """An operator token lists jobs from all sessions."""
+def test_job_list_star_shows_all_jobs(tmp_path):
+    """client_session_id='*' lists jobs from all sessions."""
     store = JobStore(tmp_path)
     store.create_job(
         profile="claude",
@@ -957,7 +949,7 @@ def test_job_list_operator_session_shows_all_jobs(tmp_path, operator_session):
         cwd="/b",
     )
 
-    listed = store.list_jobs(client_session_id=operator_session)
+    listed = store.list_jobs(client_session_id="*")
     assert len(listed) == 2
     sessions = {j["client_session_id"] for j in listed}
     assert sessions == {"thread-a", "thread-b"}
@@ -980,7 +972,7 @@ def test_random_session_still_denied(tmp_path):
     )
 
 
-def test_operator_session_does_not_leak_into_job_creation(tmp_path, operator_session):
+def test_star_does_not_leak_into_job_creation(tmp_path):
     """Jobs created normally still store their real client_session_id."""
     store = JobStore(tmp_path)
     job = store.create_job(
@@ -990,14 +982,14 @@ def test_operator_session_does_not_leak_into_job_creation(tmp_path, operator_ses
     )
     meta = store._read_job_meta(job.path)
     assert meta["client_session_id"] == "thread-a"
-    assert store.job_tail(job.job_id, client_session_id=operator_session)["ok"] is True
+    assert store.job_tail(job.job_id, client_session_id="*")["ok"] is True
 
 
-def test_operator_session_bad_job_id_still_rejected(tmp_path, operator_session):
-    """Even with an operator token, invalid job IDs are rejected before ownership check."""
+def test_star_bad_job_id_still_rejected(tmp_path):
+    """Even with '*', invalid job IDs are rejected before ownership check."""
     store = JobStore(tmp_path)
-    assert store.job_tail("../etc", client_session_id=operator_session)["error"] == "invalid_job_id"
-    assert store.job_tail("abc", client_session_id=operator_session)["error"] == "invalid_job_id"
+    assert store.job_tail("../etc", client_session_id="*")["error"] == "invalid_job_id"
+    assert store.job_tail("abc", client_session_id="*")["error"] == "invalid_job_id"
 
 
 # ── Shared default state root (regression) ──────────────────────────────────
@@ -1082,7 +1074,7 @@ def test_cross_session_note_in_denied_responses(tmp_path):
         client_session_id="thread-a",
     )
     expected_note = (
-        "pass the configured operator token as client_session_id for local cross-session access"
+        "pass client_session_id=\"*\" for explicit local cross-session access"
     )
 
     # job_tail

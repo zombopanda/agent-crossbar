@@ -142,16 +142,17 @@ return `"error": "job_not_found"` with a `cross_session_note` hint:
 {
   "ok": false,
   "error": "job_not_found",
-  "cross_session_note": "pass the configured operator token as client_session_id for local cross-session access"
+  "cross_session_note": "pass client_session_id=\"*\" for explicit local cross-session access"
 }
 ```
 
 #### Explicit Local Cross-Session Access
 
-Set `AGENT_CROSSBAR_OPERATOR_TOKEN` to a local secret and pass that value as
-`client_session_id`. Only the matching token may access jobs from another
-session, including through `job_tail`, `job_result`, `job_stop`, `job_send`,
-and `job_list`. The token is redacted from telemetry metadata.
+Pass `client_session_id="*"` to `job_tail`, `job_result`, `job_stop`,
+`job_send`, or `job_list` for explicit local cross-session access. This
+permits any local client to see and operate on all jobs regardless of the
+owning session. No environment variable or token setup is required —
+`"*"` is the literal opt-in string.
 
 ## Support Matrix
 

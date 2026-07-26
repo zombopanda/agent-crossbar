@@ -27,23 +27,6 @@ _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
 
 
-def _operator_token() -> str | None:
-    """Return the configured local operator token, if any."""
-    from agent_crossbar.env_compat import getenv
-
-    return getenv("AGENT_CROSSBAR_OPERATOR_TOKEN") or None
-
-
-def _is_operator_session(client_session_id: str | None) -> bool:
-    """Return true only for the configured, secret-backed operator session."""
-    if client_session_id is None:
-        return False
-    token = _operator_token()
-    if token is None:
-        return False
-    import secrets
-
-    return secrets.compare_digest(client_session_id, token)
 
 
 def default_state_root() -> Path:
@@ -435,10 +418,10 @@ class JobStore:
         owner = self._read_job_meta(job.path).get("client_session_id")
         if owner is None or owner == client_session_id:
             return job, None
-        if _is_operator_session(client_session_id):
+        if client_session_id == "*":
             return job, None
         return None, (
-            "pass the configured operator token as client_session_id for local cross-session access"
+            "pass client_session_id=\"*\" for explicit local cross-session access"
         )
 
     @staticmethod
@@ -1004,7 +987,7 @@ class JobStore:
                     pass
             if (
                 client_session_id is not None
-                and not _is_operator_session(client_session_id)
+                and client_session_id != "*"
                 and meta.get("client_session_id") != client_session_id
             ):
                 continue

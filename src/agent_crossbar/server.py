@@ -81,19 +81,7 @@ def _client_metadata(
     if client_session_id is not None:
         data["session_id"] = client_session_id
     data.setdefault("session_id", None)
-    _redact_operator_session_id(data)
     return data
-
-
-def _redact_operator_session_id(data: dict[str, Any]) -> None:
-    """Do not persist an operator token in telemetry metadata."""
-    session_id = data.get("session_id")
-    if session_id is None:
-        return
-    from agent_crossbar.jobs import _is_operator_session
-
-    if _is_operator_session(str(session_id)):
-        data["session_id"] = "[REDACTED:operator_token]"
 
 
 def _effective_client_session_id(
