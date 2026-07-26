@@ -1,14 +1,13 @@
 # Agent Crossbar
 
+[![npm version](https://img.shields.io/npm/v/agent-crossbar)](https://www.npmjs.com/package/agent-crossbar)
+[![PyPI version](https://img.shields.io/pypi/v/agent-crossbar)](https://pypi.org/project/agent-crossbar/)
+
 Delegate review, advice, text, and dev work to local coding agents — Codex, Claude, OpenCode — through a single MCP server. One `agent_start` call, one `job_result` answer.
 
-**Experimental developer preview (v0.2.0).** APIs may change. Provider guarantees are qualified by live gates.
+**Experimental developer preview (v0.3).** APIs may change. Provider guarantees are qualified by live gates.
 
 Expose to MCP clients with the server key `agents`.
-
-## Demo
-
-[Accessible transcript](demo/TRANSCRIPT.md) · [exact prompts](demo/PROMPTS.md) · [recording notes](demo/RECORDING.md)
 
 ## Ten-Minute Quickstart
 
@@ -209,10 +208,10 @@ The `doctor` CLI reports readiness and preflight failures only. It does **not** 
 
 - **State directory**: `~/.local/state/agent-crossbar` (override with `AGENT_CROSSBAR_STATE_DIR`)
 - **Job storage**: one directory per job under `jobs/`
-- **Retention**: no automatic cleanup in v0.2.0 — jobs persist until manually deleted
+- **Retention**: no automatic cleanup in v0.3 — jobs persist until manually deleted — jobs persist until manually deleted
 - **Local audit logs**: full MCP request and response payloads, including
   prompts and results, are written under `telemetry/` with owner-only
-  permissions. They follow the same no-cleanup policy in v0.2.0.
+  permissions. They follow the same no-cleanup policy in v0.3.
 - **No remote telemetry**: these audit logs are not sent remotely; Agent
   Crossbar does not phone home.
 
@@ -270,7 +269,7 @@ MCP Client (Codex / Claude / OpenCode)
   ACP / claude_bg / tmux / GUI  ← provider backends
 ```
 
-One Python package (`agent-crossbar` on PyPI). Bounded provider adapters under `agent_crossbar.adapters`. No separate plugin packages in v0.2.0.
+One Python package (`agent-crossbar` on PyPI). Bounded provider adapters under `agent_crossbar.adapters`. No separate plugin packages in v0.3.
 
 ## Contributing
 

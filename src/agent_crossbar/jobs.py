@@ -27,8 +27,6 @@ _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
 
 
-
-
 def default_state_root() -> Path:
     """Return the shared default state root directory.
 
@@ -420,9 +418,7 @@ class JobStore:
             return job, None
         if client_session_id == "*":
             return job, None
-        return None, (
-            "pass client_session_id=\"*\" for explicit local cross-session access"
-        )
+        return None, ('pass client_session_id="*" for explicit local cross-session access')
 
     @staticmethod
     def _inject_cross_session_note(
@@ -732,7 +728,30 @@ class JobStore:
             self._inject_cross_session_note(result, cross_session_note)
             return result
         meta = self._read_job_meta(job.path)
+        result_path = job.path / "result.json"
         if meta.get("status") == "stopped":
+            # If a result envelope was persisted (e.g. ACP stop), read it.
+            if result_path.exists():
+                result_data = json.loads(result_path.read_text())
+                envelope = result_data.get("envelope", {})
+                result = {
+                    "ok": True,
+                    "job_id": job_id,
+                    "status": envelope.get("status", "stopped"),
+                    "stop_reason": envelope.get(
+                        "stop_reason", meta.get("stop_reason", "user_cancelled")
+                    ),
+                    "summary": envelope.get(
+                        "summary", f"Job stopped: {meta.get('stop_reason', 'user_cancelled')}"
+                    ),
+                    "artifacts": [],
+                    "warnings": [],
+                }
+                # Pass through envelope technical / failure / resolved fields
+                for key in ("technical", "failure", "resolved"):
+                    if key in envelope:
+                        result[key] = envelope[key]
+                return result
             return {
                 "ok": True,
                 "job_id": job_id,
@@ -742,7 +761,6 @@ class JobStore:
                 "artifacts": [],
                 "warnings": [],
             }
-        result_path = job.path / "result.json"
         if not result_path.exists():
             self._finalize_completed_tmux_job(job)
             meta = self._read_job_meta(job.path)  # re-read after lazy finalize
