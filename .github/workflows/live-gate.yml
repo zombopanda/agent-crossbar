@@ -58,6 +58,7 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.13"
+          cache-suffix: live-gate
 
       - name: Create isolated venv
         run: uv venv --python 3.13 /tmp/ci-venv
