@@ -1011,9 +1011,12 @@ def test_validation_rejects_effort_unsupported_by_model(tmp_path: Path) -> None:
         _disc._get_cli_version = _orig_version
 
 
-def test_validation_allows_effort_supported_by_model(tmp_path: Path) -> None:
+def test_validation_allows_effort_supported_by_model(tmp_path: Path, monkeypatch) -> None:
     """validate_start_request allows a codex job when the model supports the effort."""
+    import agent_crossbar.discovery as _disc
     from agent_crossbar.validation import validate_start_request
+
+    monkeypatch.setattr(_disc, "_get_cli_version", lambda _profile: "0.145.0")
 
     data = {
         "models": ["gpt-5.6-sol", "gpt-5.6-terra"],
