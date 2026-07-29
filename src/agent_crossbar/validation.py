@@ -128,11 +128,34 @@ def validate_start_request(
     # Validate model against the profile's known allowlist.
     # Profiles with no model allowlist (e.g. chatgpt_pro) skip this check —
     # model is still required but the value is accepted as-is.
-    if resolved not in {"opencode", "claude"} and models and model not in models:
+    if resolved not in {"codex", "opencode", "claude"} and models and model not in models:
         return fail("invalid_model", f"Model '{model}' is not supported for profile '{resolved}'")
     normalized_model = model
 
     if resolved == "codex":
+        if state_root is None:
+            return fail("discovery_error", "state_root is required for Codex model discovery")
+
+        from agent_crossbar.adapters.codex import adapter as codex_adapter
+        from agent_crossbar.discovery import discover_profile_models
+
+        sr = Path(state_root) if not isinstance(state_root, Path) else state_root
+        try:
+            catalog = discover_profile_models(sr, "codex")
+        except Exception as exc:
+            return fail("discovery_error", f"Codex model discovery failed: {exc}")
+
+        if catalog.error:
+            return fail("discovery_error", f"Codex model discovery failed: {catalog.error}")
+        if not catalog.models:
+            return fail("discovery_error", "No Codex models discovered")
+        if model not in catalog.models:
+            return fail(
+                "invalid_model",
+                f"Model '{model}' is not available in Codex "
+                f"(discovered: {', '.join(catalog.models)})",
+            )
+
         effort = req.get("effort") or CODEX_DEFAULT_EFFORT
         effort = CODEX_EFFORT_ALIASES.get(effort, effort)
         if effort not in CODEX_EFFORTS:
@@ -143,19 +166,9 @@ def validate_start_request(
         normalized_effort = effort
 
         # Rule: Codex effort must be supported by the selected model's discovered capabilities.
-        if state_root is not None:
-            from agent_crossbar.adapters.codex import adapter as codex_adapter
-            from agent_crossbar.discovery import discover_profile_models
-
-            try:
-                catalog = discover_profile_models(
-                    Path(state_root) if not isinstance(state_root, Path) else state_root, "codex"
-                )
-            except Exception:
-                catalog = None
-            err = codex_adapter.validate_effort_for_model(effort, catalog, model)
-            if err is not None:
-                return fail("unsupported_effort_for_model", err)
+        err = codex_adapter.validate_effort_for_model(effort, catalog, model)
+        if err is not None:
+            return fail("unsupported_effort_for_model", err)
 
     # Rule: OpenCode validates against the live model catalog obtained via
     # discover_profile_models — which uses the cache when fresh and performs

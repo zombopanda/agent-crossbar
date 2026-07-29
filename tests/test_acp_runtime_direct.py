@@ -8,9 +8,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
+from acp.schema import (
+    AgentMessageChunk,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
+    TextContentBlock,
+)
 
 # ── production target ────────────────────────────────────────────────
 from agent_crossbar.acp_client import (
@@ -59,6 +67,61 @@ def _read_store_events(store: JobStore, job_id: str) -> list[dict]:
 def _read_store_meta(store: JobStore, job_id: str) -> dict:
     meta_file = store.get_job(job_id).path / "meta.json"
     return json.loads(meta_file.read_text())
+
+
+class _ChunkingAcpConnection:
+    """Protocol-shaped fake that emits real AgentMessageChunk notifications."""
+
+    def __init__(self, texts: list[str], model: str) -> None:
+        self.texts = texts
+        self.model = model
+        self.client = None
+
+    async def initialize(self, protocol_version, **_kwargs):
+        return SimpleNamespace(protocol_version=protocol_version)
+
+    async def new_session(self, **_kwargs):
+        return SimpleNamespace(
+            session_id="protocol-fake-1",
+            config_options=[self._model_config(self.model)],
+        )
+
+    async def set_config_option(self, value, **_kwargs):
+        self.model = value
+        return SimpleNamespace(config_options=[self._model_config(value)])
+
+    async def prompt(self, session_id, **_kwargs):
+        assert self.client is not None
+        for text in self.texts:
+            await self.client.session_update(
+                session_id,
+                AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(type="text", text=text),
+                ),
+            )
+        return SimpleNamespace(stop_reason="end_turn")
+
+    @staticmethod
+    def _model_config(model: str) -> SessionConfigOptionSelect:
+        return SessionConfigOptionSelect(
+            type="select",
+            id="model",
+            name="Model",
+            description=None,
+            category="model",
+            current_value=model,
+            options=[SessionConfigSelectOption(value=model, name=model, description=None)],
+        )
+
+
+def _chunking_acp_spawn(connection: _ChunkingAcpConnection):
+    @asynccontextmanager
+    async def _spawn(client, *_args, **_kwargs):
+        connection.client = client
+        yield connection, SimpleNamespace(pid=17)
+
+    return _spawn
 
 
 # ── command builder ──────────────────────────────────────────────────
@@ -122,6 +185,7 @@ class TestRunAcpJobSuccess:
             model="glm",
             effort=None,
             on_process_start=ANY,
+            on_text_delta=ANY,
         )
 
         # ── assert store result ──
@@ -434,6 +498,85 @@ class TestSafeErrorRedaction:
 
 
 class TestRunAcpJobEvents:
+    def test_protocol_shaped_acp_chunks_reach_job_tail(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        connection = _ChunkingAcpConnection(["streamed ", "text"], model="glm")
+
+        with patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _chunking_acp_spawn(connection),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt=SECRET,
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    effort=None,
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        events = _read_store_events(store, job_id)
+        assert [event["data"]["text"] for event in events if event["type"] == "log_delta"] == [
+            "streamed ",
+            "text",
+        ]
+        assert store.get_result(job_id)["output"] == "streamed text"
+
+    def test_success_events_stream_each_acp_text_delta(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+
+        async def _streaming_acp_prompt(*_args, **kwargs):
+            on_text_delta = kwargs["on_text_delta"]
+            on_text_delta("first ")
+            on_text_delta("second")
+            return AcpResult(
+                output="first second",
+                stop_reason="end_turn",
+                session_id="native-1",
+            )
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(side_effect=_streaming_acp_prompt),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt=SECRET,
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    effort=None,
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        events = _read_store_events(store, job_id)
+        acp_events = [
+            event
+            for event in events
+            if event["type"] in {"acp_command", "log_delta", "acp_completed"}
+        ]
+        assert [event["type"] for event in acp_events] == [
+            "acp_command",
+            "log_delta",
+            "log_delta",
+            "acp_completed",
+        ]
+        assert [event["data"]["text"] for event in acp_events if event["type"] == "log_delta"] == [
+            "first ",
+            "second",
+        ]
+
     def test_success_events_contain_acp_types(self, tmp_path):
         store, job_id = _create_job_store(tmp_path)
 

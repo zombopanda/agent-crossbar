@@ -147,8 +147,13 @@ class _OneShotClient:
     permission options according to the configured autonomy level.
     """
 
-    def __init__(self, autonomy: Autonomy) -> None:
+    def __init__(
+        self,
+        autonomy: Autonomy,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> None:
         self._autonomy = autonomy
+        self._on_text_delta = on_text_delta
         self._session_id: str | None = None
         self._output_parts: list[str] = []
         self._stop_reason = "unknown"
@@ -181,7 +186,13 @@ class _OneShotClient:
             if content is not None and getattr(content, "type", None) == "text":
                 text = getattr(content, "text", "")
                 if text:
-                    self._output_parts.append(str(text))
+                    delta = str(text)
+                    self._output_parts.append(delta)
+                    if self._on_text_delta is not None:
+                        try:
+                            self._on_text_delta(delta)
+                        except Exception:
+                            logger.warning("ACP text-delta observer failed", exc_info=True)
 
     async def write_text_file(self, session_id: str, path: str, content: str, **kwargs: Any) -> Any:
         return None  # Not supported in one-shot mode
@@ -340,6 +351,7 @@ async def run_acp_prompt(
     effort: str | None = None,
     startup_timeout: float = 30.0,
     on_process_start: Callable[[int], None] | None = None,
+    on_text_delta: Callable[[str], None] | None = None,
 ) -> AcpResult:
     """Launch a provider, optionally set model, run one ACP prompt, and return the result.
 
@@ -374,6 +386,8 @@ async def run_acp_prompt(
         startup_timeout: Maximum seconds for initialize, session creation,
             and model selection before the job fails as a startup timeout.
         on_process_start: Optional callback receiving the child PID.
+        on_text_delta: Optional callback receiving each assistant text chunk.
+            Observer failures are logged and never interrupt the provider run.
 
     Returns:
         ``AcpResult`` with ``output``, ``stop_reason``, and ``session_id``.
@@ -389,7 +403,7 @@ async def run_acp_prompt(
     except ValueError:
         raise AcpProtocolError(f"Invalid autonomy: {autonomy}", stage="prompt_delivery") from None
 
-    client_impl = _OneShotClient(normalized_autonomy)
+    client_impl = _OneShotClient(normalized_autonomy, on_text_delta=on_text_delta)
 
     async def _run() -> AcpResult:
         try:

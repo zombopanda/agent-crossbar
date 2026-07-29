@@ -1118,24 +1118,184 @@ class TestDoctorCLI:
 # ── New tests for review fixes ────────────────────────────────────────────────
 
 
-class TestChatGPTProDegraded:
-    """ChatGPT Pro must return degraded (not ready) on macOS — can't prove auth."""
+class FakeCuaRunner:
+    """Deterministic stand-in for the read-only cua-driver probe calls."""
 
-    def test_chatgpt_pro_returns_degraded_on_macos(self, monkeypatch):
-        """On macOS, chatgpt_pro must return degraded with authenticated=False."""
-        import platform
+    def __init__(self, apps=None, windows=None, trees=None, missing=False, fail_tool=None):
+        self.apps = apps if apps is not None else []
+        self.windows = windows if windows is not None else {}
+        self.trees = trees if trees is not None else {}
+        self.missing = missing
+        self.fail_tool = fail_tool
+        self.tools: list[str] = []
 
-        if platform.system() != "Darwin":
-            pytest.skip("This test verifies macOS-specific behavior")
+    def run(self, args, timeout=None, cwd=None, env=None):
+        import subprocess as _sp
 
-        result = check_chatgpt_pro_readiness()
-        assert result.state == "degraded", (
-            f"Expected 'degraded', got '{result.state}'. "
-            "chatgpt_pro must never claim authenticated from macOS alone."
-        )
+        if self.missing:
+            raise FileNotFoundError(2, "No such file or directory", args[0])
+        tool = args[2]
+        payload = json.loads(args[3])
+        self.tools.append(tool)
+        if tool == self.fail_tool:
+            return _sp.CompletedProcess(args, 1, "", "cua-driver refused")
+        if tool == "list_apps":
+            body = {"apps": self.apps}
+        elif tool == "list_windows":
+            body = {"windows": self.windows.get(payload.get("pid"), [])}
+        elif tool == "get_window_state":
+            body = {"tree_markdown": self.trees.get(payload.get("window_id"), "")}
+        elif tool == "check_permissions":
+            body = {"accessibility": True, "screen_recording": True}
+        else:  # pragma: no cover - a mutating tool would be a contract break
+            raise AssertionError(f"readiness probe must not call {tool}")
+        return _sp.CompletedProcess(args, 0, json.dumps(body), "")
+
+
+SIGNED_IN_TREE = (
+    'AXWindow "ChatGPT"\n[1] AXTextArea = "Ask ChatGPT" (Chat with ChatGPT)\n[2] AXButton "Pro"'
+)
+SIGNED_OUT_TREE = (
+    'AXWindow "ChatGPT"\n'
+    '[1] AXTextField = "chatgpt.com" (Address and search bar)\n'
+    'AXWebArea "ChatGPT"\n'
+    '[2] AXButton "Log in"\n[3] AXButton "Sign up"'
+)
+# A backgrounded window exposes only its own chrome plus history menu items —
+# never a page. It must never be read as a signed-out ChatGPT.
+BACKGROUNDED_TREE = (
+    'AXWindow "ChatGPT" [actions=[raise]]\n'
+    "AXToolbar\n"
+    '[449] AXMenuItem "Notion - Log in"\n'
+    '[572] AXMenuItem "Error processing form - Log in - PyPI"'
+)
+
+
+def helium_runner(**kwargs):
+    return FakeCuaRunner(
+        apps=[{"bundle_id": "net.imput.helium", "pid": 123, "running": True}],
+        windows={123: [{"pid": 123, "window_id": 456, "title": "ChatGPT"}]},
+        **kwargs,
+    )
+
+
+class TestChatGPTProBrowserReadiness:
+    """Readiness inspects the browser surface, non-mutating and truthfully."""
+
+    @pytest.fixture(autouse=True)
+    def _force_macos(self, monkeypatch):
+        monkeypatch.setattr("platform.system", lambda: "Darwin")
+
+    def test_signed_in_pro_browser_is_ready(self):
+        runner = helium_runner(trees={456: SIGNED_IN_TREE})
+
+        result = check_chatgpt_pro_readiness(runner)
+
+        assert result.state == "ready"
+        assert result.authenticated is True
+        assert result.auth_mode == "browser_session"
+        assert result.billing_mode == "subscription_quota"
+        assert result.subscription_type == "chatgpt_pro"
+        assert "browser=Helium" in (result.evidence or "")
+        assert "composer=present" in (result.evidence or "")
+
+    def test_probe_only_uses_read_only_tools(self):
+        runner = helium_runner(trees={456: SIGNED_IN_TREE})
+
+        check_chatgpt_pro_readiness(runner)
+
+        assert set(runner.tools) <= {
+            "list_apps",
+            "list_windows",
+            "get_window_state",
+            "check_permissions",
+        }
+
+    def test_signed_out_browser_needs_auth(self):
+        runner = helium_runner(trees={456: SIGNED_OUT_TREE})
+
+        result = check_chatgpt_pro_readiness(runner)
+
+        assert result.state == "needs_auth"
         assert result.authenticated is False
-        assert result.error_code == "chatgpt_pro_manual_gate"
-        assert "cannot be automatically verified" in (result.remediation or "").lower()
+        assert result.error_code == "chatgpt_pro_not_authenticated"
+        assert "sign in" in (result.remediation or "").lower()
+
+    def test_no_supported_browser_running(self):
+        result = check_chatgpt_pro_readiness(FakeCuaRunner(apps=[]))
+
+        assert result.state == "degraded"
+        assert result.error_code == "chatgpt_pro_browser_not_running"
+        assert "chatgpt.com" in (result.remediation or "")
+        assert "desktop app" not in (result.remediation or "").lower()
+
+    def test_browser_without_chatgpt_window(self):
+        runner = FakeCuaRunner(
+            apps=[{"bundle_id": "com.google.Chrome", "pid": 7, "running": True}],
+            windows={7: [{"pid": 7, "window_id": 1, "title": "Gitea"}]},
+        )
+
+        result = check_chatgpt_pro_readiness(runner)
+
+        assert result.state == "degraded"
+        assert result.error_code == "chatgpt_pro_window_not_found"
+        assert result.authenticated is False
+
+    def test_backgrounded_window_is_unverified_not_signed_out(self):
+        """History entries in a backgrounded window must not read as signed out."""
+        runner = helium_runner(trees={456: BACKGROUNDED_TREE})
+
+        result = check_chatgpt_pro_readiness(runner)
+
+        assert result.state == "degraded"
+        assert result.error_code == "chatgpt_pro_readiness_unverified"
+        assert result.authenticated is False
+
+    def test_unreadable_composer_is_unverified_not_ready(self):
+        runner = helium_runner(trees={456: 'AXWindow "ChatGPT"'})
+
+        result = check_chatgpt_pro_readiness(runner)
+
+        assert result.state == "degraded"
+        assert result.error_code == "chatgpt_pro_readiness_unverified"
+        assert "Helium" in (result.evidence or "")
+
+    def test_missing_cua_driver_reports_missing_binary(self):
+        result = check_chatgpt_pro_readiness(FakeCuaRunner(missing=True))
+
+        assert result.state == "missing_binary"
+        assert result.error_code == "chatgpt_pro_cua_driver_missing"
+
+    def test_failed_probe_is_degraded_with_remediation(self):
+        result = check_chatgpt_pro_readiness(FakeCuaRunner(fail_tool="list_apps"))
+
+        assert result.state == "degraded"
+        assert result.error_code == "chatgpt_pro_browser_probe_failed"
+        assert result.authenticated is False
+
+    def test_readiness_is_cached_within_the_ttl(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+        readiness_cache.clear()
+        runner = helium_runner(trees={456: SIGNED_IN_TREE})
+
+        first = probe_profile("chatgpt_pro", runner, use_cache=True)
+        calls_after_first = len(runner.tools)
+        second = probe_profile("chatgpt_pro", runner, use_cache=True)
+
+        assert first.state == "ready"
+        assert second.timestamp == first.timestamp
+        assert len(runner.tools) == calls_after_first
+        readiness_cache.clear()
+
+    def test_registration_alone_is_not_ready(self):
+        result = check_chatgpt_pro_readiness(FakeCuaRunner(apps=[]))
+
+        assert result.state != "ready"
+        assert result.authenticated is False
+
+
+class TestChatGPTProDegraded:
+    """ChatGPT Pro must never claim readiness it cannot prove."""
 
     def test_chatgpt_pro_returns_unsupported_os_on_linux(self, monkeypatch):
         """On non-macOS, chatgpt_pro must return unsupported_os."""
@@ -1145,12 +1305,12 @@ class TestChatGPTProDegraded:
             assert result.state == "unsupported_os"
             assert result.authenticated is False
 
-    def test_chatgpt_pro_never_claims_ready(self, monkeypatch):
-        """chatgpt_pro probe must NEVER return state='ready' or authenticated=True."""
+    def test_chatgpt_pro_never_claims_ready_without_evidence(self, monkeypatch):
+        """chatgpt_pro must never return ready without live browser evidence."""
         for fake_os in ("Darwin", "Linux", "Windows"):
             with monkeypatch.context() as m:
                 m.setattr("platform.system", lambda: fake_os)
-                result = check_chatgpt_pro_readiness()
+                result = check_chatgpt_pro_readiness(FakeCuaRunner(apps=[]))
                 assert result.state != "ready", (
                     f"chatgpt_pro returned 'ready' on {fake_os} — must never claim ready"
                 )

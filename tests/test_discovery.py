@@ -1047,12 +1047,11 @@ def test_validation_allows_effort_supported_by_model(tmp_path: Path) -> None:
     assert result["effort"] == "high"
 
 
-def test_validation_graceful_when_discovery_fails(tmp_path: Path) -> None:
-    """When discovery fails (no cache), validation still passes for known efforts."""
+def test_validation_fails_when_codex_discovery_fails(tmp_path: Path) -> None:
+    """Codex validation must not fall back to a static model allowlist."""
+    import agent_crossbar.discovery as _disc
     from agent_crossbar.validation import validate_start_request
 
-    # No cache — discovery would try to spawn codex but fail
-    # Validation should fall back to static effort list
     req = {
         "operation": "review",
         "profile": "codex",
@@ -1064,9 +1063,12 @@ def test_validation_graceful_when_discovery_fails(tmp_path: Path) -> None:
         "model": "gpt-5.6-sol",
         "effort": "medium",
     }
-    result = validate_start_request(req, state_root=tmp_path)
-    # Should still pass since medium is in the static CODEX_EFFORTS list
-    assert result["ok"] is True
+    with patch.object(_disc, "discover_profile_models", side_effect=RuntimeError("CLI not found")):
+        result = validate_start_request(req, state_root=tmp_path)
+
+    assert result["ok"] is False
+    assert result["error"] == "discovery_error"
+    assert result["job_created"] is False
 
 
 # ── CLI version detection ───────────────────────────────────────────────────
@@ -2091,6 +2093,53 @@ def _make_catalog(
         ),
         cache_hit=cache_hit,
     )
+
+
+def test_codex_preflight_accepts_model_advertised_by_live_discovery(tmp_path: Path) -> None:
+    """Validation must accept a model that the same live discovery publishes."""
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.validation import validate_start_request
+
+    catalog = _make_catalog(models=["gpt-5.6-luna"])
+    req = {
+        "operation": "review",
+        "profile": "codex",
+        "transport": "print",
+        "autonomy": "read_only",
+        "sensitivity": "normal",
+        "prompt": "x",
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+    }
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        result = validate_start_request(req, state_root=tmp_path)
+
+    assert result["ok"] is True
+    assert result["model"] == "gpt-5.6-luna"
+
+
+def test_codex_preflight_rejects_model_absent_from_live_discovery(tmp_path: Path) -> None:
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.validation import validate_start_request
+
+    catalog = _make_catalog(models=["gpt-5.6-luna"])
+    req = {
+        "operation": "review",
+        "profile": "codex",
+        "transport": "print",
+        "autonomy": "read_only",
+        "sensitivity": "normal",
+        "prompt": "x",
+        "model": "gpt-5.6-sol",
+        "effort": "medium",
+    }
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        result = validate_start_request(req, state_root=tmp_path)
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_model"
 
 
 # ── OpenCode preflight: discover_profile_models integration ──

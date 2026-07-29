@@ -26,7 +26,7 @@ def _no_live_model_discovery(tmp_path, monkeypatch):
 
     Isolate the state dir (never touch the real ``~/.local/state`` cache)
     and default discovery to a fast, deterministic failure so these tests
-    exercise validation logic against the static registry, not whatever
+    exercise validation logic against a deterministic discovered catalog, not whatever
     codex/opencode/claude happen to be installed on the test machine.
     """
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
@@ -35,6 +35,13 @@ def _no_live_model_discovery(tmp_path, monkeypatch):
     import agent_crossbar.discovery as _disc
 
     def _boom(state_root, profile, *, refresh=False):
+        if profile == "codex":
+            return ModelCatalog(
+                models=("gpt-5.6-sol", "gpt-5.6-terra"),
+                default_model="gpt-5.6-sol",
+                native_efforts=("low", "medium", "high", "max"),
+                source="test",
+            )
         if profile == "claude":
             return ModelCatalog(
                 models=(

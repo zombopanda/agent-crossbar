@@ -10,3 +10,4 @@ __pycache__/
 *.tgz
 dist/
 uv.lock
+docs/agents

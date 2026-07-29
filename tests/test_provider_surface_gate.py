@@ -221,6 +221,8 @@ def test_max_runtime_sec_reaches_wait_for_result_deadline(monkeypatch):
     async def fake_call(session, tool, args, timeout_sec=120):
         if tool == "agent_start":
             return {"ok": True, "job_id": "fake-job"}
+        if tool == "job_list":
+            return {"ok": True, "jobs": [{"job_id": "fake-job"}]}
         return {}
 
     monkeypatch.setattr(gate, "_call", fake_call)
@@ -241,7 +243,7 @@ def test_max_runtime_sec_reaches_wait_for_result_deadline(monkeypatch):
 def test_main_allows_ask_task(monkeypatch):
     captured = {}
 
-    def fake_run(func, cases):
+    def fake_run(func, cases, *args):
         captured["func"] = func
         captured["cases"] = cases
         return 0
@@ -267,7 +269,7 @@ def test_main_allows_ask_task(monkeypatch):
 def test_main_allows_review_task(monkeypatch):
     captured = {}
 
-    def fake_run(func, cases):
+    def fake_run(func, cases, *args):
         captured["cases"] = cases
         return 0
 
@@ -288,7 +290,61 @@ def test_main_allows_review_task(monkeypatch):
     assert captured["cases"][0].interactive is False
 
 
-def _two_phase_mock(monkeypatch, *, agent_start_response=None, job_result_response=None):
+def test_task_all_expands_to_each_noninteractive_operation_once():
+    args = gate._parse_args(
+        [
+            "--profile",
+            "opencode",
+            "--model",
+            "glm-5.2",
+            "--task",
+            "all",
+            "--task",
+            "ask",
+        ]
+    )
+
+    cases = gate._cases_from_args(args)
+
+    assert [case.task for case in cases] == ["ask", "review", "dev"]
+    assert all(case.interactive is False for case in cases)
+
+
+def test_full_surface_preflight_checks_discovery_and_readiness(monkeypatch):
+    calls = []
+
+    async def fake_call(session, tool, args, timeout_sec=120):
+        calls.append(tool)
+        if tool == "profiles_list":
+            return {
+                "ok": True,
+                "profiles": ["opencode"],
+                "profile_details": {"opencode": {"models": ["glm-5.2"], "interactive": False}},
+            }
+        if tool == "profile_health":
+            return {"ok": True, "profiles": [{"profile": "opencode", "state": "ready"}]}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(gate, "_call", fake_call)
+
+    outcome, details = anyio.run(
+        gate._run_full_surface_preflight,
+        object(),
+        [gate.GateCase("opencode", "glm-5.2", None, "ask", False)],
+    )
+
+    assert outcome.ok is True
+    assert details["opencode"]["interactive"] is False
+    assert calls == ["profiles_list", "profile_health"]
+
+
+def _two_phase_mock(
+    monkeypatch,
+    *,
+    agent_start_response=None,
+    job_result_response=None,
+    job_tail_response=None,
+):
     """Mock _call for the two-phase agent_start + job_result pattern.
 
     First call returns agent_start (with job_id), second returns job_result.
@@ -305,11 +361,55 @@ def _two_phase_mock(monkeypatch, *, agent_start_response=None, job_result_respon
         if tool == "job_result":
             return job_result_response or {}
         if tool == "job_tail":
-            return {"ok": True, "output": "", "events": []}
+            return job_tail_response or {"ok": True, "output": "", "events": []}
+        if tool == "job_list":
+            return {"ok": True, "jobs": [{"job_id": "fake-job-123"}]}
         return {}
 
     monkeypatch.setattr(gate, "_call", fake_call)
     return calls
+
+
+def _acp_tail(*deltas: str):
+    events = [{"type": "acp_command", "data": {}}]
+    events.extend({"type": "log_delta", "data": {"text": delta}} for delta in deltas)
+    events.append({"type": "acp_completed", "data": {}})
+    return {"ok": True, "events": events}
+
+
+def test_oneshot_acp_gate_rejects_missing_text_delta(monkeypatch):
+    _two_phase_mock(
+        monkeypatch,
+        agent_start_response={"ok": True, "job_id": "fake-job-123", "backend": "acp"},
+        job_result_response={"ok": True, "output": "GPT_PRO_PROVIDER_GATE_OK"},
+        job_tail_response=_acp_tail(),
+    )
+
+    result = anyio.run(
+        gate._run_oneshot_ask_case,
+        object(),
+        gate.GateCase("codex", "gpt-5.6-sol", None, "ask", False),
+    )
+
+    assert result.ok is False
+    assert "log_delta" in result.message
+
+
+def test_oneshot_acp_gate_accepts_ordered_text_deltas(monkeypatch):
+    _two_phase_mock(
+        monkeypatch,
+        agent_start_response={"ok": True, "job_id": "fake-job-123", "backend": "acp"},
+        job_result_response={"ok": True, "output": "GPT_PRO_PROVIDER_GATE_OK"},
+        job_tail_response=_acp_tail("GPT_PRO_", "PROVIDER_GATE_OK"),
+    )
+
+    result = anyio.run(
+        gate._run_oneshot_ask_case,
+        object(),
+        gate.GateCase("codex", "gpt-5.6-sol", None, "ask", False),
+    )
+
+    assert result.ok is True
 
 
 @pytest.mark.parametrize(
@@ -481,6 +581,10 @@ CLAUDE_OUTPUT_MULTILINE_ANSWER_WITH_SENTINEL = (
     "⏺ Reply with exactly GPT_PROVIDER_GATE_OK\n...\n⏺ Sure! Here you go:\n\nGPT_PROVIDER_GATE_OK\n"
 )
 
+CLAUDE_OUTPUT_ECHO_THEN_LABELLED_ANSWER = (
+    "you: Reply with exactly GPT_PROVIDER_GATE_OK\n...\nclaude: GPT_PROVIDER_GATE_OK\n"
+)
+
 
 def test_claude_sentinel_rejects_prompt_echo_only():
     """Output that only echoes the prompt must not trigger a false positive."""
@@ -504,6 +608,23 @@ def test_claude_sentinel_accepts_multiline_answer_with_standalone_sentinel():
     assert gate._claude_sentinel_received(
         "GPT_PROVIDER_GATE_OK", CLAUDE_OUTPUT_MULTILINE_ANSWER_WITH_SENTINEL
     )
+
+
+def test_claude_sentinel_accepts_labelled_transcript_answer_after_prompt_echo():
+    """Current Claude TUI labels the answer instead of prefixing it with ⏺."""
+    assert gate._claude_sentinel_received(
+        "GPT_PROVIDER_GATE_OK", CLAUDE_OUTPUT_ECHO_THEN_LABELLED_ANSWER
+    )
+
+
+def test_reasonix_footer_accepts_noisy_transcript_before_terminal_answer():
+    output = (
+        "⌘ MCP · filesystem      ✓ connected\n"
+        "GPT_PRO_PROVIDER_GATE_OK\n\n"
+        "— turns:1 cache:0.0% cost:$0.001568 save-vs-claude:95.4%\n"
+    )
+
+    assert gate._reasonix_sentinel_with_footer(output, profile="reasonix")
 
 
 def test_standalone_sentinel_finds_line_in_noisy_output():

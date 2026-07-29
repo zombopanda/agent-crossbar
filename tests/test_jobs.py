@@ -1073,9 +1073,7 @@ def test_cross_session_note_in_denied_responses(tmp_path):
         operation="review",
         client_session_id="thread-a",
     )
-    expected_note = (
-        "pass client_session_id=\"*\" for explicit local cross-session access"
-    )
+    expected_note = 'pass client_session_id="*" for explicit local cross-session access'
 
     # job_tail
     tail = store.job_tail(job.job_id, client_session_id="thread-b")

@@ -58,6 +58,42 @@ def test_removed_fields_are_absent_from_agent_start() -> None:
     assert fields.isdisjoint(removed)
 
 
+def test_gui_hardening_adds_no_provider_specific_public_fields() -> None:
+    """Browser lifecycle state stays internal: no new public request fields."""
+    fields = set(inspect.signature(server.agent_start).parameters)
+    provider_specific = {
+        "browser",
+        "browser_profile",
+        "tab_key",
+        "session_id",
+        "storage_state",
+        "transport",
+        "stop_selector",
+        "stability_sec",
+        "attachments",
+    }
+
+    assert fields.isdisjoint(provider_specific)
+
+
+def test_generic_scope_is_threaded_into_the_internal_request() -> None:
+    """`scope` reaches the runner as a generic field, never a provider field."""
+    source = inspect.getsource(server.agent_start)
+
+    assert 'req["scope"] = scope' in source
+    assert "chatgpt" not in source.casefold().replace("chatgpt_pro", "")
+
+
+def test_job_stop_cancellation_is_transport_neutral() -> None:
+    """`JobStore.stop_job` must never branch on a provider name."""
+    from agent_crossbar import jobs
+
+    source = inspect.getsource(jobs.JobStore.stop_job)
+
+    assert "chatgpt" not in source.casefold()
+    assert "run_handles.cancel(job_id)" in source
+
+
 def test_agent_start_model_is_required() -> None:
     parameter = inspect.signature(server.agent_start).parameters["model"]
     assert parameter.default is inspect.Parameter.empty

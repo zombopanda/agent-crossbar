@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_crossbar.run_handles import run_handles
 from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete,
     interactive_tmux_output_summary,
@@ -286,6 +287,17 @@ class JobStore:
             "truncated": next_offset < size,
             "text": decoded,
         }, next_offset
+
+    def job_status(self, job_id: str) -> str | None:
+        """Return the durable status for *job_id*, or None when it is unknown.
+
+        Workers use this to observe a stop that raced their own startup before
+        they touch any provider state.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return None
+        return str(self._read_job_meta(job.path).get("status") or "running")
 
     def update_job_meta(self, job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         """Merge updates into a job's meta.json."""
@@ -975,6 +987,15 @@ class JobStore:
             except OSError as exc:
                 data["print_stop"] = "error"
                 data["print_stop_error"] = str(exc)
+
+        # Generic, transport-neutral provider cancellation. A worker that
+        # registered a run handle observes the cancellation on its next check
+        # and performs its own provider-side cleanup; this call only requests
+        # it and collects bounded metadata. No provider name is branched on
+        # here — every transport uses the same interface.
+        handle_data = run_handles.cancel(job_id)
+        if handle_data is not None:
+            data["run_handle_stop"] = handle_data
 
         job.events.write(
             level="info",

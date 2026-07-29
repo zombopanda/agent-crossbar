@@ -21,13 +21,23 @@ on:
         required: false
         type: string
       task:
-        description: "Task to test"
+        description: "Task to test (all runs ask, review, and dev)"
         required: true
         type: choice
+        default: all
         options:
+          - all
           - ask
           - review
           - dev
+      coverage:
+        description: "Live API surface coverage"
+        required: true
+        type: choice
+        default: all-supported-tools
+        options:
+          - core
+          - all-supported-tools
       interactive:
         description: "Test interactive mode"
         required: false
@@ -75,6 +85,7 @@ jobs:
           INTERACTIVE: ${{ inputs.interactive }}
           MODEL: ${{ inputs.model }}
           EFFORT: ${{ inputs.effort }}
+          COVERAGE: ${{ inputs.coverage }}
           MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec }}
         run: |
           MODEL_ARG=""
@@ -85,10 +96,15 @@ jobs:
           if [ -n "${EFFORT}" ]; then
             EFFORT_ARG="--effort ${EFFORT}"
           fi
+          COVERAGE_ARG=""
+          if [ "${COVERAGE}" = "all-supported-tools" ]; then
+            COVERAGE_ARG="--all-supported-tools"
+          fi
           /tmp/ci-venv/bin/python scripts/provider_surface_gate.py \
             --profile "${PROFILE}" \
             ${MODEL_ARG} \
             ${EFFORT_ARG} \
+            ${COVERAGE_ARG} \
             --task "${TASK}" \
             --interactive "${INTERACTIVE}" \
             --max-runtime-sec "${MAX_RUNTIME_SEC:-600}"

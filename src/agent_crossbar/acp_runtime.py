@@ -141,6 +141,15 @@ async def run_acp_job(
             current = store._read_job_meta(job.path)
             store.update_job_meta(job_id, {**current, "acp_pid": pid})
 
+        def _record_acp_text_delta(text: str) -> None:
+            store.send_event(
+                job_id,
+                level="info",
+                type="log_delta",
+                message="ACP output received",
+                data={"text": text},
+            )
+
         result: AcpResult = await run_acp_prompt(
             command,
             prompt,
@@ -150,6 +159,7 @@ async def run_acp_job(
             model=model,
             effort=effort,
             on_process_start=_record_acp_pid,
+            on_text_delta=_record_acp_text_delta,
         )
     except AcpProviderUnavailableError as exc:
         safe = _safe_error(exc, prompt)

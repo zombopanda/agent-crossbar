@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_MAX_RUNTIME_SEC = 1800
 RESULT_COMPLETION_GRACE_SEC = 15
+ALL_TASKS = ("ask", "review", "dev")
 BLOCKING_PROMPTS = (
     "Allow once",
     "Allow always",
@@ -192,8 +193,39 @@ async def _wait_for_result(
         if result.get("error") == "result_not_ready":
             await anyio.sleep(2)
             continue
-        return result, tail
+        final_tail = await _call(
+            session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
+        )
+        final_tail_text = json.dumps(final_tail, ensure_ascii=False)
+        if _contains_blocking_prompt(final_tail_text):
+            return {
+                "ok": False,
+                "error": "blocking_prompt",
+                "summary": final_tail_text[-4000:],
+            }, final_tail
+        return result, final_tail
     return {"ok": False, "error": "timed_out", "summary": str(last)}, tail
+
+
+async def _check_job_is_listed(
+    session: ClientSession,
+    job_id: str,
+    case: GateCase,
+) -> CheckResult | None:
+    listed = await _call(
+        session,
+        "job_list",
+        {"profile": case.profile, "limit": 100},
+        timeout_sec=60,
+    )
+    if not listed.get("ok"):
+        return CheckResult(False, f"{case.label} job_list failed: {listed}")
+    jobs = listed.get("jobs")
+    if not isinstance(jobs, list) or not any(
+        str(job.get("job_id")) == job_id for job in jobs if isinstance(job, dict)
+    ):
+        return CheckResult(False, f"{case.label} job_list did not include {job_id}")
+    return None
 
 
 def _reasonix_sentinel_with_footer(output: str, *, profile: str) -> bool:
@@ -201,9 +233,9 @@ def _reasonix_sentinel_with_footer(output: str, *, profile: str) -> bool:
         return False
     lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
     return (
-        len(lines) == 2
-        and lines[0] == "GPT_PRO_PROVIDER_GATE_OK"
-        and _REASONIX_FOOTER_RE.fullmatch(lines[1]) is not None
+        len(lines) >= 2
+        and lines[-2] == "GPT_PRO_PROVIDER_GATE_OK"
+        and _REASONIX_FOOTER_RE.fullmatch(lines[-1]) is not None
     )
 
 
@@ -266,6 +298,11 @@ def _claude_sentinel_received(sentinel: str, output: str) -> bool:
             remainder = stripped[1:].strip()
             if remainder.lower() == sentinel.lower():
                 return True
+        # Current Claude Code transcripts label the answer explicitly.
+        if stripped.casefold().startswith("claude:"):
+            remainder = stripped.split(":", 1)[1].strip()
+            if remainder == sentinel:
+                return True
     return False
 
 
@@ -278,6 +315,9 @@ async def _run_dev_case(session: ClientSession, case: GateCase, cwd: Path) -> Ch
         return CheckResult(False, f"{case.label} agent_start failed: {start}")
 
     job_id = str(start["job_id"])
+    listed = await _check_job_is_listed(session, job_id, case)
+    if listed is not None:
+        return listed
     result, tail = await _wait_for_result(
         session,
         job_id,
@@ -292,6 +332,10 @@ async def _run_dev_case(session: ClientSession, case: GateCase, cwd: Path) -> Ch
         return CheckResult(
             False, f"{case.label} failed: {result.get('error', 'unknown')}\n{summary}"
         )
+
+    stream = _check_acp_stream(case, start, tail)
+    if stream is not None:
+        return stream
 
     workspace = _verify_reverse_words_workspace(cwd)
     if not workspace.ok:
@@ -317,13 +361,19 @@ async def _run_oneshot_ask_case(session: ClientSession, case: GateCase) -> Check
     if not start.get("ok"):
         return CheckResult(False, f"{case.label} agent_start failed: {start}")
     job_id = str(start["job_id"])
-    result, _tail = await _wait_for_result(
+    listed = await _check_job_is_listed(session, job_id, case)
+    if listed is not None:
+        return listed
+    result, tail = await _wait_for_result(
         session,
         job_id,
         timeout_sec=case.max_runtime_sec + RESULT_COMPLETION_GRACE_SEC,
     )
     if not result.get("ok"):
         return CheckResult(False, f"{case.label} failed: {result}")
+    stream = _check_acp_stream(case, start, tail)
+    if stream is not None:
+        return stream
     output = result.get("output") or result.get("summary") or ""
     return _check_sentinel(case, output)
 
@@ -336,6 +386,12 @@ async def _run_interactive_ask_case(session: ClientSession, case: GateCase) -> C
     if not start.get("ok"):
         return CheckResult(False, f"{case.label} agent_start failed: {start}")
     job_id = str(start["job_id"])
+    listed = await _check_job_is_listed(session, job_id, case)
+    if listed is not None:
+        await _call(
+            session, "job_stop", {"job_id": job_id, "reason": "job_list_missing"}, timeout_sec=30
+        )
+        return listed
 
     # 1. Wait for initial output (settling) and check first sentinel
     initial, _ = await _poll_tail_text(session, job_id, timeout_sec=60, settling_sec=8.0)
@@ -382,6 +438,194 @@ async def _run_interactive_ask_case(session: ClientSession, case: GateCase) -> C
         )
 
     return CheckResult(True, f"{case.label}: two sentinels, {cleanup_msg}, job terminal")
+
+
+CHATGPT_PROFILE = "chatgpt_pro"
+CHATGPT_LONG_PROMPT = (
+    "Write a detailed, multi-section architectural review of a distributed job "
+    "queue, at least 1500 words, covering delivery guarantees, backpressure, "
+    "observability, and failure modes."
+)
+CHATGPT_STOP_GRACE_SEC = 20
+
+
+def _events(tail: dict[str, Any]) -> list[dict[str, Any]]:
+    events = tail.get("events")
+    return (
+        [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+    )
+
+
+def _check_acp_stream(
+    case: GateCase,
+    start: dict[str, Any],
+    tail: dict[str, Any],
+) -> CheckResult | None:
+    """Require ACP jobs to expose at least one real text delta in ``job_tail``."""
+    if start.get("backend") != "acp":
+        return None
+
+    events = _events(tail)
+    event_types = [str(event.get("type")) for event in events]
+    required = ("acp_command", "log_delta", "acp_completed")
+    missing = [event_type for event_type in required if event_type not in event_types]
+    if missing:
+        return CheckResult(
+            False,
+            f"{case.label} ACP stream missing lifecycle event(s): {', '.join(missing)}",
+        )
+
+    first_delta = event_types.index("log_delta")
+    if not (event_types.index("acp_command") < first_delta < event_types.index("acp_completed")):
+        return CheckResult(False, f"{case.label} ACP stream lifecycle order is invalid")
+
+    text = "".join(
+        str(event.get("data", {}).get("text", ""))
+        for event in events
+        if event.get("type") == "log_delta" and isinstance(event.get("data"), dict)
+    )
+    if not text.strip():
+        return CheckResult(False, f"{case.label} ACP stream emitted no assistant text")
+    return None
+
+
+async def _run_chatgpt_readiness_case(session: ClientSession) -> CheckResult:
+    """Readiness must describe the browser surface, never the desktop app."""
+    data = await _call(session, "profile_health", {}, timeout_sec=120)
+    profiles = data.get("profiles") or data.get("health") or data
+    entry: dict[str, Any] | None = None
+    if isinstance(profiles, dict):
+        entry = profiles.get(CHATGPT_PROFILE)
+    elif isinstance(profiles, list):
+        entry = next(
+            (item for item in profiles if item.get("profile") == CHATGPT_PROFILE),
+            None,
+        )
+    if not isinstance(entry, dict):
+        return CheckResult(False, f"profile_health did not report {CHATGPT_PROFILE}: {data}")
+
+    remediation = str(entry.get("remediation") or "").casefold()
+    evidence = str(entry.get("evidence") or "")
+    if "desktop app" in remediation or "desktop application" in remediation:
+        return CheckResult(
+            False,
+            f"{CHATGPT_PROFILE} readiness still requires the native desktop app: {remediation}",
+        )
+    state = entry.get("state")
+    if state == "ready":
+        if not entry.get("authenticated"):
+            return CheckResult(False, "readiness reported ready without authenticated=True")
+        if "browser=" not in evidence:
+            return CheckResult(False, f"ready evidence does not name the browser: {evidence!r}")
+        return CheckResult(True, f"{CHATGPT_PROFILE} readiness: ready ({evidence})")
+    if not entry.get("error_code") or not entry.get("remediation"):
+        return CheckResult(
+            False, f"{CHATGPT_PROFILE} non-ready state {state} lacks actionable remediation"
+        )
+    return CheckResult(
+        True,
+        f"{CHATGPT_PROFILE} readiness: {state} ({entry.get('error_code')}) — actionable, not ready",
+    )
+
+
+async def _wait_for_event(
+    session: ClientSession,
+    job_id: str,
+    event_type: str,
+    *,
+    timeout_sec: int,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        tail = await _call(
+            session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
+        )
+        for event in _events(tail):
+            if event.get("type") == event_type:
+                return event
+        if tail.get("status") not in (None, "running"):
+            return None
+        await anyio.sleep(2)
+    return None
+
+
+async def _run_chatgpt_cancellation_case(session: ClientSession, case: GateCase) -> CheckResult:
+    """Maintainer-only: prove job_stop cancels a live browser generation."""
+    args = _agent_start_args(case)
+    args["prompt"] = CHATGPT_LONG_PROMPT
+    start = await _call(session, "agent_start", args, timeout_sec=180)
+    job_id = start.get("job_id")
+    if not job_id:
+        return CheckResult(False, f"cancellation gate could not start a job: {start}")
+
+    submitted = await _wait_for_event(session, job_id, "prompt_submitted", timeout_sec=300)
+    if submitted is None:
+        tail = await _call(
+            session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
+        )
+        seen = [event.get("type") for event in _events(tail)]
+        errors = [
+            str(event.get("message"))[:300]
+            for event in _events(tail)
+            if event.get("type") in ("error", "cancelled")
+        ]
+        return CheckResult(
+            False,
+            "cancellation gate never observed prompt_submitted "
+            f"(status={tail.get('status')}, events={seen}, errors={errors})",
+        )
+
+    stopped = await _call(session, "job_stop", {"job_id": job_id}, timeout_sec=120)
+    if not stopped.get("ok"):
+        return CheckResult(False, f"job_stop failed: {stopped}")
+
+    await anyio.sleep(CHATGPT_STOP_GRACE_SEC)
+    tail = await _call(session, "job_tail", {"job_id": job_id, "max_bytes": 50000}, timeout_sec=60)
+    if tail.get("status") != "stopped":
+        return CheckResult(False, f"job is not durably stopped: status={tail.get('status')}")
+
+    cancelled = [event for event in _events(tail) if event.get("type") == "cancelled"]
+    stop_events = [event for event in _events(tail) if event.get("type") == "stopped"]
+    handle_stops = [
+        event
+        for event in stop_events
+        if isinstance(event.get("data"), dict) and "run_handle_stop" in event["data"]
+    ]
+    if not handle_stops:
+        return CheckResult(False, "job_stop did not invoke a registered run handle")
+
+    # For a stopped job `ok` means "a terminal answer exists", not "the provider
+    # succeeded" — the late-success violation is a status that is no longer stopped.
+    result = await _call(session, "job_result", {"job_id": job_id}, timeout_sec=120)
+    if result.get("status") != "stopped":
+        return CheckResult(
+            False,
+            f"a late provider result overwrote the stopped status: {str(result)[:400]}",
+        )
+
+    stop_confirmed = any(
+        isinstance(event.get("data"), dict) and event["data"].get("provider_stop_confirmed")
+        for event in cancelled
+    )
+    return CheckResult(
+        True,
+        f"{case.label}: stop honoured (provider_stop_confirmed={stop_confirmed}, "
+        f"status=stopped, no late success)",
+    )
+
+
+async def _run_chatgpt_isolation_case(session: ClientSession, case: GateCase) -> CheckResult:
+    """Maintainer-only: sequential turns must not cross-contaminate."""
+    first = await _run_ask_case(session, case)
+    if not first.ok:
+        return CheckResult(False, f"isolation gate first turn failed: {first.message}")
+    second = await _run_ask_case(session, case)
+    if not second.ok:
+        return CheckResult(False, f"isolation gate second turn failed: {second.message}")
+    return CheckResult(
+        True,
+        f"{case.label}: two sequential turns each returned their own correlated answer",
+    )
 
 
 def _check_sentinel(case: GateCase, output: str) -> CheckResult:
@@ -498,7 +742,67 @@ def _server_params(env: dict[str, str]) -> StdioServerParameters:
     )
 
 
-async def _run_cases(cases: list[GateCase]) -> int:
+async def _run_full_surface_preflight(
+    session: ClientSession,
+    cases: list[GateCase],
+) -> tuple[CheckResult, dict[str, dict[str, Any]]]:
+    """Exercise discovery/readiness before running the selected live cases."""
+    listed = await _call(session, "profiles_list", {}, timeout_sec=120)
+    if not listed.get("ok"):
+        return CheckResult(False, f"profiles_list failed: {listed}"), {}
+    profiles = listed.get("profiles")
+    details = listed.get("profile_details")
+    if not isinstance(profiles, list) or not isinstance(details, dict):
+        return CheckResult(False, f"profiles_list returned malformed data: {listed}"), {}
+
+    selected_profiles = {case.profile for case in cases}
+    missing_profiles = selected_profiles - {str(profile) for profile in profiles}
+    if missing_profiles:
+        return CheckResult(
+            False, f"profiles_list omitted selected profile(s): {sorted(missing_profiles)}"
+        ), {}
+
+    typed_details = {
+        str(profile): detail for profile, detail in details.items() if isinstance(detail, dict)
+    }
+    for case in cases:
+        models = typed_details.get(case.profile, {}).get("models")
+        if not isinstance(models, list) or case.model not in models:
+            return CheckResult(
+                False,
+                f"profiles_list did not advertise {case.profile}/{case.model}",
+            ), typed_details
+
+    health = await _call(session, "profile_health", {}, timeout_sec=120)
+    if not health.get("ok"):
+        return CheckResult(False, f"profile_health failed: {health}"), typed_details
+    health_rows = health.get("profiles") or health.get("health")
+    if isinstance(health_rows, dict):
+        health_by_profile = health_rows
+    elif isinstance(health_rows, list):
+        health_by_profile = {
+            str(row.get("profile")): row for row in health_rows if isinstance(row, dict)
+        }
+    else:
+        return CheckResult(
+            False, f"profile_health returned malformed data: {health}"
+        ), typed_details
+    non_ready = [
+        profile
+        for profile in selected_profiles
+        if not isinstance(health_by_profile.get(profile), dict)
+        or health_by_profile[profile].get("state") != "ready"
+    ]
+    if non_ready:
+        return CheckResult(False, f"profile_health not ready: {sorted(non_ready)}"), typed_details
+    return CheckResult(True, "profiles_list and profile_health passed"), typed_details
+
+
+async def _run_cases(
+    cases: list[GateCase],
+    lifecycle: bool = False,
+    all_supported_tools: bool = False,
+) -> int:
     with tempfile.TemporaryDirectory(prefix="agents-provider-gate-state-") as state_root:
         env = os.environ.copy()
         env["AGENT_CROSSBAR_STATE_DIR"] = state_root
@@ -509,6 +813,29 @@ async def _run_cases(cases: list[GateCase]) -> int:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                profile_details: dict[str, dict[str, Any]] = {}
+                if all_supported_tools:
+                    preflight, profile_details = await _run_full_surface_preflight(session, cases)
+                    print(preflight.message)
+                    if not preflight.ok:
+                        return 1
+                if lifecycle:
+                    readiness = await _run_chatgpt_readiness_case(session)
+                    print(readiness.message)
+                    if not readiness.ok:
+                        failed = True
+                    for case in cases:
+                        if case.profile != CHATGPT_PROFILE:
+                            continue
+                        for runner_fn in (
+                            _run_chatgpt_cancellation_case,
+                            _run_chatgpt_isolation_case,
+                        ):
+                            outcome = await runner_fn(session, case)
+                            print(outcome.message)
+                            if not outcome.ok:
+                                failed = True
+                    return 1 if failed else 0
                 for case in cases:
                     if case.task == "dev":
                         with _workspace_tempdir() as work_dir:
@@ -526,6 +853,25 @@ async def _run_cases(cases: list[GateCase]) -> int:
                     print(result.message)
                     if not result.ok:
                         failed = True
+                if all_supported_tools:
+                    interactive_cases: set[tuple[str, str, str | None]] = set()
+                    for case in cases:
+                        detail = profile_details.get(case.profile, {})
+                        key = (case.profile, case.model, case.effort)
+                        if (
+                            case.interactive
+                            or not detail.get("interactive")
+                            or key in interactive_cases
+                        ):
+                            continue
+                        interactive_cases.add(key)
+                        result = await _run_interactive_ask_case(
+                            session,
+                            replace(case, task="ask", interactive=True),
+                        )
+                        print(result.message)
+                        if not result.ok:
+                            failed = True
         return 1 if failed else 0
 
 
@@ -537,18 +883,41 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--profile", action="append", required=True)
     parser.add_argument("--model", action="append", required=True)
     parser.add_argument("--effort", action="append", default=[])
-    parser.add_argument("--task", action="append", choices=["ask", "review", "dev"])
+    parser.add_argument("--task", action="append", choices=[*ALL_TASKS, "all"])
+    parser.add_argument(
+        "--all-supported-tools",
+        action="store_true",
+        help=(
+            "Run the full method surface claimed by selected profiles: discovery, health, "
+            "job listing, and an interactive ask for profiles that advertise it."
+        ),
+    )
     parser.add_argument(
         "--interactive", type=lambda s: s.lower() in ("true", "1", "yes"), default=False
     )
     parser.add_argument("--max-runtime-sec", type=int, default=DEFAULT_MAX_RUNTIME_SEC)
+    parser.add_argument(
+        "--chatgpt-lifecycle",
+        action="store_true",
+        help=(
+            "Maintainer-only: run the ChatGPT Pro browser lifecycle gate "
+            "(readiness, cancellation after submit, sequential isolation)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def _cases_from_args(args: argparse.Namespace) -> list[GateCase]:
     models = args.model
     efforts = args.effort or [None]
-    tasks = args.task or ["dev"]
+    requested_tasks = args.task or ["dev"]
+    tasks = tuple(
+        dict.fromkeys(
+            task
+            for requested in requested_tasks
+            for task in (ALL_TASKS if requested == "all" else (requested,))
+        )
+    )
     return [
         GateCase(
             profile=profile,
@@ -567,7 +936,7 @@ def _cases_from_args(args: argparse.Namespace) -> list[GateCase]:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    valid_tasks = {"ask", "review", "dev"}
+    valid_tasks = set(ALL_TASKS) | {"all"}
     unsupported = [task for task in (args.task or ["dev"]) if task not in valid_tasks]
     if unsupported:
         print(
@@ -575,7 +944,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    return anyio.run(_run_cases, _cases_from_args(args))
+    cases = _cases_from_args(args)
+    if args.chatgpt_lifecycle:
+        return anyio.run(_run_cases, cases, True, args.all_supported_tools)
+    return anyio.run(_run_cases, cases, False, args.all_supported_tools)
 
 
 if __name__ == "__main__":

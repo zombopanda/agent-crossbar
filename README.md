@@ -172,7 +172,7 @@ currently available model IDs before starting a job.
 | Profile | Tasks | Interactive | Notes |
 |---------|-------|-------------|-------|
 | `reasonix` | ask, review, dev | both | Supports noninteractive and interactive modes; results use heuristic TUI parsing |
-| `chatgpt_pro` | ask, review | false | Experimental macOS GUI adapter; requires a manual signed-in ChatGPT app/browser gate |
+| `chatgpt_pro` | ask, review | false | Experimental macOS browser adapter; requires an open, signed-in ChatGPT window in Helium, Chrome, or Safari plus `cua-driver` |
 
 ### Provider Prerequisites
 
@@ -227,7 +227,22 @@ The `doctor` CLI reports readiness and preflight failures only. It does **not** 
 | `opencode_missing` | OpenCode CLI not on PATH | Install the OpenCode CLI |
 | `reasonix_missing` | Reasonix CLI not on PATH | Install the Reasonix CLI |
 | `unsupported_os` | Provider requires different OS | Use a supported OS or different provider |
-| `chatgpt_pro_manual_gate` | ChatGPT Pro needs manual setup | Launch ChatGPT desktop app and sign in |
+| `chatgpt_pro_cua_driver_missing` | `cua-driver` is not installed or not on PATH | Install `cua-driver` and grant it accessibility permission |
+| `chatgpt_pro_browser_not_running` | No supported ChatGPT browser is running | Open https://chatgpt.com in Helium, Chrome, or Safari |
+| `chatgpt_pro_window_not_found` | A supported browser runs but has no ChatGPT window | Open a ChatGPT tab in that browser on the current desktop |
+| `chatgpt_pro_not_authenticated` | A ChatGPT window is open but signed out | Sign in with a ChatGPT Pro account |
+| `chatgpt_pro_readiness_unverified` | The ChatGPT window exists but its composer could not be read | Bring the window onto the current desktop and retry |
+| `chatgpt_pro_browser_probe_failed` | `cua-driver` could not inspect the desktop | Check its accessibility permissions, then retry |
+| `model_not_available` | The requested ChatGPT model is not offered by the visible picker | Pick a model shown in the ChatGPT UI (see `diagnostics.selection.available_choices`) |
+| `effort_not_available` | The requested effort is not offered by the visible picker | Omit `effort` or pick one the UI exposes |
+| `composer_not_empty` | An unrelated ChatGPT draft is open | Clear that draft; Agent Crossbar never overwrites it |
+| `prompt_verification_failed` | The composer did not contain the exact prompt before Send | Retry; the prompt was never submitted |
+| `session_mismatch` / `session_window_unavailable` | The owned ChatGPT window changed, closed, or became ambiguous | Retry without moving or closing that window mid-turn |
+| `generation_status_unavailable` | The prompt was submitted but its response could not be read safely | Check the ChatGPT window; the turn is never retried in another browser |
+| `generation_timed_out` | The prompt was submitted but did not finish within `max_runtime_sec` | Increase `max_runtime_sec` or shorten the request |
+| `cancelled` | `job_stop` cancelled the turn | Check `provider_stop_confirmed` in the `cancelled` event for whether the visible Stop action was clicked |
+| `context_path_missing` / `context_path_symlink` / `context_path_outside_cwd` | A `scope` path is missing, symlinked, or escapes `cwd` | Pass explicit, real paths inside `cwd` |
+| `attachment_missing` / `attachment_too_large` / `attachment_symlink` | A `scope.attachments` entry is missing, oversized, or symlinked | Pass a real file inside `cwd` under the size budget |
 | `missing_model` | `agent_start` omitted or passed an empty `model` | Call `profiles_list`, choose a model, and pass it explicitly |
 | `provider_limit_exhausted` | Provider quota, credits, or rate limit is exhausted | Wait for reset or choose another explicitly available model |
 | `provider_unavailable` | No backend is currently available for the selected model | Choose another model or retry after the provider recovers |
@@ -239,6 +254,11 @@ The `doctor` CLI reports readiness and preflight failures only. It does **not** 
 `job_stop` is idempotent. ACP jobs persist a terminal result even when the
 provider process has already exited; running ACP child processes receive
 SIGTERM and then SIGKILL after a bounded grace period when necessary.
+GUI (browser) jobs are marked terminal first, then their registered run handle
+is cancelled: the worker stops polling, clicks ChatGPT's visible Stop action
+when one is exposed, retires the browser session, and records whether the
+provider stop was actually confirmed. A late provider completion can never
+overwrite a stopped result.
 
 Stable error codes are guaranteed across patch versions. The `next_action` field in job results provides exact remediation.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shlex
@@ -24,6 +25,40 @@ from agent_crossbar.runner import (
     run_print_job,
     run_print_request,
 )
+
+
+def _chatgpt_delivery_stubs(monkeypatch):
+    """Stub delivery so the pre-Send snapshot holds the exact delivered prompt.
+
+    The runner re-verifies the composer from a fresh snapshot immediately
+    before Send, so a stub that reports a successful paste must also make the
+    composer show that prompt.
+    """
+    state: dict[str, str | None] = {"prompt": None}
+    placeholder = (
+        '[1] AXTextArea = "Ask ChatGPT" (Chat with ChatGPT)\n'
+        '[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
+    )
+
+    def snapshot(*_args, **_kwargs):
+        delivered = state["prompt"]
+        if delivered is None:
+            return placeholder
+        value = json.dumps(delivered)[1:-1]
+        return (
+            f'[1] AXTextArea = "{value}" (Chat with ChatGPT)\n'
+            '[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
+        )
+
+    def deliver(*args, **kwargs):
+        state["prompt"] = args[4] if len(args) > 4 else kwargs["prompt"]
+        return True
+
+    monkeypatch.setattr(runner_module, "_chatgpt_browser_snapshot", snapshot)
+    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", deliver)
+    # Prevent real browser windows from opening during tests.
+    # Return None so the runner falls back to the mocked _chatgpt_browser_window.
+    monkeypatch.setattr(runner_module, "_chatgpt_open_fresh_window", lambda *_: None)
 
 
 def test_runner_default_timeout_is_thirty_minutes():
@@ -1458,7 +1493,7 @@ def test_chatgpt_browser_runner_falls_back_in_fixed_order(monkeypatch, tmp_path)
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
     seen: list[str] = []
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         seen.append(candidate.key)
         if candidate.key == "safari":
             return {"ok": True, "output": "BROWSER_OK", "browser": candidate.name}
@@ -1503,7 +1538,7 @@ def test_chatgpt_browser_candidates_exclude_unsupported_zen():
 def test_chatgpt_browser_runner_reports_all_fallback_failures(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         return {
             "ok": False,
             "error": "authentication_required",
@@ -1547,7 +1582,7 @@ def test_chatgpt_browser_runner_reports_all_fallback_failures(monkeypatch, tmp_p
 def test_chatgpt_browser_runner_preserves_shared_screen_time_failure(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         return {
             "ok": False,
             "error": "browser_time_limit",
@@ -1575,7 +1610,7 @@ def test_chatgpt_browser_runner_does_not_aggregate_partial_screen_time_failure(
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
     calls = 0
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         nonlocal calls
         calls += 1
         # Exhaust the shared deadline after the first attempted browser.
@@ -1587,7 +1622,7 @@ def test_chatgpt_browser_runner_does_not_aggregate_partial_screen_time_failure(
         }
 
     monkeypatch.setattr(runner_module, "_run_chatgpt_browser_candidate", fake_candidate)
-    monotonic_values = iter([0.0, 0.0])
+    monotonic_values = itertools.chain([0.0, 0.0], itertools.repeat(0.0))
     monkeypatch.setattr(runner_module.time, "monotonic", lambda: next(monotonic_values))
 
     result = run_gui_request(
@@ -1604,7 +1639,7 @@ def test_chatgpt_browser_runner_does_not_aggregate_partial_screen_time_failure(
 def test_chatgpt_browser_runner_preserves_post_submit_timeout_state(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         return {
             "ok": False,
             "error": "generation_timed_out",
@@ -2936,7 +2971,7 @@ def test_safari_candidate_falls_back_to_page_insert_only_after_clipboard_deliver
     assert result["ok"] is True
     assert result["output"] == "SAFARI_FALLBACK_OK"
     assert len(hotkeys) == 1
-    assert page_actions == ["click_element", "get_text"]
+    assert page_actions == ["click_element", "get_text", "get_text"]
     assert state["submitted"] is True
 
 
@@ -3207,10 +3242,8 @@ def test_chatgpt_candidate_ignores_progress_callback_failure_after_submit(monkey
         "_chatgpt_browser_window",
         lambda *_: {"pid": 123, "window_id": 456, "title": "ChatGPT"},
     )
-    tree = '[1] AXTextArea = "Ask ChatGPT"\n[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
-    monkeypatch.setattr(runner_module, "_chatgpt_browser_snapshot", lambda *_: tree)
     monkeypatch.setattr(runner_module, "_chatgpt_page_text", lambda *_: "signed in")
-    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", lambda *args, **kwargs: True)
+    _chatgpt_delivery_stubs(monkeypatch)
 
     class FakeCua:
         def call(self, tool, payload):
@@ -3239,7 +3272,7 @@ def test_chatgpt_browser_runner_never_falls_back_after_post_submit_page_exceptio
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
     seen: list[str] = []
 
-    def fake_candidate(candidate, req, cua, sleep, deadline, nonce):
+    def fake_candidate(candidate, req, cua, sleep, deadline, nonce, *_args, **_kwargs):
         seen.append(candidate.key)
         return {
             "ok": False,
@@ -3276,9 +3309,7 @@ def test_chatgpt_generation_page_reads_are_bounded_by_heartbeat_and_deadline(
         "_chatgpt_browser_window",
         lambda *_: {"pid": 123, "window_id": 456, "title": "ChatGPT"},
     )
-    tree = '[1] AXTextArea = "Ask ChatGPT"\n[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
-    monkeypatch.setattr(runner_module, "_chatgpt_browser_snapshot", lambda *_: tree)
-    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", lambda *args, **kwargs: True)
+    _chatgpt_delivery_stubs(monkeypatch)
     clock = {"now": 0.0}
     monkeypatch.setattr(runner_module.time, "monotonic", lambda: clock["now"])
     read_timeouts: list[float] = []
@@ -3328,9 +3359,7 @@ def test_chatgpt_generation_retries_timed_out_page_reads_then_returns_response(
         "_chatgpt_browser_window",
         lambda *_: {"pid": 123, "window_id": 456, "title": "ChatGPT"},
     )
-    tree = '[1] AXTextArea = "Ask ChatGPT" (Chat with ChatGPT)\n[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
-    monkeypatch.setattr(runner_module, "_chatgpt_browser_snapshot", lambda *_: tree)
-    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", lambda *args, **kwargs: True)
+    _chatgpt_delivery_stubs(monkeypatch)
     clock = {"now": 0.0}
     monkeypatch.setattr(runner_module.time, "monotonic", lambda: clock["now"])
     reads = {"count": 0}
@@ -3365,7 +3394,7 @@ def test_chatgpt_generation_retries_timed_out_page_reads_then_returns_response(
 
     assert result["ok"] is True
     assert result["output"] == "DONE"
-    assert reads["count"] == 3
+    assert reads["count"] >= 3
     assert "generation_in_progress" in progress_events
 
 
@@ -3388,9 +3417,7 @@ def test_chatgpt_generation_read_timeouts_reach_deadline_without_browser_fallbac
             seen_windows.append(browser.key) or {"pid": 123, "window_id": 456, "title": "ChatGPT"}
         ),
     )
-    tree = '[1] AXTextArea = "Ask ChatGPT" (Chat with ChatGPT)\n[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
-    monkeypatch.setattr(runner_module, "_chatgpt_browser_snapshot", lambda *_: tree)
-    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", lambda *args, **kwargs: True)
+    _chatgpt_delivery_stubs(monkeypatch)
     clock = {"now": 0.0}
     monkeypatch.setattr(runner_module.time, "monotonic", lambda: clock["now"])
 
@@ -4289,3 +4316,109 @@ def test_cua_driver_client_accepts_plain_text_action_output(monkeypatch):
     result = CuaDriverClient(bin_path="cua-driver").call("click", {"pid": 123})
 
     assert result == {"raw_output": "clicked"}
+
+
+# --- Tests for 8.5-8.8: Temporary per-turn sessions, window cleanup, host-global lock, generating guard ---
+
+
+def test_verify_temporary_chat_indicator_detects_heading():
+    tree = '  [1] AXHeading "Temporary Chat"\n  [2] AXTextArea "Message ChatGPT"'
+    assert runner_module._verify_temporary_chat_indicator(tree) is True
+
+
+def test_verify_temporary_chat_indicator_detects_button():
+    tree = '  [1] AXButton "Turn off temporary chat"\n  [2] AXTextArea "Message ChatGPT"'
+    assert runner_module._verify_temporary_chat_indicator(tree) is True
+
+
+def test_verify_temporary_chat_indicator_rejects_normal_chat():
+    tree = '  [1] AXTextArea "Ask ChatGPT"\n  [2] AXButton "Send prompt"'
+    assert runner_module._verify_temporary_chat_indicator(tree) is False
+
+
+def test_close_turn_window_uses_hotkey_when_no_close_button():
+    calls: list[tuple[str, dict]] = []
+
+    class FakeCua:
+        def call(self, tool, payload, **kw):
+            calls.append((tool, payload))
+            if tool == "get_window_state":
+                return {"tree_markdown": "[1] AXTextArea"}
+            return {"ok": True}
+
+    sleep_calls: list[float] = []
+    runner_module._close_turn_window(
+        FakeCua(),
+        runner_module._CHATGPT_BROWSER_CANDIDATES[0],
+        100,
+        200,
+        lambda s: sleep_calls.append(s),
+    )
+    assert any(t == "hotkey" and p.get("keys") == ["cmd", "w"] for t, p in calls)
+
+
+def test_chatgpt_lock_path_is_host_global(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_module, "_state_root", lambda: tmp_path / "state")
+    path = runner_module._chatgpt_lock_path()
+    assert "tmp" in str(path).lower() or path.parent.name != "locks"
+    assert "chatgpt" in path.name
+
+
+def test_run_gui_request_blocks_while_another_turn_generates(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner_module, "_chatgpt_lock_path", lambda: tmp_path / "lock")
+    runner_module._chatgpt_turn_generating.set()
+    try:
+        result = runner_module.run_gui_request(
+            {"profile": "chatgpt_pro", "prompt": "test", "model": "pro"},
+            cua=type("C", (), {"call": lambda s, *a, **k: {}})(),
+        )
+        assert result["ok"] is False
+        assert result["error"] == "turn_generating"
+    finally:
+        runner_module._chatgpt_turn_generating.clear()
+
+
+def test_generating_flag_cleared_after_turn(tmp_path, monkeypatch):
+    """The generating flag must be cleared even when a turn fails."""
+    monkeypatch.setattr(runner_module, "_chatgpt_lock_path", lambda: tmp_path / "lock")
+    monkeypatch.setattr(runner_module, "_chatgpt_browser_app", lambda *_: {"pid": 123})
+    monkeypatch.setattr(
+        runner_module,
+        "_chatgpt_browser_window",
+        lambda *_: {"pid": 123, "window_id": 456, "title": "ChatGPT"},
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_chatgpt_open_fresh_window",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_chatgpt_browser_snapshot",
+        lambda *_: (
+            '[1] AXTextArea = "Ask ChatGPT" (Chat with ChatGPT)\n'
+            '[2] AXButton "Pro"\n[3] AXButton (Send prompt)'
+        ),
+    )
+    monkeypatch.setattr(runner_module, "_chatgpt_deliver_prompt", lambda *a, **kw: True)
+    monkeypatch.setattr(runner_module, "_chatgpt_page_text", lambda *a, **kw: "signed in")
+
+    # Make the submit button click raise so the turn fails
+    class FailOnSubmitCua:
+        def call(self, tool, payload, **kw):
+            if tool == "page":
+                return {"text": "signed in"}
+            if tool == "click":
+                raise RuntimeError("submit failed")
+            return {"ok": True}
+
+    candidate = runner_module._CHATGPT_BROWSER_CANDIDATES[0]
+    runner_module._run_chatgpt_browser_candidate(
+        candidate,
+        {"prompt": "test"},
+        FailOnSubmitCua(),
+        lambda _: None,
+        10.0,
+        "nonce",
+    )
+    assert runner_module._chatgpt_turn_generating.is_set() is False

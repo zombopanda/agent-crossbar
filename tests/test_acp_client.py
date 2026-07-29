@@ -286,6 +286,7 @@ def test_edit_local_read_titled_edit_file():
 def test_run_acp_prompt_success():
     conn = _Conn(texts=["hello ", "world"], stop_reason="end_turn", session_id="session-42")
     state = {}
+    deltas: list[str] = []
     with mock.patch(
         "agent_crossbar.acp_client.spawn_agent_process",
         _spawn(conn, state),
@@ -297,12 +298,14 @@ def test_run_acp_prompt_success():
                 "/tmp",
                 autonomy=Autonomy.EDIT_LOCAL,
                 model="test-model",
+                on_text_delta=deltas.append,
             )
         )
     assert isinstance(result, AcpResult)
     assert result.output == "hello world"
     assert result.stop_reason == "end_turn"
     assert result.session_id == "session-42"
+    assert deltas == ["hello ", "world"]
     assert state.get("cleaned") is True
 
 

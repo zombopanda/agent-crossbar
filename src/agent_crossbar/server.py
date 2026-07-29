@@ -513,6 +513,11 @@ def agent_start(
         req["model"] = model
     if cwd is not None:
         req["cwd"] = cwd
+    if scope is not None:
+        # Generic, provider-neutral context scope. Providers that support
+        # bounded context packing consume it from the internal request; no
+        # provider-specific public field is introduced.
+        req["scope"] = scope
     if effort is not None:
         req["effort"] = effort
     timeout_sec = max_runtime_sec or 1800

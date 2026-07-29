@@ -14,6 +14,27 @@ from agent_crossbar.profiles import (
 from agent_crossbar.validation import validate_start_request
 
 
+@pytest.fixture(autouse=True)
+def _stable_codex_model_catalog(monkeypatch):
+    """Keep Codex validation tests independent of the installed CLI catalog."""
+    import agent_crossbar.discovery as discovery
+
+    original_discover = discovery.discover_profile_models
+    catalog = ModelCatalog(
+        models=("gpt-5.6-sol", "gpt-5.6-terra"),
+        default_model="gpt-5.6-sol",
+        native_efforts=("low", "medium", "high", "max"),
+        source="test",
+    )
+
+    def discover(state_root, profile, *, refresh=False):
+        if profile == "codex":
+            return catalog
+        return original_discover(state_root, profile, refresh=refresh)
+
+    monkeypatch.setattr(discovery, "discover_profile_models", discover)
+
+
 def test_profiles_are_canonical_only():
     profiles = list_profiles()
     assert sorted(profiles) == ["chatgpt_pro", "claude", "codex", "opencode", "reasonix"]
@@ -272,7 +293,9 @@ def test_opencode_profile_exposes_all_opencode_go_models_and_defaults(tmp_path):
     )
 
     def discover(state_root, profile, *, refresh=False):
-        return claude_catalog if profile == "claude" else catalog
+        if profile == "claude":
+            return claude_catalog
+        return catalog
 
     with patch.object(_disc, "discover_profile_models", side_effect=discover):
         for operation, overrides in (
@@ -431,9 +454,19 @@ def test_model_is_explicitly_passed_for_all_profiles(tmp_path):
         native_efforts=("low", "medium", "high"),
         source="test",
     )
+    codex_catalog = ModelCatalog(
+        models=("gpt-5.6-sol",),
+        default_model="gpt-5.6-sol",
+        native_efforts=("low", "medium", "high", "max"),
+        source="test",
+    )
 
     def discover(state_root, profile, *, refresh=False):
-        return claude_catalog if profile == "claude" else catalog
+        if profile == "claude":
+            return claude_catalog
+        if profile == "codex":
+            return codex_catalog
+        return catalog
 
     with patch.object(_disc, "discover_profile_models", side_effect=discover):
         # All profiles with explicit model should work

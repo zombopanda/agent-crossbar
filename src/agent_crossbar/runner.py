@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -17,7 +18,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from agent_crossbar.context import pack_context
 from agent_crossbar.env_compat import getenv
+from agent_crossbar.gui_lifecycle import (
+    ChatGptSession,
+    CompletionTracker,
+    DomHealthTracker,
+    JobArtifactStore,
+    ResponseObservation,
+    TurnLifecycle,
+    prompt_mismatch_diagnostics,
+    sessions,
+    verify_owned_window,
+)
 from agent_crossbar.jobs import JobStore, default_state_root
 from agent_crossbar.providers import (
     _opencode_model_id,
@@ -26,6 +39,7 @@ from agent_crossbar.providers import (
     reasonix_shell_env,
     reasonix_shell_mcp_spec,
 )
+from agent_crossbar.run_handles import run_handles
 from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete,
     interactive_tmux_output_summary,
@@ -73,6 +87,7 @@ _TMUX_INHERITED_ENV_KEYS = frozenset(
 _TMUX_CLEAN_ENV_KEYS = _TMUX_INHERITED_ENV_KEYS | {"TERM"}
 _TMUX_LITERAL_PROMPT_MAX_BYTES = 8192
 _TMUX_PASTE_SETTLE_SEC = 0.5
+_chatgpt_turn_generating = threading.Event()
 
 
 def _candidate_home_dirs() -> list[Path]:
@@ -234,13 +249,26 @@ def _prepare_prompt(req: dict[str, Any]) -> str:
 
 
 def _chatgpt_lock_path() -> Path:
-    return _state_root() / "locks" / "chatgpt_pro.lock"
+    return Path(tempfile.gettempdir()) / "agent-crossbar-chatgpt-pro.lock"
 
 
 def _acquire_chatgpt_lock(stale_after_sec: int = 900) -> tuple[bool, Path, str | None]:
     path = _chatgpt_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
+
+    # Check legacy lock path for backward compatibility with processes that
+    # were started before the lock moved to /tmp.
+    legacy_path = _state_root() / "locks" / "chatgpt_pro.lock"
+    if legacy_path.exists():
+        try:
+            legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+            legacy_age = now - float(legacy.get("created_at", 0))
+            if legacy_age <= stale_after_sec:
+                return False, legacy_path, "Another chatgpt_pro GUI job is already running"
+        except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
     try:
         current = json.loads(path.read_text(encoding="utf-8"))
         created_at = float(current.get("created_at", 0))
@@ -282,10 +310,14 @@ def _write_text_clipboard(text: str) -> None:
         pass
 
 
-def _chatgpt_prompt(req: dict[str, Any], nonce: str) -> tuple[str, str, str]:
+def _chatgpt_prompt(
+    req: dict[str, Any], nonce: str, *, context_text: str = ""
+) -> tuple[str, str, str]:
     begin = f"BEGIN_AGENTS_MCP_RESPONSE_{nonce}"
     end = f"END_AGENTS_MCP_RESPONSE_{nonce}"
     prompt = _prepare_prompt(req).rstrip()
+    if context_text:
+        prompt = f"{context_text.rstrip()}\n\n{prompt}"
     wrapped = (
         "You are the ChatGPT Pro advisor called by agents MCP. "
         "Answer the user's request directly and do not mention these transport instructions.\n\n"
@@ -503,6 +535,17 @@ def _chatgpt_app(cua: Any) -> dict[str, Any]:
     ):
         raise RuntimeError("Native ChatGPT app did not launch")
     return launched
+
+
+def _list_browser_windows(cua: Any, pid: int | None) -> list[dict[str, Any]] | None:
+    """Return the raw window list for *pid*, or None when it cannot be read."""
+    if pid is None:
+        return None
+    try:
+        windows = cua.call("list_windows", {"pid": pid}).get("windows", [])
+    except Exception:
+        return None
+    return [window for window in windows if isinstance(window, dict)]
 
 
 def _find_windows_on_current_space(cua: Any, pid: int) -> list[dict[str, Any]]:
@@ -770,6 +813,80 @@ def _find_chatgpt_web_send_button(tree: str) -> int | None:
     return None
 
 
+def _find_chatgpt_web_stop_button(tree: str) -> int | None:
+    """Return the visible Stop control while ChatGPT is generating.
+
+    The live label is ``Stop answering``; earlier builds used ``Stop`` and
+    ``Stop generating``. Match the whole family rather than a fixed list, so a
+    UI wording change cannot silently make a running turn look idle.
+    """
+    for line in tree.splitlines():
+        if not re.search(r"AXButton\b", line):
+            continue
+        label = (_chatgpt_web_control_label(line) or "").casefold().strip()
+        if label == "stop" or label.startswith("stop "):
+            index = _element_index(line)
+            if index is not None:
+                return index
+    return None
+
+
+def _chatgpt_response_is_running(tree: str) -> bool:
+    """True while ChatGPT still exposes a Stop control for the active turn."""
+    return _find_chatgpt_web_stop_button(tree) is not None
+
+
+def _chatgpt_completion_action_visible(tree: str) -> bool:
+    """True when ChatGPT exposes an idle-turn action (copy, or a fresh Send).
+
+    ChatGPT swaps the composer's Send control for Stop while a turn streams,
+    so a visible Send (or a response Copy action) is the visible evidence that
+    the turn is no longer running.
+    """
+    if _find_latest_chatgpt_copy_action(tree) is not None:
+        return True
+    return _find_chatgpt_web_send_button(tree) is not None
+
+
+def _chatgpt_model_choices(tree: str) -> list[str]:
+    """Return the visible model/effort choice labels, deduplicated in order."""
+    choices: list[str] = []
+    for line in tree.splitlines():
+        if not re.search(r"AX(?:PopUpButton|Button|MenuItem|RadioButton)\b", line):
+            continue
+        label = (_chatgpt_web_control_label(line) or "").strip()
+        if not label:
+            continue
+        normalized = label.casefold()
+        if normalized in {"auto", "pro", "low", "medium", "high", "instant", "thinking"}:
+            if label not in choices:
+                choices.append(label)
+    return choices
+
+
+_EFFORT_CHOICES = frozenset({"low", "medium", "high"})
+
+
+def _chatgpt_requested_label(requested: str | None, available: list[str]) -> str | None:
+    """Resolve a requested public model/effort onto a live visible choice label.
+
+    Matching is exact on the visible label or on a token of the requested
+    value (``gpt-5-pro`` → ``Pro``).  No default is invented: an unmatched
+    request returns None so the caller can fail closed.
+    """
+    if not requested:
+        return None
+    normalized = requested.strip().casefold()
+    if not normalized:
+        return None
+    tokens = {token for token in re.split(r"[^a-z0-9]+", normalized) if token}
+    for label in available:
+        candidate = label.casefold()
+        if candidate == normalized or candidate in tokens:
+            return label
+    return None
+
+
 def _chatgpt_web_composer_value(tree: str, text_area: int) -> str | None:
     marker = re.search(
         rf'(?m)^\s*(?:-\s*)?\[{text_area}\]\s+AXTextArea(?:\s+"[^"]*")?\s*=\s*"',
@@ -963,25 +1080,30 @@ def _chatgpt_browser_window(
                 tree,
                 re.IGNORECASE,
             )
+            # Only raise the browser when the page is not already exposed over
+            # accessibility: a rendered window can be driven entirely in the
+            # background, without taking the user's foreground or key focus.
+            needs_activation = _find_first_text_area(tree) is None
             if re.search(r'AXWebArea\s+(?:"ChatGPT"|\(ChatGPT\))', tree):
-                return {**window, "pid": target_pid}
+                return {**window, "pid": target_pid, "needs_activation": needs_activation}
             if has_chatgpt_address:
-                return {**window, "pid": target_pid}
+                return {**window, "pid": target_pid, "needs_activation": needs_activation}
         return None
+
+    def maybe_activate(window: dict[str, Any], target_pid: int) -> dict[str, Any]:
+        if candidate.key != "safari" and window.get("needs_activation", True):
+            _activate_chatgpt_browser(candidate, target_pid, int(window["window_id"]))
+        return window
 
     initial_windows = browser_windows(pid)
     window = chatgpt_window(initial_windows, pid)
     if window is not None:
-        if candidate.key != "safari":
-            _activate_chatgpt_browser(candidate, pid, int(window["window_id"]))
-        return window
+        return maybe_activate(window, pid)
     for _ in range(5):
         sleep(0.2)
         window = chatgpt_window(browser_windows(pid), pid)
         if window is not None:
-            if candidate.key != "safari":
-                _activate_chatgpt_browser(candidate, pid, int(window["window_id"]))
-            return window
+            return maybe_activate(window, pid)
     launch_args = (
         [
             "open",
@@ -1041,9 +1163,7 @@ def _chatgpt_browser_window(
             windows = browser_windows(candidate_pid)
             window = chatgpt_window(windows, candidate_pid)
             if window is not None:
-                if candidate.key != "safari":
-                    _activate_chatgpt_browser(candidate, candidate_pid, int(window["window_id"]))
-                return window
+                return maybe_activate(window, candidate_pid)
     raise RuntimeError(f"{candidate.name} did not expose a ChatGPT window")
 
 
@@ -1087,6 +1207,126 @@ end run
         pass
 
 
+def _verify_temporary_chat_indicator(tree: str) -> bool:
+    """Return True when the AX tree contains the temporary-chat indicator.
+
+    Checks for an AXHeading containing "Temporary Chat" or an AXButton
+    containing "Turn off temporary chat" (case-insensitive). Either match
+    suffices.
+    """
+    lowered = tree.casefold()
+    for line in lowered.splitlines():
+        if "axheading" in line and "temporary chat" in line:
+            return True
+        if "axbutton" in line and "turn off temporary chat" in line:
+            return True
+    return False
+
+
+def _close_turn_window(
+    cua: Any,
+    candidate: ChatGptBrowserCandidate,
+    pid: int,
+    window_id: int,
+    sleep: Callable[[float], None],
+) -> None:
+    """Close a single browser window without terminating the app.
+
+    Never raises — cleanup code must be silent.
+    """
+    try:
+        state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
+        tree = str(state.get("tree_markdown") or "")
+        close_idx: int | None = None
+        for label in ("Close", "Close tab"):
+            close_idx = _find_element(tree, label, role="AXButton")
+            if close_idx is not None:
+                break
+        if close_idx is not None:
+            cua.call(
+                "click",
+                {"pid": pid, "window_id": window_id, "element_index": close_idx},
+            )
+        else:
+            cua.call("hotkey", {"pid": pid, "keys": ["cmd", "w"]})
+    except Exception:
+        pass
+
+
+def _chatgpt_open_fresh_window(
+    cua: Any,
+    candidate: ChatGptBrowserCandidate,
+    sleep: Callable[[float], None],
+) -> dict[str, Any] | None:
+    """Open a new ChatGPT window whose composer is empty.
+
+    Used when the discovered window holds an unrelated draft: the user's text is
+    never cleared or overwritten, the turn simply takes a fresh window. Returns
+    ``{"pid", "window_id"}`` or None when no clean window could be obtained.
+
+    When a window is found with an empty composer, the function additionally
+    verifies that the visible ``Temporary Chat`` indicator is present so a
+    pre-existing non-temporary window is never returned by accident.
+    """
+    if candidate.key == "safari":
+        # Safari exposes no supported way to open a controlled extra window
+        # without disturbing the user's session; retire instead.
+        return None
+    try:
+        subprocess.run(
+            [
+                "open",
+                "-na",
+                candidate.name,
+                "--args",
+                "--new-window",
+                "https://chatgpt.com/?temporary-chat=true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    for _attempt in range(20):
+        if _attempt > 0:
+            sleep(0.5)
+        try:
+            apps = cua.call("list_apps", {}).get("apps", [])
+        except Exception:
+            # If the CUA cannot list apps on the first attempt, bail
+            # immediately — polling will not help.
+            if _attempt == 0:
+                return None
+            continue
+        pids = [
+            app.get("pid")
+            for app in apps
+            if isinstance(app, dict)
+            and app.get("bundle_id") == candidate.bundle_id
+            and isinstance(app.get("pid"), int)
+        ]
+        for pid in pids:
+            for window in _list_browser_windows(cua, pid) or []:
+                window_id = window.get("window_id")
+                if window_id is None:
+                    continue
+                try:
+                    state = cua.call("get_window_state", {"pid": pid, "window_id": int(window_id)})
+                except Exception:
+                    continue
+                tree = str(state.get("tree_markdown") or "")
+                text_area = _find_first_text_area(tree)
+                if text_area is None:
+                    continue
+                if _chatgpt_web_composer_is_empty(tree, text_area):
+                    if _verify_temporary_chat_indicator(tree):
+                        return {"pid": int(pid), "window_id": int(window_id)}
+    return None
+
+
 def _chatgpt_browser_snapshot(
     cua: Any,
     candidate: ChatGptBrowserCandidate,
@@ -1105,6 +1345,30 @@ def _chatgpt_browser_snapshot(
         if attempt < 9:
             sleep(0.5)
     return tree
+
+
+def _chatgpt_clear_composer(
+    cua: Any, pid: int, window_id: int, text_area: int
+) -> dict[str, Any] | None:
+    """Clear text this turn wrote into a composer it had proven empty.
+
+    Delivery is only attempted after the composer was verified empty, so any
+    remaining content belongs to this turn. Leaving a corrupted partial prompt
+    behind would pollute the user's draft and block every later turn with
+    ``composer_not_empty``.
+    """
+    try:
+        state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
+        current = _chatgpt_web_composer_value(str(state.get("tree_markdown") or ""), text_area)
+        if current is None or not current.strip():
+            return None
+        cua.call(
+            "set_value",
+            {"pid": pid, "window_id": window_id, "element_index": text_area, "value": ""},
+        )
+        return {"cleared": True, "chars": len(current)}
+    except Exception as exc:
+        return {"cleared": False, "error": exc.__class__.__name__}
 
 
 def _chatgpt_deliver_prompt(
@@ -1190,6 +1454,26 @@ def _chatgpt_deliver_prompt(
             if attempt < 4:
                 sleep(0.2)
         return False, last_state
+
+    # Preferred path: a background accessibility write. It never steals the
+    # user's keyboard focus, never moves the cursor, and never touches the
+    # clipboard. ChatGPT's composer accepts it and re-renders its Send control,
+    # which the exact verification below confirms.
+    trace["stage"] = "ax_set_value"
+    try:
+        ax_write = cua.call(
+            "set_value",
+            {"pid": pid, "window_id": window_id, "element_index": text_area, "value": prompt},
+        )
+    except Exception as exc:
+        ax_write = {"ok": False, "error": exc.__class__.__name__}
+    if succeeded(ax_write):
+        delivered, _state = verify_paste()
+        if delivered:
+            trace["stage"] = "verified"
+            trace["focus_mode"] = "background_ax"
+            return True
+        trace["ax_residue"] = _chatgpt_clear_composer(cua, pid, window_id, text_area)
 
     previous_clipboard = _read_text_clipboard()
     injected_clipboard = False
@@ -1427,6 +1711,245 @@ def _chatgpt_page_insert_prompt(
     return False
 
 
+def _find_chatgpt_web_option(tree: str, label: str) -> int | None:
+    """Return the picker option whose visible label equals *label*."""
+    wanted = label.casefold()
+    for line in tree.splitlines():
+        if not re.search(r"AX(?:Button|MenuItem|RadioButton)\b", line):
+            continue
+        if (_chatgpt_web_control_label(line) or "").casefold() != wanted:
+            continue
+        index = _element_index(line)
+        if index is not None:
+            return index
+    return None
+
+
+def _chatgpt_pick_choice(
+    cua: Any,
+    candidate: ChatGptBrowserCandidate,
+    pid: int,
+    window_id: int,
+    tree: str,
+    target: str,
+    sleep: Callable[[float], None],
+) -> str:
+    """Open the composer picker and select *target*, returning a fresh tree.
+
+    Accessibility presses land on a backgrounded window, so the browser is only
+    raised when a press did not take effect. That keeps the user's foreground
+    window and keyboard focus untouched in the normal case.
+    """
+
+    def press(element_index: int, settle: float) -> str:
+        cua.call(
+            "click",
+            {"pid": pid, "window_id": window_id, "element_index": element_index, "action": "press"},
+        )
+        sleep(settle)
+        state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
+        return str(state.get("tree_markdown") or "")
+
+    picker = _find_chatgpt_web_model_picker(tree)
+    if picker is None:
+        return tree
+    open_tree = press(picker, 0.3)
+    option = _find_chatgpt_web_option(open_tree, target)
+    if option is None:
+        # The menu did not open in the background — raise the window once and
+        # retry before giving up, so selection still fails closed, not silently.
+        _activate_chatgpt_browser(candidate, pid, window_id)
+        picker = _find_chatgpt_web_model_picker(open_tree) or picker
+        open_tree = press(picker, 0.3)
+        option = _find_chatgpt_web_option(open_tree, target)
+        if option is None:
+            return open_tree
+    return press(option, 0.5)
+
+
+def _chatgpt_active_label(tree: str) -> str | None:
+    picker_line = _chatgpt_web_model_picker_line(tree)
+    if picker_line is None:
+        return None
+    return _chatgpt_web_control_label(picker_line)
+
+
+def _chatgpt_verify_selection(
+    cua: Any,
+    candidate: ChatGptBrowserCandidate,
+    pid: int,
+    window_id: int,
+    tree: str,
+    req: dict[str, Any],
+    sleep: Callable[[float], None],
+    diagnostics: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Select and confirm the requested model (and effort) before any typing.
+
+    Returns ``(tree, failure)``.  No default model is invented: an explicitly
+    requested model that the live picker cannot confirm fails closed with the
+    redacted list of visible choices.  When no model is supplied by an
+    internal caller the historical Pro requirement is preserved.
+    """
+    available = _chatgpt_model_choices(tree)
+    model_choices = [label for label in available if label.casefold() not in _EFFORT_CHOICES]
+    requested_model = str(req.get("model") or "").strip()
+    target = _chatgpt_requested_label(requested_model, model_choices)
+    explicit = bool(requested_model)
+    if target is None and not explicit:
+        target = "Pro"
+
+    selection: dict[str, Any] = {
+        "requested_model": requested_model or None,
+        "available_choices": available,
+        "target": target,
+    }
+    diagnostics["selection"] = selection
+
+    if target is None:
+        diagnostics.update({"stage": "model_selection"})
+        return tree, {
+            "ok": False,
+            "error": "model_not_available",
+            "message": (
+                f"ChatGPT model {requested_model!r} is not offered by the visible "
+                f"{candidate.name} picker"
+            ),
+            "diagnostics": diagnostics,
+        }
+
+    if (_chatgpt_active_label(tree) or "").casefold() != target.casefold():
+        tree = _chatgpt_pick_choice(cua, candidate, pid, window_id, tree, target, sleep)
+    confirmed = (_chatgpt_active_label(tree) or "").casefold() == target.casefold()
+    selection["confirmed_model"] = _chatgpt_active_label(tree)
+
+    diagnostics.update(
+        {
+            "stage": "model_detection",
+            "model_detection": {
+                "composer_found": _find_first_text_area(tree) is not None,
+                "picker_found": _find_chatgpt_web_model_picker(tree) is not None,
+                "pro_detected": _chatgpt_web_active_model_is_pro(tree),
+            },
+        }
+    )
+    if not confirmed:
+        if explicit:
+            return tree, {
+                "ok": False,
+                "error": "model_not_available",
+                "message": (
+                    f"Could not confirm ChatGPT model {requested_model!r} in {candidate.name}"
+                ),
+                "diagnostics": diagnostics,
+            }
+        return tree, {
+            "ok": False,
+            "error": "model_not_pro",
+            "message": f"Could not confirm ChatGPT Pro in {candidate.name}",
+            "diagnostics": diagnostics,
+        }
+
+    requested_effort = str(req.get("effort") or "").strip()
+    if requested_effort:
+        effort_choices = [label for label in available if label.casefold() in _EFFORT_CHOICES]
+        selection["available_efforts"] = effort_choices
+        if not effort_choices:
+            # The published support matrix declares effort_support=False for
+            # this provider: record that the control was absent instead of
+            # failing a request the contract never promised to honour.
+            selection["effort"] = "control_absent"
+        else:
+            effort_target = _chatgpt_requested_label(requested_effort, effort_choices)
+            if effort_target is None:
+                return tree, {
+                    "ok": False,
+                    "error": "effort_not_available",
+                    "message": (
+                        f"ChatGPT effort {requested_effort!r} is not offered by the visible "
+                        f"{candidate.name} picker"
+                    ),
+                    "diagnostics": diagnostics,
+                }
+            tree = _chatgpt_pick_choice(cua, candidate, pid, window_id, tree, effort_target, sleep)
+            active = _chatgpt_active_label(tree)
+            selection["confirmed_effort"] = active
+            if (active or "").casefold() != effort_target.casefold():
+                return tree, {
+                    "ok": False,
+                    "error": "effort_not_available",
+                    "message": (
+                        f"Could not confirm ChatGPT effort {requested_effort!r} in {candidate.name}"
+                    ),
+                    "diagnostics": diagnostics,
+                }
+    return tree, None
+
+
+def _chatgpt_upload_capability(
+    cua: Any,
+    candidate: ChatGptBrowserCandidate,
+    pid: int,
+    window_id: int,
+    session_id: str,
+) -> tuple[bool, str]:
+    """Detect, read-only, whether this browser exposes a file-attachment route.
+
+    A ChatGPT attachment can only be delivered through CDP
+    (``browser_set_input_files``); there is no safe native file-dialog path.
+    Safari exposes no attachable CDP endpoint at all, and the Chromium route
+    requires an *owned* DevTools endpoint on an isolated profile, which by
+    construction is not the user's signed-in ChatGPT profile. This probe never
+    prepares or launches an endpoint — it only asks whether one already binds.
+    """
+    if candidate.key == "safari":
+        return False, "webkit_no_cdp_endpoint"
+    try:
+        state = cua.call(
+            "get_browser_state",
+            {"pid": pid, "window_id": window_id, "session": session_id},
+        )
+    except Exception as exc:
+        return False, f"browser_state_unavailable:{exc.__class__.__name__}"
+    if isinstance(state, dict) and state.get("status") == "refused":
+        refusal = state.get("refusal") if isinstance(state.get("refusal"), dict) else {}
+        return False, str(refusal.get("code") or "browser_route_unavailable")
+    return True, "cdp_bound"
+
+
+class ChatGptCancelled(RuntimeError):
+    """Raised inside a GUI turn once the durable job has been stopped."""
+
+
+def _check_cancelled(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise ChatGptCancelled("job_stopped")
+
+
+def _chatgpt_request_stop(
+    cua: Any,
+    pid: int | None,
+    window_id: int | None,
+    sleep: Callable[[float], None],
+) -> bool:
+    """Click ChatGPT's visible Stop control.  True only when it was clicked."""
+    if pid is None or window_id is None:
+        return False
+    try:
+        state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
+        tree = str(state.get("tree_markdown") or "")
+        stop = _find_chatgpt_web_stop_button(tree)
+        if stop is None:
+            return False
+        result = cua.call("click", {"pid": pid, "window_id": window_id, "element_index": stop})
+        sleep(0.2)
+        if isinstance(result, dict) and (result.get("ok") is False or result.get("error")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _run_chatgpt_browser_candidate(
     candidate: ChatGptBrowserCandidate,
     req: dict[str, Any],
@@ -1435,16 +1958,123 @@ def _run_chatgpt_browser_candidate(
     deadline: float,
     nonce: str,
     progress: Callable[[str, str, dict[str, Any]], None] | None = None,
+    *,
+    cancel: threading.Event | None = None,
+    session: ChatGptSession | None = None,
+    lifecycle: TurnLifecycle | None = None,
+    artifacts: JobArtifactStore | None = None,
+    context_text: str = "",
+    attachments: list[dict[str, Any]] | None = None,
+    stability_sec: float = 0.0,
 ) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {"stage": "browser_app"}
+    turn = lifecycle if lifecycle is not None else TurnLifecycle()
+
+    def stage(name: str, **data: Any) -> None:
+        event = turn.enter(name, **data)
+        if event is None or progress is None:
+            return
+        try:
+            progress("turn_stage", f"ChatGPT turn stage: {name}", {"stage": name, **data})
+        except Exception as exc:
+            diagnostics.setdefault("progress_reporting", []).append(
+                {
+                    "event_type": "turn_stage",
+                    "exception_type": exc.__class__.__name__,
+                    "exception_message": str(exc),
+                }
+            )
+
+    def owned(pid: int, window_id: int) -> dict[str, Any] | None:
+        """Fail closed when the live window is not the job's owned session."""
+        if session is None:
+            return None
+        if not session.matches(pid, window_id):
+            diagnostics.update(
+                {
+                    "stage": "session_mismatch",
+                    "session": session.snapshot(),
+                    "observed": {"pid": pid, "window_id": window_id},
+                }
+            )
+            session.retire("window_mismatch")
+            stage("failed", reason="session_mismatch")
+            return {
+                "ok": False,
+                "error": "session_mismatch",
+                "message": (
+                    "The discovered ChatGPT window is not the window this job owns; "
+                    "refusing to type or submit into it"
+                ),
+                "diagnostics": diagnostics,
+            }
+        ok, reason = verify_owned_window(session, _list_browser_windows(cua, pid))
+        if not ok and reason == "window_list_unavailable":
+            # The bound identity is still the only window this turn addresses;
+            # a transient driver read failure is recorded, not fatal.
+            diagnostics["session_verification"] = {"skipped": reason}
+            return None
+        if not ok:
+            diagnostics.update(
+                {"stage": "session_unverified", "session": session.snapshot(), "reason": reason}
+            )
+            session.retire(reason or "window_unverified")
+            stage("failed", reason=reason or "window_unverified")
+            return {
+                "ok": False,
+                "error": "session_window_unavailable",
+                "message": f"The owned ChatGPT window could not be verified ({reason})",
+                "diagnostics": diagnostics,
+            }
+        return None
+
+    _opened_fresh = False
+    _opened_pid: int | None = None
+    _opened_window_id: int | None = None
+
     try:
+        _check_cancelled(cancel)
+        stage("bootstrap", browser=candidate.name)
         app = _chatgpt_browser_app(cua, candidate, sleep)
         pid = int(app["pid"])
         diagnostics.update({"stage": "browser_window", "pid": pid})
-        window = _chatgpt_browser_window(cua, candidate, pid, sleep)
-        pid = int(window.get("pid", pid))
-        window_id = int(window["window_id"])
+        # Always try to open a fresh temporary-chat window first. If that
+        # fails (Safari, or the browser refused), fall back to discovering an
+        # existing window.
+        fresh = _chatgpt_open_fresh_window(cua, candidate, sleep)
+        diagnostics["fresh_window"] = bool(fresh)
+        window: dict[str, Any] = {}
+        if fresh is not None:
+            _opened_fresh = True
+            _opened_pid = int(fresh["pid"])
+            _opened_window_id = int(fresh["window_id"])
+            pid = _opened_pid
+            window_id = _opened_window_id
+        else:
+            window = _chatgpt_browser_window(cua, candidate, pid, sleep)
+            pid = int(window.get("pid", pid))
+            window_id = int(window["window_id"])
+            _opened_fresh = False
+        if session is not None:
+            session.bind(pid, window_id)
+            diagnostics["session"] = session.snapshot()
         diagnostics.update({"stage": "page_probe", "window_id": window_id})
+        _check_cancelled(cancel)
+        # When we opened a fresh window, it must expose the Temporary Chat
+        # indicator. A pre-existing non-temporary window is never accepted.
+        if _opened_fresh:
+            probe_tree = _chatgpt_browser_snapshot(cua, candidate, pid, window_id, sleep)
+            if not _verify_temporary_chat_indicator(probe_tree):
+                stage("failed", reason="temporary_chat_not_confirmed")
+                return {
+                    "ok": False,
+                    "error": "temporary_chat_not_confirmed",
+                    "message": (
+                        f"Opened a new ChatGPT window in {candidate.name}, but the "
+                        "Temporary Chat indicator was not found"
+                    ),
+                    "diagnostics": diagnostics,
+                }
         if "just a moment" in str(window.get("title") or "").casefold():
             return {
                 "ok": False,
@@ -1466,6 +2096,9 @@ def _run_chatgpt_browser_candidate(
                 "message": f"macOS Screen Time blocked {candidate.name}",
                 "diagnostics": diagnostics,
             }
+        mismatch = owned(pid, window_id)
+        if mismatch is not None:
+            return mismatch
         # Safari's Apple Events page probe clears the web composer focus. Its
         # fresh AX tree already exposes the signed-in composer, so use that
         # instead until after delivery has completed.
@@ -1499,70 +2132,60 @@ def _run_chatgpt_browser_candidate(
                 "message": f"macOS Screen Time blocked {candidate.name}",
                 "diagnostics": diagnostics,
             }
-        picker = _find_chatgpt_web_model_picker(tree)
-        if not _chatgpt_web_active_model_is_pro(tree):
-            if picker is not None:
-                _activate_chatgpt_browser(candidate, pid, window_id)
-                cua.call(
-                    "click",
-                    {
-                        "pid": pid,
-                        "window_id": window_id,
-                        "element_index": picker,
-                        "action": "press",
-                    },
-                )
-                sleep(0.3)
-                state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
-                tree = str(state.get("tree_markdown") or "")
-                option = _find_chatgpt_web_pro_option(tree)
-                if option is not None:
-                    _activate_chatgpt_browser(candidate, pid, window_id)
-                    cua.call(
-                        "click",
-                        {
-                            "pid": pid,
-                            "window_id": window_id,
-                            "element_index": option,
-                            "action": "press",
-                        },
-                    )
-                    sleep(0.5)
-                    state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
-                    tree = str(state.get("tree_markdown") or "")
-        diagnostics.update(
-            {
-                "stage": "model_detection",
-                "model_detection": {
-                    "composer_found": _find_first_text_area(tree) is not None,
-                    "picker_found": picker is not None,
-                    "pro_detected": _chatgpt_web_active_model_is_pro(tree),
-                },
-            }
+        stage("authenticated", browser=candidate.name)
+        _check_cancelled(cancel)
+        tree, selection_failure = _chatgpt_verify_selection(
+            cua, candidate, pid, window_id, tree, req, sleep, diagnostics
         )
-        if not _chatgpt_web_active_model_is_pro(tree):
-            return {
-                "ok": False,
-                "error": "model_not_pro",
-                "message": f"Could not confirm ChatGPT Pro in {candidate.name}",
-                "diagnostics": diagnostics,
-            }
+        if selection_failure is not None:
+            stage("failed", reason=str(selection_failure.get("error")))
+            return selection_failure
+        stage("model_selected", model=diagnostics.get("selection", {}).get("confirmed_model"))
 
         text_area = _find_first_text_area(tree)
         if text_area is None:
+            stage("failed", reason="message_input_not_found")
             return {
                 "ok": False,
                 "error": "message_input_not_found",
                 "message": f"Could not find ChatGPT input in {candidate.name}",
             }
         if not _chatgpt_web_composer_is_empty(tree, text_area):
+            # A non-empty composer after the fresh-window-first flow means
+            # we fell back to an existing window with a stray draft. Never
+            # overwrite it.
+            stage("failed", reason="composer_not_empty")
             return {
                 "ok": False,
                 "error": "composer_not_empty",
-                "message": f"Refusing to overwrite an existing ChatGPT draft in {candidate.name}",
+                "message": (f"Refusing to overwrite an existing ChatGPT draft in {candidate.name}"),
             }
+        stage("composer_ready")
+        if attachments:
+            # Explicit attachments were requested. Fail closed before the prompt
+            # is delivered rather than silently dropping the caller's files.
+            supported, reason = _chatgpt_upload_capability(
+                cua, candidate, pid, window_id, session.session_id if session else nonce
+            )
+            diagnostics["attachments"] = {
+                "requested": len(attachments),
+                "upload_supported": supported,
+                "reason": reason,
+            }
+            stage("failed", reason="attachment_upload_unsupported")
+            return {
+                "ok": False,
+                "error": "attachment_upload_unsupported",
+                "message": (
+                    f"{candidate.name} exposes no usable ChatGPT file-attachment route "
+                    f"({reason}); the prompt was not submitted. Inline the file contents "
+                    "through scope.paths instead."
+                ),
+                "diagnostics": diagnostics,
+            }
+        _check_cancelled(cancel)
 
-        prompt, begin, end = _chatgpt_prompt(req, nonce)
+        prompt, begin, end = _chatgpt_prompt(req, nonce, context_text=context_text)
         prompt_diagnostics: dict[str, Any] = {}
         diagnostics.update({"stage": "prompt_delivery", "prompt_delivery": prompt_diagnostics})
         delivered = _chatgpt_deliver_prompt(
@@ -1588,6 +2211,10 @@ def _run_chatgpt_browser_candidate(
                 diagnostics=safari_diagnostics,
             )
         if not delivered:
+            # Never leave our own partial prompt in the user's composer: it
+            # would block every later turn with composer_not_empty.
+            diagnostics["residue_cleanup"] = _chatgpt_clear_composer(cua, pid, window_id, text_area)
+            stage("failed", reason="prompt_insertion_failed")
             return {
                 "ok": False,
                 "error": "prompt_insertion_failed",
@@ -1595,8 +2222,42 @@ def _run_chatgpt_browser_candidate(
                 "diagnostics": diagnostics,
             }
         submit_tree = _chatgpt_browser_snapshot(cua, candidate, pid, window_id, sleep)
+        # Verify the exact expected prompt from a fresh snapshot immediately
+        # before Send. A truncated or altered composer must never be submitted.
+        observed = _chatgpt_web_composer_value(submit_tree, text_area)
+        if not _chatgpt_web_composer_matches_prompt(observed, prompt):
+            diagnostics["residue_cleanup"] = _chatgpt_clear_composer(cua, pid, window_id, text_area)
+            diagnostics["prompt_verification"] = {
+                "browser": candidate.name,
+                "stage": "pre_submit_verification",
+                **prompt_mismatch_diagnostics(prompt, observed),
+            }
+            stage("failed", reason="prompt_verification_failed")
+            if artifacts is not None:
+                artifacts.write(
+                    "prompt-verification-tree.txt",
+                    submit_tree,
+                    stage="prompt_verified",
+                    kind="ax_tree",
+                    session=session.snapshot() if session else None,
+                )
+            return {
+                "ok": False,
+                "error": "prompt_verification_failed",
+                "message": (
+                    f"The {candidate.name} composer did not contain the exact prompt; "
+                    "refusing to submit"
+                ),
+                "diagnostics": diagnostics,
+            }
+        stage("prompt_verified", expected_len=len(prompt))
+        mismatch = owned(pid, window_id)
+        if mismatch is not None:
+            return mismatch
+        _check_cancelled(cancel)
         send_button = _find_chatgpt_web_send_button(submit_tree)
         if send_button is None:
+            stage("failed", reason="prompt_submit_failed")
             return {
                 "ok": False,
                 "error": "prompt_submit_failed",
@@ -1609,6 +2270,7 @@ def _run_chatgpt_browser_candidate(
         if isinstance(submit_result, dict) and (
             submit_result.get("ok") is False or submit_result.get("error")
         ):
+            stage("failed", reason="prompt_submit_failed")
             return {
                 "ok": False,
                 "error": "prompt_submit_failed",
@@ -1637,12 +2299,40 @@ def _run_chatgpt_browser_candidate(
                     }
                 )
 
+        stage("submitted", browser=candidate.name)
+        _chatgpt_turn_generating.set()
         report_progress(
             "prompt_submitted",
             "ChatGPT prompt submitted",
             {"browser": candidate.name},
         )
+
+        completion = CompletionTracker(stability_sec=stability_sec)
+        health = DomHealthTracker()
+        streaming_reported = False
         while time.monotonic() < deadline:
+            if cancel is not None and cancel.is_set():
+                stopped = _chatgpt_request_stop(cua, pid, window_id, sleep)
+                diagnostics.update(
+                    {
+                        "stage": "cancelled",
+                        "provider_stop_confirmed": stopped,
+                        "elapsed_sec": int(time.monotonic() - submitted_at),
+                    }
+                )
+                stage("cancelled", provider_stop_confirmed=stopped)
+                if session is not None:
+                    session.retire("cancelled_after_submit")
+                return {
+                    "ok": False,
+                    "error": "cancelled",
+                    "message": (
+                        "ChatGPT generation was cancelled after submission"
+                        + ("; the visible Stop action was clicked" if stopped else "")
+                    ),
+                    "provider_stop_confirmed": stopped,
+                    "diagnostics": diagnostics,
+                }
             sleep(min(2.0, max(0.0, deadline - time.monotonic())))
             now = time.monotonic()
             remaining_sec = deadline - now
@@ -1666,13 +2356,76 @@ def _run_chatgpt_browser_candidate(
                         {
                             "browser": candidate.name,
                             "elapsed_sec": int(now - submitted_at),
+                            "stage": turn.stage,
                         },
                     )
                     last_progress_at = now
                 continue
+            try:
+                poll_state = cua.call("get_window_state", {"pid": pid, "window_id": window_id})
+                poll_tree = str(poll_state.get("tree_markdown") or "")
+            except Exception:
+                poll_tree = ""
+            running = _chatgpt_response_is_running(poll_tree)
+            if poll_tree:
+                completion_action = _chatgpt_completion_action_visible(poll_tree)
+            else:
+                # The AX tree is momentarily unreadable. Rather than fail every
+                # such turn, fall back to the correlated closed nonce marker
+                # plus the stability window, and record the degradation.
+                completion_action = True
+                diagnostics["ax_unreadable_polls"] = (
+                    int(diagnostics.get("ax_unreadable_polls", 0)) + 1
+                )
             output = _extract_marked_response(page_text, begin, end)
-            if output:
-                return {"ok": True, "output": output, "browser": candidate.name}
+            observation = ResponseObservation(
+                at=time.monotonic(),
+                response_present=bool(output) or running or begin in page_text,
+                running=running,
+                completion_action=completion_action,
+                text=output,
+            )
+            if running and not streaming_reported:
+                streaming_reported = True
+                stage("streaming")
+            final = completion.observe(observation)
+            if final:
+                stage("complete", chars=len(final))
+                return {
+                    "ok": True,
+                    "output": final,
+                    "browser": candidate.name,
+                    "diagnostics": diagnostics,
+                }
+            dom_failure = health.observe(observation)
+            if dom_failure is not None:
+                diagnostics.update(
+                    {
+                        "stage": "dom_health_failed",
+                        "dom_health": {"failure": dom_failure, **health.detail},
+                        "completion_blocked_by": completion.reason,
+                    }
+                )
+                if artifacts is not None:
+                    artifacts.write(
+                        f"dom-health-{dom_failure}.txt",
+                        poll_tree,
+                        stage="streaming",
+                        kind="ax_tree",
+                        session=session.snapshot() if session else None,
+                    )
+                stage("failed", reason=dom_failure)
+                if session is not None:
+                    session.retire(dom_failure)
+                return {
+                    "ok": False,
+                    "error": "generation_status_unavailable",
+                    "message": (
+                        f"ChatGPT generation could not be read safely in {candidate.name} "
+                        f"({dom_failure})"
+                    ),
+                    "diagnostics": diagnostics,
+                }
             now = time.monotonic()
             if progress is not None and now - last_progress_at >= 30:
                 report_progress(
@@ -1681,9 +2434,12 @@ def _run_chatgpt_browser_candidate(
                     {
                         "browser": candidate.name,
                         "elapsed_sec": int(now - submitted_at),
+                        "stage": turn.stage,
                     },
                 )
                 last_progress_at = now
+        diagnostics["completion_blocked_by"] = completion.reason
+        stage("failed", reason="generation_timed_out")
         return {
             "ok": False,
             "error": "generation_timed_out",
@@ -1691,6 +2447,18 @@ def _run_chatgpt_browser_candidate(
                 f"ChatGPT prompt was submitted in {candidate.name}, but the "
                 "response did not finish before the configured timeout"
             ),
+            "diagnostics": diagnostics,
+        }
+    except ChatGptCancelled:
+        diagnostics.update({"stage": "cancelled", "prompt_submitted": False})
+        stage("cancelled", provider_stop_confirmed=False)
+        if session is not None:
+            session.retire("cancelled_before_submit")
+        return {
+            "ok": False,
+            "error": "cancelled",
+            "message": "ChatGPT turn was cancelled before the prompt was submitted",
+            "provider_stop_confirmed": False,
             "diagnostics": diagnostics,
         }
     except Exception as exc:
@@ -1701,12 +2469,31 @@ def _run_chatgpt_browser_candidate(
                 "exception_message": str(exc),
             }
         )
+        stage("failed", reason=exc.__class__.__name__)
+        if session is not None:
+            session.retire("exception")
         return {
             "ok": False,
             "error": exc.__class__.__name__,
             "message": str(exc),
             "diagnostics": diagnostics,
         }
+    finally:
+        _chatgpt_turn_generating.clear()
+        if _opened_fresh and _opened_pid is not None and _opened_window_id is not None:
+            try:
+                _close_turn_window(cua, candidate, _opened_pid, _opened_window_id, sleep)
+            except Exception:
+                pass
+
+
+def _chatgpt_stability_sec() -> float:
+    """Configurable completion stability window (seconds)."""
+    raw = getenv("AGENT_CROSSBAR_CHATGPT_STABILITY_SEC")
+    try:
+        return max(0.0, float(raw)) if raw else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def run_gui_request(
@@ -1716,6 +2503,9 @@ def run_gui_request(
     sleep: Callable[[float], None] = time.sleep,
     timeout_sec: int | None = None,
     progress: Callable[[str, str, dict[str, Any]], None] | None = None,
+    cancel: threading.Event | None = None,
+    job_id: str | None = None,
+    artifact_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run a ChatGPT Pro request through the browser fallback chain."""
     if req.get("profile") != "chatgpt_pro":
@@ -1727,6 +2517,33 @@ def run_gui_request(
         }
 
     nonce = uuid.uuid4().hex
+    owner = job_id or nonce
+
+    # Bounded context preparation happens before any browser work so an
+    # unsafe or missing explicit path can never reach a submitted prompt.
+    packed = pack_context(req.get("cwd"), req.get("scope"))
+    if not packed.get("ok"):
+        return {
+            "ok": False,
+            "error": str(packed.get("error") or "invalid_scope"),
+            "message": str(packed.get("message") or "context preparation failed"),
+            "attempts": [],
+            "artifacts": [],
+            "nonce": nonce,
+        }
+    context_text = str(packed.get("text") or "")
+    context_summary = packed.get("summary") or {}
+
+    if cancel is not None and cancel.is_set():
+        return {
+            "ok": False,
+            "error": "cancelled",
+            "message": "ChatGPT Pro job was stopped before the browser was touched",
+            "attempts": [],
+            "artifacts": [],
+            "nonce": nonce,
+        }
+
     acquired, lock_path, lock_message = _acquire_chatgpt_lock()
     if not acquired:
         return _chatgpt_failure(
@@ -1739,15 +2556,70 @@ def run_gui_request(
         call_timeout_sec=max(_DEFAULT_CUA_CALL_TIMEOUT_SEC, min(float(timeout), 180.0))
     )
     deadline = time.monotonic() + timeout
+    artifacts = (
+        JobArtifactStore(artifact_dir)
+        if artifact_dir is not None
+        else JobArtifactStore(_state_root() / "artifacts" / "chatgpt_pro", subdir=nonce)
+    )
+    lifecycle = TurnLifecycle()
+    stability_sec = _chatgpt_stability_sec()
+
+    def finish(payload: dict[str, Any]) -> dict[str, Any]:
+        existing = list(payload.get("artifacts") or [])
+        for path in artifacts.paths():
+            if path not in existing:
+                existing.append(path)
+        payload["artifacts"] = existing
+        payload["lifecycle"] = lifecycle.stages()
+        if context_summary.get("requested"):
+            payload["context_summary"] = context_summary
+        manifest = artifacts.manifest()
+        if manifest:
+            payload["artifact_manifest"] = manifest
+        return payload
 
     try:
         attempts: list[dict[str, Any]] = []
         for candidate in _CHATGPT_BROWSER_CANDIDATES:
             if time.monotonic() >= deadline:
                 break
-            candidate_kwargs: dict[str, Any] = {}
-            if progress is not None:
-                candidate_kwargs["progress"] = progress
+            if cancel is not None and cancel.is_set():
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "cancelled",
+                        "message": "ChatGPT Pro job was stopped before submission",
+                        "attempts": attempts,
+                        "nonce": nonce,
+                    }
+                )
+            if _chatgpt_turn_generating.is_set():
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "turn_generating",
+                        "message": (
+                            "Another ChatGPT turn is still generating; "
+                            "refusing to launch a fallback browser"
+                        ),
+                        "attempts": attempts,
+                        "nonce": nonce,
+                    }
+                )
+            session, busy_reason = sessions.acquire(owner, candidate.key, candidate.name)
+            if session is None:
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "busy",
+                        "message": (
+                            "Another chatgpt_pro GUI turn already owns the browser session"
+                        ),
+                        "attempts": attempts,
+                        "busy_reason": busy_reason,
+                        "nonce": nonce,
+                    }
+                )
             result = _run_chatgpt_browser_candidate(
                 candidate,
                 req,
@@ -1755,7 +2627,14 @@ def run_gui_request(
                 sleep,
                 deadline,
                 nonce,
-                **candidate_kwargs,
+                progress,
+                cancel=cancel,
+                session=session,
+                lifecycle=lifecycle,
+                artifacts=artifacts,
+                context_text=context_text,
+                attachments=packed.get("attachments") or [],
+                stability_sec=stability_sec,
             )
             attempt = {
                 "browser": candidate.name,
@@ -1765,14 +2644,32 @@ def run_gui_request(
             if result.get("ok"):
                 attempt["candidate"] = f"ChatGPT Pro web via {candidate.name}"
                 attempts.append(attempt)
-                return {
-                    "ok": True,
-                    "output": result["output"],
-                    "selected_candidate": attempt["candidate"],
-                    "provider_exit_code": 0,
-                    "attempts": attempts,
-                    "nonce": nonce,
-                }
+                sessions.retire(owner, "turn_complete")
+                return finish(
+                    {
+                        "ok": True,
+                        "output": result["output"],
+                        "selected_candidate": attempt["candidate"],
+                        "provider_exit_code": 0,
+                        "attempts": attempts,
+                        "nonce": nonce,
+                    }
+                )
+            sessions.retire(owner, str(result.get("error") or "turn_failed"))
+            if result.get("error") == "cancelled":
+                attempt["error"] = "cancelled"
+                attempt["message"] = str(result.get("message") or "cancelled")
+                attempts.append(attempt)
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "cancelled",
+                        "message": attempt["message"],
+                        "provider_stop_confirmed": bool(result.get("provider_stop_confirmed")),
+                        "attempts": attempts,
+                        "nonce": nonce,
+                    }
+                )
             attempt["error"] = str(result.get("error") or "browser_failed")
             attempt["message"] = str(result.get("message") or f"{candidate.name} failed")
             if isinstance(result.get("diagnostics"), dict):
@@ -1783,46 +2680,56 @@ def run_gui_request(
                 and result["diagnostics"].get("prompt_submitted") is True
             )
             if result.get("error") == "generation_timed_out":
-                return {
-                    "ok": False,
-                    "error": "generation_timed_out",
-                    "message": attempt["message"],
-                    "attempts": attempts,
-                    "artifacts": result.get("artifacts", []),
-                    "nonce": nonce,
-                }
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "generation_timed_out",
+                        "message": attempt["message"],
+                        "attempts": attempts,
+                        "artifacts": result.get("artifacts", []),
+                        "nonce": nonce,
+                    }
+                )
             if prompt_was_submitted:
-                return {
-                    "ok": False,
-                    "error": "generation_status_unavailable",
-                    "message": (
-                        "ChatGPT prompt was submitted, but its generation status "
-                        "could not be read safely"
-                    ),
-                    "cause_error": attempt["error"],
-                    "attempts": attempts,
-                    "artifacts": result.get("artifacts", []),
-                    "nonce": nonce,
-                }
+                # Fallback is forbidden once a prompt is durably submitted:
+                # another candidate would duplicate the same request.
+                return finish(
+                    {
+                        "ok": False,
+                        "error": "generation_status_unavailable",
+                        "message": (
+                            "ChatGPT prompt was submitted, but its generation status "
+                            "could not be read safely"
+                        ),
+                        "cause_error": attempt["error"],
+                        "attempts": attempts,
+                        "artifacts": result.get("artifacts", []),
+                        "nonce": nonce,
+                    }
+                )
         if len(attempts) == len(_CHATGPT_BROWSER_CANDIDATES) and all(
             attempt.get("error") == "browser_time_limit" for attempt in attempts
         ):
-            return {
+            return finish(
+                {
+                    "ok": False,
+                    "error": "browser_time_limit",
+                    "message": "macOS Screen Time blocked every ChatGPT browser",
+                    "attempts": attempts,
+                    "artifacts": [],
+                    "nonce": nonce,
+                }
+            )
+        return finish(
+            {
                 "ok": False,
-                "error": "browser_time_limit",
-                "message": "macOS Screen Time blocked every ChatGPT browser",
+                "error": "browser_fallback_exhausted",
+                "message": "ChatGPT Pro failed in Helium, Chrome, and Safari",
                 "attempts": attempts,
                 "artifacts": [],
                 "nonce": nonce,
             }
-        return {
-            "ok": False,
-            "error": "browser_fallback_exhausted",
-            "message": "ChatGPT Pro failed in Helium, Chrome, and Safari",
-            "attempts": attempts,
-            "artifacts": [],
-            "nonce": nonce,
-        }
+        )
     except Exception as exc:
         return _chatgpt_failure(
             exc.__class__.__name__,
@@ -1830,6 +2737,7 @@ def run_gui_request(
             nonce=nonce,
         )
     finally:
+        sessions.retire(owner, "runner_exit")
         if owns_lock:
             _release_chatgpt_lock(lock_path)
 
@@ -2970,6 +3878,40 @@ def run_gui_job(
     timeout_sec: int | None = None,
 ) -> dict[str, Any]:
     """Run a GUI job and persist events/result."""
+    job = store.get_job(job_id)
+    # A stop that raced startup must be observed before any browser focus,
+    # prompt delivery, or session publication.
+    if job is not None:
+        meta_status = store.job_status(job_id) or "running"
+        if meta_status != "running":
+            store.send_event(
+                job_id,
+                level="info",
+                type="cancelled",
+                message="GUI provider start skipped: job is already terminal",
+                data={"status": meta_status},
+            )
+            return {
+                "ok": False,
+                "error": "cancelled",
+                "message": "Job was stopped before the GUI provider started",
+                "attempts": [],
+            }
+
+    # Reuse the pre-registered event when present: re-registering inherits an
+    # already-cancelled state, so an early stop is never lost.
+    existing = run_handles.get(job_id)
+    cancel = existing.cancel_event if existing is not None else threading.Event()
+
+    def on_cancel() -> dict[str, Any]:
+        session = sessions.active(job_id)
+        data: dict[str, Any] = {"transport": "gui", "provider_stop": "requested"}
+        if session is not None:
+            data["gui_session"] = session.snapshot()
+        return data
+
+    run_handles.register(job_id, cancel_event=cancel, on_cancel=on_cancel)
+
     store.send_event(
         job_id,
         level="info",
@@ -2991,7 +3933,40 @@ def run_gui_job(
             data=data,
         )
 
-    result = run_gui_request(req, timeout_sec=timeout_sec, progress=progress)
+    try:
+        result = run_gui_request(
+            req,
+            timeout_sec=timeout_sec,
+            progress=progress,
+            cancel=cancel,
+            job_id=job_id,
+            artifact_dir=job.path if job is not None else None,
+        )
+    finally:
+        run_handles.release(job_id)
+
+    if result.get("error") == "cancelled":
+        store.send_event(
+            job_id,
+            level="info",
+            type="cancelled",
+            message=result.get("message") or "GUI provider cancelled",
+            data={
+                "provider_stop_confirmed": bool(result.get("provider_stop_confirmed")),
+                "lifecycle": result.get("lifecycle", []),
+                "artifacts": result.get("artifacts", []),
+            },
+        )
+        # The durable stopped status written by job_stop stays terminal; the
+        # late-result guard in set_result rejects any competing outcome.
+        store.set_result(
+            job_id,
+            ok=False,
+            summary=str(result.get("message") or "GUI provider cancelled"),
+            artifacts=result.get("artifacts", []),
+        )
+        return result
+
     if result.get("output"):
         store.send_event(
             job_id,
@@ -3056,6 +4031,10 @@ def start_gui_job(
     timeout_sec: int | None = None,
 ) -> threading.Thread:
     """Start a GUI job in the background and return the worker thread."""
+    # Register the cancellation handle before the job becomes observable, so a
+    # stop that races the worker cannot slip through the window between the
+    # worker's durable status check and its own registration.
+    run_handles.register(job_id)
     thread = threading.Thread(
         target=run_gui_job,
         kwargs={

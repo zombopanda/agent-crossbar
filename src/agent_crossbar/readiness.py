@@ -15,6 +15,7 @@ Design constraints:
 from __future__ import annotations
 
 import platform
+import re
 import subprocess
 import threading
 import time
@@ -614,14 +615,95 @@ def check_reasonix_readiness(runner: Any = None) -> ProbeResult:
     )
 
 
-def check_chatgpt_pro_readiness(runner: Any = None) -> ProbeResult:
-    """Probe ChatGPT Pro readiness: macOS-only, truthful auth/binary check.
+CHATGPT_BROWSER_REMEDIATION = (
+    "Open https://chatgpt.com in Helium, Chrome, or Safari, sign in with a "
+    "ChatGPT Pro account, and leave that window open on the current desktop."
+)
 
-    ChatGPT Pro requires macOS with the ChatGPT desktop application.
-    On non-macOS, returns ``unsupported_os``.
-    On macOS, returns ``degraded`` — we cannot safely prove authentication
-    or application state via a non-mutating probe. The caller must perform
-    a manual gate (launch the ChatGPT app and sign in).
+
+def _cua_call(runner: Any, tool: str, payload: str = "{}", timeout: float = 20) -> Any:
+    """Run one read-only cua-driver call and return its parsed JSON payload."""
+    import json
+
+    from agent_crossbar.runner import _wrapper_bin
+
+    binary = _wrapper_bin("AGENT_CROSSBAR_CUA_DRIVER_BIN", ".local/bin/cua-driver", "cua-driver")
+    result = runner.run([binary, "call", tool, payload], timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or f"cua-driver {tool} failed")[:200])
+    if not (result.stdout or "").strip():
+        return {}
+    return json.loads(result.stdout)
+
+
+_CHATGPT_WEB_AREA_RE = re.compile(r'AXWebArea\s+(?:"ChatGPT"|\(ChatGPT\))')
+_CHATGPT_ADDRESS_RE = re.compile(
+    r'AXTextField\s*=\s*"[^"]*chatgpt\.com[^"]*"\s*\(Address and search bar\)',
+    re.IGNORECASE,
+)
+_SIGNED_OUT_CONTROL_RE = re.compile(
+    r'AX(?:Button|Link|StaticText)\b[^\n]*(?:"|\()(?:Log in|Sign up|Log in with)',
+    re.IGNORECASE,
+)
+
+
+def _chatgpt_window_matches(tree: str, title: str) -> bool:
+    """True when this window is a ChatGPT window, by the runner's own signals."""
+    if "chatgpt" in title.casefold():
+        return True
+    return bool(_CHATGPT_WEB_AREA_RE.search(tree) or _CHATGPT_ADDRESS_RE.search(tree))
+
+
+def _chatgpt_window_evidence(tree: str) -> dict[str, bool]:
+    """Classify a browser AX snapshot without mutating any browser state.
+
+    A backgrounded or off-Space browser window exposes only its window chrome
+    over accessibility — no web area, no composer, and no page controls.  Such
+    a window proves nothing about authentication, so ``web_content`` gates every
+    auth conclusion: browser history entries and menu items must never be read
+    as a signed-out page.
+    """
+    from agent_crossbar.runner import (
+        _chatgpt_web_active_model_is_pro,
+        _chatgpt_web_model_picker_line,
+        _find_first_text_area,
+    )
+
+    web_content = bool(_CHATGPT_WEB_AREA_RE.search(tree) or _CHATGPT_ADDRESS_RE.search(tree))
+    composer = _find_first_text_area(tree) is not None
+    return {
+        "web_content": web_content or composer,
+        "composer": composer,
+        "model_control": _chatgpt_web_model_picker_line(tree) is not None,
+        "pro_selected": _chatgpt_web_active_model_is_pro(tree),
+        "signed_out": bool(web_content and not composer and _SIGNED_OUT_CONTROL_RE.search(tree)),
+    }
+
+
+def _cua_permissions(runner: Any) -> tuple[bool, dict[str, Any]]:
+    """Return (ok, payload) for cua-driver's own TCC permission report."""
+    try:
+        payload = _cua_call(runner, "check_permissions")
+    except Exception:
+        return True, {}  # older drivers may not expose it — do not invent a failure
+    if not isinstance(payload, dict):
+        return True, {}
+    accessibility = payload.get("accessibility")
+    if accessibility is False:
+        return False, payload
+    return True, payload
+
+
+def check_chatgpt_pro_readiness(runner: Any = None) -> ProbeResult:
+    """Probe ChatGPT Pro readiness through the existing macOS browser surface.
+
+    Strictly non-mutating: it lists running applications and windows and reads
+    accessibility snapshots.  It never launches, focuses, navigates, clicks,
+    types, or touches the clipboard, and it never requires the native ChatGPT
+    desktop application.
+
+    ``ready`` requires a visible, signed-in ChatGPT window in a supported
+    browser.  Registration or the mere presence of macOS is never enough.
     """
     system = platform.system()
     if system != "Darwin":
@@ -635,16 +717,167 @@ def check_chatgpt_pro_readiness(runner: Any = None) -> ProbeResult:
             ),
             evidence=f"platform={system}",
         )
+
+    if runner is None:
+        runner = _SubprocessRunner()
+
+    from agent_crossbar.runner import _CHATGPT_BROWSER_CANDIDATES
+
+    try:
+        apps = _cua_call(runner, "list_apps").get("apps", [])
+    except FileNotFoundError as exc:
+        return ProbeResult(
+            state="missing_binary",
+            authenticated=False,
+            error_code="chatgpt_pro_cua_driver_missing",
+            remediation=(
+                "cua-driver is not installed or not on PATH. Install it with "
+                "`curl -fsSL https://cua.ai/driver/install.sh | bash`, then grant it "
+                "macOS Accessibility permission. Agent Crossbar never installs it "
+                "automatically: it is a GUI-automation daemon whose permissions only a "
+                "human can grant."
+            ),
+            evidence=str(exc)[:200],
+        )
+    except Exception as exc:
+        return ProbeResult(
+            state="degraded",
+            authenticated=False,
+            error_code="chatgpt_pro_browser_probe_failed",
+            remediation=(
+                "cua-driver could not inspect the desktop. Check its accessibility "
+                "permissions, then retry. " + CHATGPT_BROWSER_REMEDIATION
+            ),
+            evidence=f"{exc.__class__.__name__}: {exc}"[:300],
+        )
+
+    permissions_ok, permissions = _cua_permissions(runner)
+    if not permissions_ok:
+        return ProbeResult(
+            state="misconfigured",
+            authenticated=False,
+            error_code="chatgpt_pro_cua_driver_unauthorized",
+            remediation=(
+                "cua-driver does not hold macOS Accessibility permission, so it cannot "
+                "inspect or drive a browser. Grant it in System Settings → Privacy & "
+                "Security → Accessibility, then retry."
+            ),
+            evidence=(
+                f"accessibility={permissions.get('accessibility')}; "
+                f"screen_recording={permissions.get('screen_recording')}"
+            ),
+        )
+
+    running = {
+        str(app.get("bundle_id")): app
+        for app in apps
+        if isinstance(app, dict) and app.get("running") and app.get("pid")
+    }
+    candidates = [
+        candidate for candidate in _CHATGPT_BROWSER_CANDIDATES if candidate.bundle_id in running
+    ]
+    if not candidates:
+        return ProbeResult(
+            state="degraded",
+            authenticated=False,
+            error_code="chatgpt_pro_browser_not_running",
+            remediation=CHATGPT_BROWSER_REMEDIATION,
+            evidence="no supported ChatGPT browser is running",
+        )
+
+    import json as _json
+
+    signed_out_browsers: list[str] = []
+    inspected: list[str] = []
+    for candidate in candidates:
+        app = running[candidate.bundle_id]
+        pid = app.get("pid")
+        try:
+            windows = _cua_call(runner, "list_windows", _json.dumps({"pid": pid})).get(
+                "windows", []
+            )
+        except Exception:
+            continue
+        # An off-Space or backgrounded window exposes no web content, so prefer
+        # the on-screen windows: they are the only ones that can prove auth.
+        ordered = sorted(
+            (window for window in windows if isinstance(window, dict)),
+            key=lambda window: (
+                window.get("is_on_screen") is not True,
+                "chatgpt" not in str(window.get("title") or "").casefold(),
+            ),
+        )
+        for window in ordered:
+            window_id = window.get("window_id")
+            title = str(window.get("title") or "")
+            try:
+                state = _cua_call(
+                    runner,
+                    "get_window_state",
+                    _json.dumps({"pid": pid, "window_id": window_id}),
+                )
+            except Exception:
+                continue
+            tree = str(state.get("tree_markdown") or "")
+            if not _chatgpt_window_matches(tree, title):
+                continue
+            evidence = _chatgpt_window_evidence(tree)
+            if not evidence["web_content"]:
+                # The window is a ChatGPT window but its page is not rendered.
+                inspected.append(candidate.name)
+                continue
+            inspected.append(candidate.name)
+            if evidence["signed_out"]:
+                signed_out_browsers.append(candidate.name)
+                continue
+            if evidence["composer"]:
+                return ProbeResult(
+                    state="ready",
+                    authenticated=True,
+                    auth_mode="browser_session",
+                    billing_mode="subscription_quota",
+                    subscription_type="chatgpt_pro" if evidence["pro_selected"] else None,
+                    evidence=(
+                        f"browser={candidate.name}; window=ChatGPT; composer=present; "
+                        f"model_control={'present' if evidence['model_control'] else 'absent'}; "
+                        f"pro_selected={evidence['pro_selected']}"
+                    ),
+                )
+
+    if signed_out_browsers:
+        return ProbeResult(
+            state="needs_auth",
+            authenticated=False,
+            error_code="chatgpt_pro_not_authenticated",
+            remediation=(
+                "A ChatGPT browser window is open but signed out. Sign in with a "
+                "ChatGPT Pro account and retry."
+            ),
+            evidence=f"signed_out_browsers={sorted(set(signed_out_browsers))}",
+        )
+
+    if inspected:
+        return ProbeResult(
+            state="degraded",
+            authenticated=False,
+            error_code="chatgpt_pro_readiness_unverified",
+            remediation=(
+                "A ChatGPT browser window was found but its signed-in composer could "
+                "not be read. Bring that window onto the current desktop and retry. "
+                + CHATGPT_BROWSER_REMEDIATION
+            ),
+            evidence=f"inspected_browsers={sorted(set(inspected))}; composer=absent",
+        )
+
     return ProbeResult(
         state="degraded",
         authenticated=False,
-        error_code="chatgpt_pro_manual_gate",
-        remediation=(
-            "ChatGPT Pro readiness cannot be automatically verified. "
-            "Ensure the native ChatGPT desktop app is installed, launched, "
-            "and signed in with a Pro subscription. Then retry."
+        error_code="chatgpt_pro_window_not_found",
+        remediation=CHATGPT_BROWSER_REMEDIATION,
+        evidence=(
+            "supported browsers running="
+            f"{sorted({candidate.name for candidate in candidates})}; no ChatGPT window"
         ),
-        evidence="macOS detected — manual gate required for ChatGPT Pro GUI automation.",
     )
 
 
