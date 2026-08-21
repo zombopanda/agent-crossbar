@@ -215,6 +215,49 @@ The `doctor` CLI reports readiness and preflight failures only. It does **not** 
 - **No remote telemetry**: these audit logs are not sent remotely; Agent
   Crossbar does not phone home.
 
+## Controller terminal waiter
+
+When a controller starts an asynchronous job, wait for the durable terminal
+result with the CLI waiter. If the Agents MCP server uses a non-default state
+root, pass that exact root explicitly; a job ID alone is not enough to locate a
+job across MCP processes:
+
+```bash
+uv run --directory /Users/bo/dev/tools/agent-crossbar \
+  python -m agent_crossbar.cli wait-job \
+  --job-id "<job-id>" \
+  --state-dir "<the-state-root-used-by-Agents-MCP>" \
+  --timeout-sec 1815
+```
+
+The waiter treats `result_not_ready` as an expected intermediate response and
+never calls `job_stop`. Exit codes are stable: `0` successful completion, `2`
+observed deadline, `3` terminal failure/cancellation, and `4` missing or
+inaccessible job. Do not infer a stall from a quiet `job_tail`, no workspace
+diff, or absent output.
+
+The credential-free `scripts/acp_quiet_live_harness.py` is a lifecycle
+regression harness, not a provider E2E. Maintainers can run the real provider
+surface gate separately:
+
+```bash
+uv run --directory /Users/bo/dev/tools/agent-crossbar \
+  python scripts/provider_surface_gate.py \
+  --profile opencode \
+  --model opencode-go/deepseek-v4-flash \
+  --task dev \
+  --max-runtime-sec 1800
+```
+
+For the full real chain, Codex root runs `gpt-5.6-sol` at `low`, starts the
+native Luna coder with `gpt-5.6-luna` at `xhigh`, and that coder captures route
+output from
+`uv run --directory /Users/bo/dev/tools/mcp/packages/codexbar-mcp delegation-route --lane implementation`, then start the exact routed profile/model/effort
+through Agents MCP and run the source-path waiter above with the same Agents
+MCP state root. This covers Codex root -> native coder -> `delegation_router`
+-> Agents MCP -> OpenCode. It is a maintainer-only live gate and is not run in
+provider-credential-free CI.
+
 ## Troubleshooting by Error Code
 
 | Error Code | Meaning | Action |

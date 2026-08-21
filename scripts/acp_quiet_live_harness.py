@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal regression harness for the quiet-but-live ACP controller failure.
+"""Credential-free lifecycle regression harness, not a provider E2E.
 
 The harness deliberately models the controller decision, not an ACP provider:
 the subprocess is real, quiet for a short interval, and then exits successfully.
@@ -84,6 +84,7 @@ def run_harness(*, quiet_sec: float = 0.15) -> HarnessResult:
 def run_fixed_harness(*, quiet_sec: float = 0.15) -> HarnessResult:
     """Run the same durable job through the callable CLI waiter."""
     state_root, _store, job_id, process = _create_quiet_job(quiet_sec)
+    wrong_default = tempfile.TemporaryDirectory(prefix="acp-quiet-wrong-default-")
     alive = process.poll() is None
     waiter = subprocess.Popen(
         [
@@ -93,6 +94,8 @@ def run_fixed_harness(*, quiet_sec: float = 0.15) -> HarnessResult:
             "wait-job",
             "--job-id",
             job_id,
+            "--state-dir",
+            state_root.name,
             "--timeout-sec",
             str(max(1.0, quiet_sec * 10)),
             "--poll-interval-sec",
@@ -101,7 +104,7 @@ def run_fixed_harness(*, quiet_sec: float = 0.15) -> HarnessResult:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env={**os.environ, "AGENT_CROSSBAR_STATE_DIR": state_root.name},
+        env={**os.environ, "AGENT_CROSSBAR_STATE_DIR": wrong_default.name},
     )
     time.sleep(quiet_sec / 2)
     quiet_tail = _store.job_tail(job_id, max_bytes=20000, client_session_id="*")
@@ -109,6 +112,7 @@ def run_fixed_harness(*, quiet_sec: float = 0.15) -> HarnessResult:
     process_stdout, process_stderr = process.communicate(timeout=2)
     final_tail = _store.job_tail(job_id, max_bytes=20000, client_session_id="*")
     state_root.cleanup()
+    wrong_default.cleanup()
     if process.returncode != 0:
         raise RuntimeError(f"quiet subprocess failed: {process_stderr[-500:]}")
     if waiter.returncode != 0:

@@ -36,21 +36,39 @@ def test_version_prints_installed_package_version(monkeypatch, capsys) -> None:
     assert capsys.readouterr().out == f"agent-crossbar {__version__}\n"
 
 
-def _run_wait_job(state_root, job_id: str, timeout_sec: float = 1.0):
+def test_wait_job_help_documents_explicit_state_dir(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["agent-crossbar", "wait-job", "--help"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 0
+    assert "--state-dir" in capsys.readouterr().out
+
+
+def _run_wait_job(
+    state_root,
+    job_id: str,
+    timeout_sec: float = 1.0,
+    state_dir: str | None = None,
+):
     env = {**os.environ, "AGENT_CROSSBAR_STATE_DIR": str(state_root)}
+    args = [
+        sys.executable,
+        "-m",
+        "agent_crossbar.cli",
+        "wait-job",
+        "--job-id",
+        job_id,
+        "--timeout-sec",
+        str(timeout_sec),
+        "--poll-interval-sec",
+        "0.01",
+    ]
+    if state_dir is not None:
+        args.extend(["--state-dir", state_dir])
     return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "agent_crossbar.cli",
-            "wait-job",
-            "--job-id",
-            job_id,
-            "--timeout-sec",
-            str(timeout_sec),
-            "--poll-interval-sec",
-            "0.01",
-        ],
+        args,
         check=False,
         capture_output=True,
         text=True,
@@ -104,3 +122,32 @@ def test_wait_job_deadline_returns_two_without_stopping_running_job(tmp_path) ->
     assert payload["error"] == "terminal_wait_timeout"
     assert payload["last_result"]["error"] == "result_not_ready"
     assert store._read_job_meta(job.path).get("status", "running") == "running"
+
+
+def test_wait_job_explicit_state_dir_reads_agents_mcp_state(tmp_path) -> None:
+    mcp_state = tmp_path / "agents-mcp-state"
+    other_state = tmp_path / "other-state"
+    store = JobStore(mcp_state)
+    job = store.create_job(
+        profile="opencode", operation="dev", transport="print", cwd=str(tmp_path)
+    )
+    store.set_result(job.job_id, ok=True, summary="shared-state-done")
+
+    completed = _run_wait_job(other_state, job.job_id, state_dir=str(mcp_state))
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["summary"] == "shared-state-done"
+
+
+def test_wait_job_without_matching_state_dir_returns_four(tmp_path) -> None:
+    mcp_state = tmp_path / "agents-mcp-state"
+    wrong_state = tmp_path / "wrong-state"
+    store = JobStore(mcp_state)
+    job = store.create_job(
+        profile="opencode", operation="dev", transport="print", cwd=str(tmp_path)
+    )
+
+    completed = _run_wait_job(wrong_state, job.job_id)
+
+    assert completed.returncode == 4
+    assert json.loads(completed.stdout)["error"] == "job_not_found"

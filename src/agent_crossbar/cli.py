@@ -96,7 +96,12 @@ def doctor_cmd(json_output: bool = False, profile: str | None = None) -> None:
         sys.stdout.write(_format_text(results_dict, profile))
 
 
-def wait_job_cmd(job_id: str, timeout_sec: float, poll_interval_sec: float) -> int:
+def wait_job_cmd(
+    job_id: str,
+    timeout_sec: float,
+    poll_interval_sec: float,
+    state_dir: str | None = None,
+) -> int:
     """Wait for a durable job's terminal result without inferring a stall.
 
     Exit codes are stable for controller use: ``0`` completed successfully,
@@ -106,7 +111,7 @@ def wait_job_cmd(job_id: str, timeout_sec: float, poll_interval_sec: float) -> i
     from agent_crossbar.jobs import JobStore
     from agent_crossbar.terminal_wait import TerminalWaitTimeout, wait_for_terminal_result
 
-    store = JobStore()
+    store = JobStore(state_dir)
 
     async def read_result() -> dict[str, Any]:
         # Explicit wildcard access is intentional for a local controller
@@ -169,6 +174,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     wait_job.add_argument("--job-id", required=True, help="Durable job identifier.")
     wait_job.add_argument(
+        "--state-dir",
+        metavar="PATH",
+        help=(
+            "Exact durable state root used by the Agents MCP server; required when "
+            "that server does not use the default state directory."
+        ),
+    )
+    wait_job.add_argument(
         "--timeout-sec",
         type=float,
         default=1815.0,
@@ -191,7 +204,9 @@ def main() -> None:
         doctor_cmd(json_output=args.json, profile=args.profile)
         return
     if args.command == "wait-job":
-        raise SystemExit(wait_job_cmd(args.job_id, args.timeout_sec, args.poll_interval_sec))
+        raise SystemExit(
+            wait_job_cmd(args.job_id, args.timeout_sec, args.poll_interval_sec, args.state_dir)
+        )
 
     from agent_crossbar.server import main as server_main
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -541,8 +542,9 @@ async def run_acp_prompt(
 
                 stderr_task = asyncio.create_task(_watch_stderr())
                 prompt_task: asyncio.Task[Any] | None = None
-                heartbeat_task: asyncio.Task[Any] | None = None
                 process_watch_task: asyncio.Task[Any] | None = None
+                heartbeat_stop = threading.Event()
+                heartbeat_thread: threading.Thread | None = None
                 try:
                     prepare_task = asyncio.create_task(_prepare_session())
                     done, _pending = await asyncio.wait(
@@ -576,11 +578,16 @@ async def run_acp_prompt(
                         )
                     )
 
-                    async def _execution_heartbeat() -> None:
-                        while True:
-                            await asyncio.sleep(ACP_HEARTBEAT_INTERVAL_SEC)
-                            if prompt_task is None or prompt_task.done():
-                                return
+                    def _execution_heartbeat_loop() -> None:
+                        """Report ACP liveness outside the provider event loop.
+
+                        Some ACP SDK/provider paths synchronously block the
+                        asyncio loop while handling a tool call.  A thread is
+                        intentional here: the heartbeat reports only the
+                        subprocess/prompt lifecycle owned by this wrapper and
+                        never a provider-native working state.
+                        """
+                        while not heartbeat_stop.wait(ACP_HEARTBEAT_INTERVAL_SEC):
                             process_returncode = getattr(process, "returncode", None)
                             payload = {
                                 "process_alive": process_returncode is None,
@@ -599,7 +606,13 @@ async def run_acp_prompt(
                                         exc_info=True,
                                     )
 
-                    heartbeat_task = asyncio.create_task(_execution_heartbeat())
+                    if on_execution_heartbeat is not None:
+                        heartbeat_thread = threading.Thread(
+                            target=_execution_heartbeat_loop,
+                            name="acp-execution-heartbeat",
+                            daemon=False,
+                        )
+                        heartbeat_thread.start()
                     process_wait = getattr(process, "wait", None)
                     if callable(process_wait):
 
@@ -629,10 +642,9 @@ async def run_acp_prompt(
                         prompt_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await prompt_task
-                    if heartbeat_task is not None and not heartbeat_task.done():
-                        heartbeat_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await heartbeat_task
+                    heartbeat_stop.set()
+                    if heartbeat_thread is not None:
+                        heartbeat_thread.join()
                     if process_watch_task is not None and not process_watch_task.done():
                         process_watch_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):

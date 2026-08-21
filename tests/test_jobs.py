@@ -1,3 +1,4 @@
+import json
 import threading
 from types import SimpleNamespace
 
@@ -22,6 +23,63 @@ def test_event_sequence_is_atomic(tmp_path):
         job.events.write(level="info", type="progress", message=str(idx), data={})
     events = job.events.read_since(0)
     assert [e["seq"] for e in events] == [1, 2, 3, 4, 5]
+
+
+def test_event_sequence_is_contiguous_across_job_store_instances(tmp_path):
+    store_a = JobStore(tmp_path)
+    job = store_a.create_job(profile="opencode", operation="dev")
+    store_b = JobStore(tmp_path)
+    job_b = store_b.get_job(job.job_id)
+    assert job_b is not None
+    barrier = threading.Barrier(2)
+    events_per_writer = 40
+    sequences: list[int] = []
+    sequence_lock = threading.Lock()
+
+    def write_events(writer, prefix: str) -> None:
+        barrier.wait()
+        event_type = "execution_heartbeat" if prefix == "heartbeat" else "log_delta"
+        local = [
+            writer.events.write(level="info", type=event_type, message=f"{prefix}-{idx}")
+            for idx in range(events_per_writer)
+        ]
+        with sequence_lock:
+            sequences.extend(local)
+
+    first = threading.Thread(target=write_events, args=(job, "heartbeat"))
+    second = threading.Thread(target=write_events, args=(job_b, "delta"))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    events_path = job.path / "events.jsonl"
+    raw_lines = events_path.read_text().splitlines()
+    events = [json.loads(line) for line in raw_lines]
+    event_sequences = [event["seq"] for event in events]
+    assert sorted(sequences) == list(range(1, events_per_writer * 2 + 1))
+    assert event_sequences == list(range(1, events_per_writer * 2 + 1))
+    assert len(event_sequences) == len(set(event_sequences))
+    assert sum(event["type"] == "execution_heartbeat" for event in events) == events_per_writer
+    assert sum(event["type"] == "log_delta" for event in events) == events_per_writer
+    assert oct((job.path / ".events.lock").stat().st_mode & 0o777) == "0o600"
+
+
+def test_event_read_cursor_is_one_consistent_snapshot(tmp_path):
+    store_a = JobStore(tmp_path)
+    job = store_a.create_job(profile="opencode", operation="dev")
+    store_b = JobStore(tmp_path)
+    job_b = store_b.get_job(job.job_id)
+    assert job_b is not None
+    job.events.write(level="info", type="heartbeat", message="first")
+
+    events, cursor = job_b.events.read_since_with_cursor(0)
+    assert [event["message"] for event in events] == ["first"]
+    assert cursor == 1
+
+    job.events.write(level="info", type="log_delta", message="second")
+    events_after = job_b.events.read_since(cursor)
+    assert [event["message"] for event in events_after] == ["second"]
 
 
 # Fix 1: job_tail after reloading a job from disk must compute last_seq/next_seq from events.jsonl

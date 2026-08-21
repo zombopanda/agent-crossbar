@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -67,6 +68,7 @@ class _Conn:
         protocol_error_after_prompt=None,
         model="test-model",
         delay_before_result=0.0,
+        block_event_loop_sec=0.0,
     ):
         self.texts = texts or []
         self.stop_reason = stop_reason
@@ -77,6 +79,7 @@ class _Conn:
         self.protocol_error_after_prompt = protocol_error_after_prompt
         self.model = model
         self.delay_before_result = delay_before_result
+        self.block_event_loop_sec = block_event_loop_sec
         self.client = None
         self.prompt_cancelled = False
 
@@ -140,6 +143,8 @@ class _Conn:
                 raise
         if self.delay_before_result:
             await asyncio.sleep(self.delay_before_result)
+        if self.block_event_loop_sec:
+            time.sleep(self.block_event_loop_sec)
         if self.protocol_error_after_prompt is not None:
             raise self.protocol_error_after_prompt
         for text in self.texts:
@@ -362,6 +367,39 @@ def test_run_acp_prompt_timeout_is_terminal_after_quiet_live_prompt(monkeypatch)
             )
     assert exc.value.stage == "execution"
     assert heartbeats
+    count_after_timeout = len(heartbeats)
+    time.sleep(0.03)
+    assert len(heartbeats) == count_after_timeout
+
+
+def test_run_acp_prompt_heartbeat_survives_blocked_provider_event_loop(monkeypatch):
+    conn = _Conn(block_event_loop_sec=0.05, session_id="blocked-session")
+    state = {}
+    heartbeats: list[dict[str, Any]] = []
+    monkeypatch.setattr("agent_crossbar.acp_client.ACP_HEARTBEAT_INTERVAL_SEC", 0.01)
+    with mock.patch(
+        "agent_crossbar.acp_client.spawn_agent_process",
+        _spawn(conn, state),
+    ):
+        result = _run(
+            run_acp_prompt(
+                ["fake"],
+                "safe",
+                "/tmp",
+                autonomy=Autonomy.EDIT_LOCAL,
+                model="test-model",
+                on_execution_heartbeat=heartbeats.append,
+            )
+        )
+    assert result.session_id == "blocked-session"
+    assert len(heartbeats) >= 3
+    assert all(item["process_alive"] is True for item in heartbeats)
+    assert all(item["prompt_active"] is True for item in heartbeats)
+    assert all("native_state" not in item for item in heartbeats)
+    count_after_terminal = len(heartbeats)
+    time.sleep(0.03)
+    assert len(heartbeats) == count_after_terminal
+    assert state.get("cleaned") is True
 
 
 def test_run_acp_prompt_reports_process_exit_as_terminal_failure():

@@ -26,6 +26,19 @@ _JOB_ID_RE = re.compile(r"^[0-9]{8,}-[a-zA-Z0-9_-]+$")
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
+_EVENT_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+_EVENT_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+def _event_process_lock(path: Path) -> threading.RLock:
+    """Return the process-local lock shared by all writers for *path*."""
+    key = str(path.resolve())
+    with _EVENT_PROCESS_LOCKS_GUARD:
+        lock = _EVENT_PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _EVENT_PROCESS_LOCKS[key] = lock
+        return lock
 
 
 def default_state_root() -> Path:
@@ -62,7 +75,7 @@ def _generate_job_id(existing_ids: set[str]) -> str:
 
 @dataclass
 class EventWriter:
-    """Monotonic per-job event writer backed by JSONL with a per-job lock."""
+    """Monotonic per-job event writer with inter-instance serialization."""
 
     path: Path
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -70,7 +83,30 @@ class EventWriter:
 
     def __post_init__(self) -> None:
         """Reload sequence counter from existing events on disk."""
-        self._reload_seq()
+        with self._lock:
+            with self._shared_lock():
+                self._reload_seq()
+
+    @contextmanager
+    def _shared_lock(self):
+        """Serialize event reads/writes across threads and processes."""
+        process_lock = _event_process_lock(self.path.with_name(".events.lock"))
+        with process_lock:
+            lock_path = self.path.with_name(".events.lock")
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, _FILE_MODE)
+            try:
+                os.fchmod(fd, _FILE_MODE)
+                try:
+                    import fcntl
+                except ImportError:  # pragma: no cover - Windows fallback
+                    fcntl = None
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def _reload_seq(self) -> None:
         """Scan events.jsonl and set _seq to the highest seq found."""
@@ -100,44 +136,73 @@ class EventWriter:
     ) -> int:
         """Append one event line; returns the assigned sequence number."""
         with self._lock:
-            self._seq += 1
-            event = {
-                "seq": self._seq,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "level": level,
-                "type": type,
-                "message": message,
-                "redacted": redacted,
-                "data": data or {},
-            }
-            line = json.dumps(event, separators=(",", ":")) + "\n"
-            with open(self.path, "a") as f:
-                f.write(line)
-            return self._seq
+            with self._shared_lock():
+                # Every writer instance reloads the high-water mark while the
+                # inter-process lock is held.  Its private _lock alone cannot
+                # protect a heartbeat thread from another JobStore instance.
+                self._reload_seq()
+                next_seq = self._seq + 1
+                event = {
+                    "seq": next_seq,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": level,
+                    "type": type,
+                    "message": message,
+                    "redacted": redacted,
+                    "data": data or {},
+                }
+                line = (json.dumps(event, separators=(",", ":")) + "\n").encode()
+                fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, _FILE_MODE)
+                try:
+                    os.fchmod(fd, _FILE_MODE)
+                    offset = 0
+                    while offset < len(line):
+                        offset += os.write(fd, line[offset:])
+                finally:
+                    os.close(fd)
+                self._seq = next_seq
+                return next_seq
+
+    def _read_since_locked(self, after_seq: int) -> tuple[list[dict[str, Any]], int]:
+        """Read events and capture one high-water mark under the shared lock."""
+        self._reload_seq()
+        results: list[dict[str, Any]] = []
+        if not self.path.exists():
+            return results, self._seq
+        for raw in self.path.read_text().splitlines():
+            if not raw.strip():
+                continue
+            event = json.loads(raw)
+            if event["seq"] > after_seq:
+                results.append(event)
+        return results, self._seq
+
+    def read_since_with_cursor(self, after_seq: int) -> tuple[list[dict[str, Any]], int]:
+        """Read events and return the matching high-water mark atomically."""
+        with self._lock:
+            with self._shared_lock():
+                return self._read_since_locked(after_seq)
 
     def read_since(self, after_seq: int) -> list[dict[str, Any]]:
         """Read events with seq > after_seq, in order."""
-        results: list[dict[str, Any]] = []
-        if not self.path.exists():
-            return results
-        with self._lock:
-            for raw in self.path.read_text().splitlines():
-                if not raw.strip():
-                    continue
-                event = json.loads(raw)
-                if event["seq"] > after_seq:
-                    results.append(event)
-        return results
+        events, _last_seq = self.read_since_with_cursor(after_seq)
+        return events
 
     @property
     def last_seq(self) -> int:
         """Current highest sequence number."""
-        return self._seq
+        with self._lock:
+            with self._shared_lock():
+                self._reload_seq()
+                return self._seq
 
     @property
     def next_seq(self) -> int:
         """Sequence number that will be assigned to the next event."""
-        return self._seq + 1
+        with self._lock:
+            with self._shared_lock():
+                self._reload_seq()
+                return self._seq + 1
 
 
 @dataclass
@@ -484,9 +549,8 @@ class JobStore:
         if meta.get("status", "running") == "running":
             self._finalize_completed_tmux_job(job)
 
-        events = job.events.read_since(since_seq)
-        last_seq = job.events.last_seq
-        next_seq = job.events.next_seq
+        events, last_seq = job.events.read_since_with_cursor(since_seq)
+        next_seq = last_seq + 1
 
         original_event_count = len(events)
 
