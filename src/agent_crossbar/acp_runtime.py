@@ -150,6 +150,17 @@ async def run_acp_job(
                 data={"text": text},
             )
 
+        def _record_acp_execution_heartbeat(data: dict[str, Any]) -> None:
+            # This is deliberately transport/liveness evidence only.  ACP
+            # does not expose a provider-native working state here.
+            store.send_event(
+                job_id,
+                level="info",
+                type="execution_heartbeat",
+                message="ACP execution coroutine is still active",
+                data=data,
+            )
+
         result: AcpResult = await run_acp_prompt(
             command,
             prompt,
@@ -160,6 +171,7 @@ async def run_acp_job(
             effort=effort,
             on_process_start=_record_acp_pid,
             on_text_delta=_record_acp_text_delta,
+            on_execution_heartbeat=_record_acp_execution_heartbeat,
         )
     except AcpProviderUnavailableError as exc:
         safe = _safe_error(exc, prompt)

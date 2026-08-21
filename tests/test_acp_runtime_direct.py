@@ -186,6 +186,7 @@ class TestRunAcpJobSuccess:
             effort=None,
             on_process_start=ANY,
             on_text_delta=ANY,
+            on_execution_heartbeat=ANY,
         )
 
         # ── assert store result ──
@@ -203,6 +204,43 @@ class TestRunAcpJobSuccess:
         meta_text = (store.get_job(job_id).path / "meta.json").read_text()
         assert SECRET not in events_text
         assert SECRET not in meta_text
+
+    def test_execution_heartbeat_is_persisted_without_native_working_claim(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+
+        async def fake_run(*_args, **kwargs):
+            kwargs["on_execution_heartbeat"](
+                {
+                    "process_alive": True,
+                    "prompt_active": True,
+                    "elapsed_sec": 31,
+                    "last_protocol_activity_sec": 31,
+                }
+            )
+            return AcpResult(output="done", stop_reason="end_turn", session_id="native-1")
+
+        with patch("agent_crossbar.acp_runtime.run_acp_prompt", new=fake_run):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="safe",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    max_runtime_sec=30,
+                )
+            )
+
+        heartbeat = [
+            event
+            for event in _read_store_events(store, job_id)
+            if event["type"] == "execution_heartbeat"
+        ]
+        assert len(heartbeat) == 1
+        assert heartbeat[0]["data"]["process_alive"] is True
+        assert "native_state" not in heartbeat[0]["data"]
 
 
 class TestRunAcpJobTimeout:

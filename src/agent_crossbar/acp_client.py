@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,7 @@ from acp.schema import (
 from .models import Autonomy
 
 logger = logging.getLogger(__name__)
+ACP_HEARTBEAT_INTERVAL_SEC = 30.0
 
 # ── Public types ────────────────────────────────────────────────────────
 
@@ -158,6 +160,7 @@ class _OneShotClient:
         self._output_parts: list[str] = []
         self._stop_reason = "unknown"
         self.prompt_sent = False
+        self.last_protocol_activity_at = time.monotonic()
 
     # -- Client protocol --------------------------------------------------
 
@@ -181,6 +184,10 @@ class _OneShotClient:
         update: Any,
         **kwargs: Any,
     ) -> None:
+        # ACP does not expose a provider-neutral "working" state.  Recording
+        # protocol activity locally lets the execution heartbeat describe only
+        # what this process knows: the one-shot prompt coroutine is alive.
+        self.last_protocol_activity_at = time.monotonic()
         if isinstance(update, AgentMessageChunk):
             content = getattr(update, "content", None)
             if content is not None and getattr(content, "type", None) == "text":
@@ -352,6 +359,7 @@ async def run_acp_prompt(
     startup_timeout: float = 30.0,
     on_process_start: Callable[[int], None] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
+    on_execution_heartbeat: Callable[[dict[str, Any]], None] | None = None,
 ) -> AcpResult:
     """Launch a provider, optionally set model, run one ACP prompt, and return the result.
 
@@ -388,6 +396,9 @@ async def run_acp_prompt(
         on_process_start: Optional callback receiving the child PID.
         on_text_delta: Optional callback receiving each assistant text chunk.
             Observer failures are logged and never interrupt the provider run.
+        on_execution_heartbeat: Optional callback receiving provider-neutral
+            liveness data while the ACP subprocess and prompt coroutine remain
+            alive.  This does not claim a provider-native working state.
 
     Returns:
         ``AcpResult`` with ``output``, ``stop_reason``, and ``session_id``.
@@ -530,6 +541,8 @@ async def run_acp_prompt(
 
                 stderr_task = asyncio.create_task(_watch_stderr())
                 prompt_task: asyncio.Task[Any] | None = None
+                heartbeat_task: asyncio.Task[Any] | None = None
+                process_watch_task: asyncio.Task[Any] | None = None
                 try:
                     prepare_task = asyncio.create_task(_prepare_session())
                     done, _pending = await asyncio.wait(
@@ -554,24 +567,76 @@ async def run_acp_prompt(
 
                     # 3. session/prompt
                     client_impl.prompt_sent = True
+                    prompt_started_at = time.monotonic()
+                    client_impl.last_protocol_activity_at = prompt_started_at
                     prompt_task = asyncio.create_task(
                         conn.prompt(
                             session_id=session_id,
                             prompt=[text_block(prompt_text)],
                         )
                     )
+
+                    async def _execution_heartbeat() -> None:
+                        while True:
+                            await asyncio.sleep(ACP_HEARTBEAT_INTERVAL_SEC)
+                            if prompt_task is None or prompt_task.done():
+                                return
+                            process_returncode = getattr(process, "returncode", None)
+                            payload = {
+                                "process_alive": process_returncode is None,
+                                "prompt_active": True,
+                                "elapsed_sec": int(time.monotonic() - prompt_started_at),
+                                "last_protocol_activity_sec": int(
+                                    time.monotonic() - client_impl.last_protocol_activity_at
+                                ),
+                            }
+                            if on_execution_heartbeat is not None:
+                                try:
+                                    on_execution_heartbeat(payload)
+                                except Exception:
+                                    logger.warning(
+                                        "ACP execution-heartbeat observer failed",
+                                        exc_info=True,
+                                    )
+
+                    heartbeat_task = asyncio.create_task(_execution_heartbeat())
+                    process_wait = getattr(process, "wait", None)
+                    if callable(process_wait):
+
+                        async def _watch_process_exit() -> None:
+                            exit_code = await process_wait()
+                            if prompt_task is not None and not prompt_task.done():
+                                raise AcpProtocolError(
+                                    f"ACP process exited with code {exit_code}",
+                                    stage="execution",
+                                )
+
+                        process_watch_task = asyncio.create_task(_watch_process_exit())
+                    wait_tasks: set[asyncio.Task[Any]] = {prompt_task, stderr_task}
+                    if process_watch_task is not None:
+                        wait_tasks.add(process_watch_task)
                     done, _pending = await asyncio.wait(
-                        {prompt_task, stderr_task},
+                        wait_tasks,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if stderr_task in done:
                         await stderr_task
+                    if process_watch_task is not None and process_watch_task in done:
+                        await process_watch_task
                     prompt_response = await prompt_task
                 finally:
                     if prompt_task is not None and not prompt_task.done():
                         prompt_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await prompt_task
+                    if heartbeat_task is not None and not heartbeat_task.done():
+                        heartbeat_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await heartbeat_task
+                    if process_watch_task is not None and not process_watch_task.done():
+                        process_watch_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await process_watch_task
                     stderr_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await stderr_task

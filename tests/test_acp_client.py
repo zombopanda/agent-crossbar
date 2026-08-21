@@ -66,6 +66,7 @@ class _Conn:
         protocol_error=None,
         protocol_error_after_prompt=None,
         model="test-model",
+        delay_before_result=0.0,
     ):
         self.texts = texts or []
         self.stop_reason = stop_reason
@@ -75,6 +76,7 @@ class _Conn:
         self.protocol_error = protocol_error
         self.protocol_error_after_prompt = protocol_error_after_prompt
         self.model = model
+        self.delay_before_result = delay_before_result
         self.client = None
         self.prompt_cancelled = False
 
@@ -136,6 +138,8 @@ class _Conn:
             except asyncio.CancelledError:
                 self.prompt_cancelled = True
                 raise
+        if self.delay_before_result:
+            await asyncio.sleep(self.delay_before_result)
         if self.protocol_error_after_prompt is not None:
             raise self.protocol_error_after_prompt
         for text in self.texts:
@@ -307,6 +311,94 @@ def test_run_acp_prompt_success():
     assert result.session_id == "session-42"
     assert deltas == ["hello ", "world"]
     assert state.get("cleaned") is True
+
+
+def test_run_acp_prompt_emits_neutral_heartbeat_for_quiet_live_prompt(monkeypatch):
+    conn = _Conn(delay_before_result=0.04, session_id="quiet-session")
+    state = {}
+    heartbeats: list[dict[str, Any]] = []
+    monkeypatch.setattr("agent_crossbar.acp_client.ACP_HEARTBEAT_INTERVAL_SEC", 0.01)
+    with mock.patch(
+        "agent_crossbar.acp_client.spawn_agent_process",
+        _spawn(conn, state),
+    ):
+        result = _run(
+            run_acp_prompt(
+                ["fake"],
+                "safe",
+                "/tmp",
+                autonomy=Autonomy.EDIT_LOCAL,
+                model="test-model",
+                on_execution_heartbeat=heartbeats.append,
+            )
+        )
+    assert result.session_id == "quiet-session"
+    assert heartbeats
+    assert all(item["process_alive"] is True for item in heartbeats)
+    assert all(item["prompt_active"] is True for item in heartbeats)
+    assert all("native_state" not in item for item in heartbeats)
+    assert state.get("cleaned") is True
+
+
+def test_run_acp_prompt_timeout_is_terminal_after_quiet_live_prompt(monkeypatch):
+    conn = _Conn(hang=True)
+    heartbeats: list[dict[str, Any]] = []
+    monkeypatch.setattr("agent_crossbar.acp_client.ACP_HEARTBEAT_INTERVAL_SEC", 0.01)
+    with mock.patch(
+        "agent_crossbar.acp_client.spawn_agent_process",
+        _spawn(conn, {}),
+    ):
+        with pytest.raises(AcpTimeoutError) as exc:
+            _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "safe",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
+                    timeout=0.04,
+                    on_execution_heartbeat=heartbeats.append,
+                )
+            )
+    assert exc.value.stage == "execution"
+    assert heartbeats
+
+
+def test_run_acp_prompt_reports_process_exit_as_terminal_failure():
+    conn = _Conn(hang=True)
+    state = {}
+
+    class _ExitedProcess:
+        pid = 42
+        returncode = 1
+
+        async def wait(self):
+            return self.returncode
+
+    @asynccontextmanager
+    async def spawn_with_exited_process(to_client, *_args, **_kwargs):
+        conn.client = to_client(conn) if callable(to_client) else to_client
+        try:
+            yield conn, _ExitedProcess()
+        finally:
+            state["cleaned"] = True
+
+    with mock.patch(
+        "agent_crossbar.acp_client.spawn_agent_process",
+        spawn_with_exited_process,
+    ):
+        with pytest.raises(AcpProtocolError, match="process exited") as exc:
+            _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "safe",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
+                )
+            )
+    assert exc.value.stage == "execution"
+    assert state["cleaned"] is True
 
 
 # D. invalid autonomy before spawn

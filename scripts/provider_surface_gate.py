@@ -24,6 +24,8 @@ import anyio
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from agent_crossbar.terminal_wait import TerminalWaitTimeout, wait_for_terminal_result
+
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_MAX_RUNTIME_SEC = 1800
 RESULT_COMPLETION_GRACE_SEC = 15
@@ -59,6 +61,14 @@ class GateCase:
         effort = self.effort or "default"
         interactive = "interactive" if self.interactive else "oneshot"
         return f"{self.profile}/{self.model}/{effort}/{self.task}/{interactive}"
+
+
+class _BlockingPromptDetected(RuntimeError):
+    """Internal sentinel used to abort a deterministic waiter safely."""
+
+    def __init__(self, tail: dict[str, Any]) -> None:
+        super().__init__("provider requested interactive input")
+        self.tail = tail
 
 
 def _contains_blocking_prompt(output: str) -> bool:
@@ -177,34 +187,45 @@ async def _wait_for_result(
     *,
     timeout_sec: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    deadline = time.monotonic() + timeout_sec
-    last: dict[str, Any] = {}
     tail: dict[str, Any] = {}
-    while time.monotonic() < deadline:
+
+    async def _observe_tail(_result: dict[str, Any]) -> None:
+        nonlocal tail
         tail = await _call(
             session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
         )
         tail_text = json.dumps(tail, ensure_ascii=False)
         if _contains_blocking_prompt(tail_text):
-            return {"ok": False, "error": "blocking_prompt", "summary": tail_text[-4000:]}, tail
+            raise _BlockingPromptDetected(tail)
 
-        result = await _call(session, "job_result", {"job_id": job_id}, timeout_sec=60)
-        last = result
-        if result.get("error") == "result_not_ready":
-            await anyio.sleep(2)
-            continue
-        final_tail = await _call(
-            session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
+    async def _read_result() -> dict[str, Any]:
+        return await _call(session, "job_result", {"job_id": job_id}, timeout_sec=60)
+
+    try:
+        result = await wait_for_terminal_result(
+            _read_result,
+            timeout_sec=timeout_sec,
+            poll_interval_sec=2.0,
+            on_not_ready=_observe_tail,
         )
-        final_tail_text = json.dumps(final_tail, ensure_ascii=False)
-        if _contains_blocking_prompt(final_tail_text):
-            return {
-                "ok": False,
-                "error": "blocking_prompt",
-                "summary": final_tail_text[-4000:],
-            }, final_tail
-        return result, final_tail
-    return {"ok": False, "error": "timed_out", "summary": str(last)}, tail
+    except _BlockingPromptDetected as exc:
+        tail = exc.tail
+        tail_text = json.dumps(tail, ensure_ascii=False)
+        return {"ok": False, "error": "blocking_prompt", "summary": tail_text[-4000:]}, tail
+    except TerminalWaitTimeout as exc:
+        return {"ok": False, "error": "timed_out", "summary": str(exc.last_result)}, tail
+
+    final_tail = await _call(
+        session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
+    )
+    final_tail_text = json.dumps(final_tail, ensure_ascii=False)
+    if _contains_blocking_prompt(final_tail_text):
+        return {
+            "ok": False,
+            "error": "blocking_prompt",
+            "summary": final_tail_text[-4000:],
+        }, final_tail
+    return result, final_tail
 
 
 async def _check_job_is_listed(
