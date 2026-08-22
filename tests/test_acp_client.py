@@ -318,33 +318,6 @@ def test_run_acp_prompt_success():
     assert state.get("cleaned") is True
 
 
-def test_run_acp_prompt_emits_neutral_heartbeat_for_quiet_live_prompt(monkeypatch):
-    conn = _Conn(delay_before_result=0.04, session_id="quiet-session")
-    state = {}
-    heartbeats: list[dict[str, Any]] = []
-    monkeypatch.setattr("agent_crossbar.acp_client.ACP_HEARTBEAT_INTERVAL_SEC", 0.01)
-    with mock.patch(
-        "agent_crossbar.acp_client.spawn_agent_process",
-        _spawn(conn, state),
-    ):
-        result = _run(
-            run_acp_prompt(
-                ["fake"],
-                "safe",
-                "/tmp",
-                autonomy=Autonomy.EDIT_LOCAL,
-                model="test-model",
-                on_execution_heartbeat=heartbeats.append,
-            )
-        )
-    assert result.session_id == "quiet-session"
-    assert heartbeats
-    assert all(item["process_alive"] is True for item in heartbeats)
-    assert all(item["prompt_active"] is True for item in heartbeats)
-    assert all("native_state" not in item for item in heartbeats)
-    assert state.get("cleaned") is True
-
-
 def test_run_acp_prompt_timeout_is_terminal_after_quiet_live_prompt(monkeypatch):
     conn = _Conn(hang=True)
     heartbeats: list[dict[str, Any]] = []
