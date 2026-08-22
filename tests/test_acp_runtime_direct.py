@@ -75,6 +75,7 @@ class _ChunkingAcpConnection:
     def __init__(self, texts: list[str], model: str) -> None:
         self.texts = texts
         self.model = model
+        self.mode = "orchestrator"
         self.client = None
 
     async def initialize(self, protocol_version, **_kwargs):
@@ -83,12 +84,17 @@ class _ChunkingAcpConnection:
     async def new_session(self, **_kwargs):
         return SimpleNamespace(
             session_id="protocol-fake-1",
-            config_options=[self._model_config(self.model)],
+            config_options=[self._model_config(self.model), self._mode_config(self.mode)],
         )
 
     async def set_config_option(self, value, **_kwargs):
-        self.model = value
-        return SimpleNamespace(config_options=[self._model_config(value)])
+        if value in {"orchestrator", "build", "plan"}:
+            self.mode = value
+        else:
+            self.model = value
+        return SimpleNamespace(
+            config_options=[self._model_config(self.model), self._mode_config(self.mode)]
+        )
 
     async def prompt(self, session_id, **_kwargs):
         assert self.client is not None
@@ -112,6 +118,21 @@ class _ChunkingAcpConnection:
             category="model",
             current_value=model,
             options=[SessionConfigSelectOption(value=model, name=model, description=None)],
+        )
+
+    @staticmethod
+    def _mode_config(mode: str) -> SessionConfigOptionSelect:
+        return SessionConfigOptionSelect(
+            type="select",
+            id="mode",
+            name="Mode",
+            description=None,
+            category="mode",
+            current_value=mode,
+            options=[
+                SessionConfigSelectOption(value=value, name=value, description=None)
+                for value in ("orchestrator", "build", "plan")
+            ],
         )
 
 
@@ -176,6 +197,8 @@ class TestRunAcpJobSuccess:
             )
 
         # ── assert run_acp_prompt called correctly (model forwarded) ──
+        # provider="opencode" + task="dev" resolves the adapter-owned "build"
+        # session mode (see adapters/opencode.py OpencodeAdapter.dev_acp_mode).
         mock_run.assert_awaited_once_with(
             ["opencode", "acp"],
             SECRET,
@@ -184,6 +207,7 @@ class TestRunAcpJobSuccess:
             autonomy=Autonomy.EDIT_LOCAL,
             model="glm",
             effort=None,
+            mode="build",
             on_process_start=ANY,
             on_text_delta=ANY,
             on_execution_heartbeat=ANY,
@@ -241,6 +265,144 @@ class TestRunAcpJobSuccess:
         assert len(heartbeat) == 1
         assert heartbeat[0]["data"]["process_alive"] is True
         assert "native_state" not in heartbeat[0]["data"]
+
+
+class TestRunAcpJobDevEmptyResultFailsClosed:
+    """A "dev" task returning whitespace/empty output must fail closed with
+    a stable ``acp_empty_result`` diagnostic — never report `completed`."""
+
+    @pytest.mark.parametrize("blank_output", ["\n\n", "", "   ", "\t \n"])
+    def test_whitespace_only_output_fails_closed(self, tmp_path, blank_output):
+        store, job_id = _create_job_store(tmp_path)
+        acp_result = AcpResult(output=blank_output, stop_reason="end_turn", session_id="native-1")
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(return_value=acp_result),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["ok"] is False
+        assert stored["failure"]["code"] == "acp_empty_result"
+        assert stored["failure"]["stage"] in FAILURE_STAGES
+        assert stored["failure"]["stage"] == "execution"
+        assert stored["failure"]["retryable"] is True
+        assert "OpenCode" not in stored["output"]
+
+    def test_no_output_sentinel_fails_closed(self, tmp_path):
+        """Zero session_update chunks at all (the "(no output)" sentinel) is
+        just as much a no-op as whitespace text."""
+        from agent_crossbar.acp_client import NO_OUTPUT_SENTINEL
+
+        store, job_id = _create_job_store(tmp_path)
+        acp_result = AcpResult(
+            output=NO_OUTPUT_SENTINEL, stop_reason="end_turn", session_id="native-1"
+        )
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(return_value=acp_result),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["failure"]["code"] == "acp_empty_result"
+
+    def test_concise_nonempty_dev_output_still_succeeds(self, tmp_path):
+        """A legitimately concise dev reply must NOT be treated as empty —
+        `changes` being externally empty (Agents MCP doesn't inventory the
+        workspace) is expected and is not itself a failure signal."""
+        store, job_id = _create_job_store(tmp_path)
+        acp_result = AcpResult(output="Done.", stop_reason="end_turn", session_id="native-1")
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(return_value=acp_result),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "completed"
+        assert stored["ok"] is True
+        assert stored["output"] == "Done."
+        assert stored["envelope"]["changes"] == []
+
+    @pytest.mark.parametrize("task", ["ask", "review"])
+    def test_non_dev_whitespace_output_is_unaffected(self, tmp_path, task):
+        """Preserves pre-existing behaviour for ask/review — only "dev" gets
+        the fail-closed empty-output gate."""
+        store = JobStore(tmp_path)
+        job = store.create_job(
+            profile="opencode",
+            operation=task,
+            transport="print",
+            sensitivity="normal",
+            cwd=str(tmp_path),
+        )
+        job_id = job.job_id
+        acp_result = AcpResult(output="\n\n", stop_reason="end_turn", session_id="native-1")
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(return_value=acp_result),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task=task,
+                    model="glm",
+                    autonomy=Autonomy.READ_ONLY,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "completed"
+        assert stored["ok"] is True
+        assert stored["output"] == "\n\n"
 
 
 class TestRunAcpJobTimeout:

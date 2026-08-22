@@ -185,6 +185,11 @@ class OpencodeAdapter(StaticAdapter):
             # OpenCode ACP v1.18.4 advertises the per-model `effort` selector
             # (category `thought_level`) through session config options.
             supports_acp_effort=True,
+            # OpenCode ACP also advertises a `mode` selector (category
+            # `mode`) with values such as orchestrator/build/plan. "dev"
+            # tasks require "build" so edits actually happen — the live
+            # session must advertise and accept this value before prompting.
+            dev_acp_mode="build",
         )
 
     def discover_models(self, runner: DiscoveryProcess) -> ModelCatalog:

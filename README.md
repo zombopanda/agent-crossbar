@@ -293,6 +293,7 @@ provider-credential-free CI.
 | `acp_protocol_error` | ACP protocol handshake or message error (version mismatch, invalid request) | Check provider and protocol logs; provider CLI may need upgrade |
 | `acp_timeout` | ACP job exceeded `max_runtime_sec` while awaiting an already-delivered prompt's response | Follow `failure.next_action`: normally increase `max_runtime_sec`; for OpenCode, `check_provider_limits_or_retry_with_free_model` |
 | `acp_prompt_delivery_timeout` | ACP startup did not finish within its bounded startup window, before the prompt was dispatched | Check provider availability, quota, CLI installation, and selected model |
+| `acp_empty_result` | An ACP `dev` task returned whitespace-only or entirely absent output — treated as a failed no-op rather than `completed`, since a real dev turn should produce observable text even when `changes` stays empty (Agents MCP does not inventory the workspace) | Retry, or inspect the prompt and provider session mode |
 
 `job_stop` is idempotent. ACP jobs persist a terminal result even when the
 provider process has already exited; running ACP child processes receive

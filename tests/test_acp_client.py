@@ -1087,6 +1087,324 @@ class TestRunAcpPromptModelSelection:
         assert secret in str(exc_info.value.__cause__)
 
 
+# I2. session-mode selection via config_option (generic, provider-agnostic)
+# ---------------------------------------------------------------------------
+
+
+class TestRunAcpPromptModeSelection:
+    """A requested session-mode is discovered and accepted before prompting."""
+
+    def test_mode_selected_via_category_and_verified(self):
+        """Discovered mode option + advertised value → set_config_option called."""
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="mode",
+            values=["orchestrator", "build", "plan"],
+            current_value="orchestrator",
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="opencode-go/deepseek-v4-flash",
+                    mode="build",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+            ("mode", "session-1", "build"),
+        ]
+
+    def test_mode_fallback_to_id_when_category_missing(self):
+        """Falls back to id=='mode' when no config option has category=='mode'."""
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="",
+            values=["orchestrator", "build"],
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="opencode-go/deepseek-v4-flash",
+                    mode="build",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert ("mode", "session-1", "build") in conn.set_config_option_calls
+
+    def test_mode_option_absent_is_a_prompt_delivery_error(self):
+        """A requested mode without a live selector must fail closed."""
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        conn = _ConnWithConfig(config_options=[model_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            with pytest.raises(AcpProtocolError, match="No mode config option") as exc:
+                _run(
+                    run_acp_prompt(
+                        ["fake"],
+                        "hello",
+                        "/tmp",
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        model="opencode-go/deepseek-v4-flash",
+                        mode="build",
+                    )
+                )
+        assert exc.value.stage == "prompt_delivery"
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+        ]
+
+    def test_mode_value_not_advertised_is_a_prompt_delivery_error(self):
+        """A live selector without the requested value must fail closed."""
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="mode",
+            values=["orchestrator", "plan"],  # "build" not offered
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            with pytest.raises(AcpProtocolError, match="Requested mode.*not available") as exc:
+                _run(
+                    run_acp_prompt(
+                        ["fake"],
+                        "hello",
+                        "/tmp",
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        model="opencode-go/deepseek-v4-flash",
+                        mode="build",
+                    )
+                )
+        assert exc.value.stage == "prompt_delivery"
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+        ]
+
+    def test_mode_rejected_by_agent_raises_protocol_error(self):
+        """Advertised + attempted, but the agent's response reverts it → hard failure."""
+
+        class _ConnModeRejected(_ConnWithConfig):
+            async def set_config_option(self, config_id, session_id, value, **kwargs):
+                response = await super().set_config_option(config_id, session_id, value, **kwargs)
+                if config_id == "mode":
+                    # Simulate the agent silently refusing the mode switch —
+                    # the response reports the option unchanged.
+                    from acp.schema import SetSessionConfigOptionResponse
+
+                    return SetSessionConfigOptionResponse(config_options=self._config_options)
+                return response
+
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="mode",
+            values=["orchestrator", "build"],
+            current_value="orchestrator",
+        )
+        conn = _ConnModeRejected(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            with pytest.raises(AcpProtocolError, match="Agent rejected mode") as exc:
+                _run(
+                    run_acp_prompt(
+                        ["fake"],
+                        "safe",
+                        "/tmp",
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        model="opencode-go/deepseek-v4-flash",
+                        mode="build",
+                    )
+                )
+        assert exc.value.stage == "prompt_delivery"
+
+    def test_mode_set_config_option_failure_raises_protocol_error(self):
+        """set_config_option raising for the mode id → AcpProtocolError, not silently ignored."""
+
+        class _ConnModeSetError(_ConnWithConfig):
+            async def set_config_option(self, config_id, session_id, value, **kwargs):
+                if config_id == "mode":
+                    raise RuntimeError("connection lost")
+                return await super().set_config_option(config_id, session_id, value, **kwargs)
+
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="mode",
+            values=["orchestrator", "build"],
+        )
+        conn = _ConnModeSetError(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            with pytest.raises(AcpProtocolError, match="Failed to set mode config") as exc:
+                _run(
+                    run_acp_prompt(
+                        ["fake"],
+                        "safe",
+                        "/tmp",
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        model="opencode-go/deepseek-v4-flash",
+                        mode="build",
+                    )
+                )
+        assert exc.value.stage == "prompt_delivery"
+
+    def test_mode_none_never_calls_set_config_option_for_mode(self):
+        """mode=None (the default) never even looks for the selector."""
+        model_opt = _config_with_category(
+            category="model", values=["opencode-go/deepseek-v4-flash"]
+        )
+        mode_opt = _config_with_category(
+            option_id="mode",
+            category="mode",
+            values=["orchestrator", "build"],
+        )
+        conn = _ConnWithConfig(config_options=[model_opt, mode_opt])
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="opencode-go/deepseek-v4-flash",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+        ]
+
+    def test_mode_discovered_from_effort_response_options_snapshot(self):
+        """Mode discovery must read the snapshot returned by the *effort*
+        set_config_option call, not the initial session/new advertisement.
+
+        Regression: matches the real OpenCode ACP sequence, where session/new
+        advertises only the model selector and effort/mode are only revealed
+        by later set_config_option responses. Mode resolution must thread the
+        freshest snapshot through model -> effort -> mode, in that order.
+        """
+
+        class _StagedConfigConn:
+            def __init__(self):
+                self.session_id = "session-1"
+                self.client = None
+                self.set_config_option_calls: list[tuple[str, str, str]] = []
+                self._model_opt = _config_with_category(
+                    option_id="model",
+                    category="model",
+                    values=["opencode-go/deepseek-v4-flash"],
+                    current_value="",
+                )
+                self._effort_opt = _config_with_category(
+                    option_id="effort",
+                    category="thought_level",
+                    values=["low", "high"],
+                    current_value="low",
+                )
+                self._mode_opt = _config_with_category(
+                    option_id="mode",
+                    category="mode",
+                    values=["orchestrator", "build"],
+                    current_value="orchestrator",
+                )
+
+            async def initialize(self, protocol_version, client_capabilities=None, **kwargs):
+                return SimpleNamespace(protocol_version=protocol_version)
+
+            async def new_session(self, cwd, **kwargs):
+                # session/new advertises the model selector only.
+                return SimpleNamespace(session_id=self.session_id, config_options=[self._model_opt])
+
+            async def set_config_option(self, config_id, session_id, value, **kwargs):
+                from acp.schema import SetSessionConfigOptionResponse
+
+                self.set_config_option_calls.append((config_id, session_id, value))
+                if config_id == "model":
+                    updated = self._model_opt.model_copy(update={"current_value": value})
+                    # Fresh snapshot: selecting the model reveals effort + mode.
+                    return SetSessionConfigOptionResponse(
+                        config_options=[updated, self._effort_opt, self._mode_opt]
+                    )
+                if config_id == "effort":
+                    updated = self._effort_opt.model_copy(update={"current_value": value})
+                    # Fresh snapshot: still exposes the mode selector.
+                    return SetSessionConfigOptionResponse(config_options=[updated, self._mode_opt])
+                if config_id == "mode":
+                    updated = self._mode_opt.model_copy(update={"current_value": value})
+                    return SetSessionConfigOptionResponse(config_options=[updated])
+                raise AssertionError(f"unexpected config_id {config_id!r}")
+
+            async def prompt(self, session_id, prompt, **kwargs):
+                return SimpleNamespace(stop_reason="end_turn")
+
+        conn = _StagedConfigConn()
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn_with_config(conn),
+        ):
+            result = _run(
+                run_acp_prompt(
+                    ["fake"],
+                    "hello",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="opencode-go/deepseek-v4-flash",
+                    effort="high",
+                    mode="build",
+                )
+            )
+        assert isinstance(result, AcpResult)
+        assert result.session_id == "session-1"
+        assert result.stop_reason == "end_turn"
+        assert conn.set_config_option_calls == [
+            ("model", "session-1", "opencode-go/deepseek-v4-flash"),
+            ("effort", "session-1", "high"),
+            ("mode", "session-1", "build"),
+        ]
+
+
 # J. model and effort forwarded through run_acp_job
 class TestRunAcpJobForwardsConfiguration:
     def test_model_and_effort_passed_to_run_acp_prompt(self, tmp_path):
@@ -1123,6 +1441,74 @@ class TestRunAcpJobForwardsConfiguration:
         _, kwargs = mock_run.call_args
         assert kwargs["model"] == "opencode-go/deepseek-v4-flash"
         assert kwargs["effort"] == "high"
+        # "dev" + opencode resolves the adapter-owned "build" mode.
+        assert kwargs["mode"] == "build"
+
+    def test_mode_not_resolved_for_non_dev_task(self, tmp_path):
+        """Only "dev" tasks get an automatic session-mode preference."""
+        from agent_crossbar.acp_runtime import run_acp_job
+        from agent_crossbar.jobs import JobStore
+
+        store = JobStore(tmp_path)
+        job = store.create_job(
+            profile="opencode", operation="review", transport="print", cwd=str(tmp_path)
+        )
+
+        with mock.patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(
+                return_value=AcpResult(output="ok", stop_reason="end_turn", session_id="s1")
+            ),
+        ) as mock_run:
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job.job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="review",
+                    model="opencode-go/deepseek-v4-flash",
+                    autonomy=Autonomy.READ_ONLY,
+                    max_runtime_sec=30,
+                )
+            )
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["mode"] is None
+
+    def test_mode_not_resolved_for_codex_dev_task(self, tmp_path):
+        """Codex has no dev_acp_mode preference — resolution stays None."""
+        from agent_crossbar.acp_runtime import run_acp_job
+        from agent_crossbar.jobs import JobStore
+
+        store = JobStore(tmp_path)
+        job = store.create_job(
+            profile="codex", operation="dev", transport="print", cwd=str(tmp_path)
+        )
+
+        with mock.patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(
+                return_value=AcpResult(output="ok", stop_reason="end_turn", session_id="s1")
+            ),
+        ) as mock_run:
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job.job_id,
+                    provider="codex",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="gpt-5.6-sol",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=30,
+                )
+            )
+
+        _, kwargs = mock_run.call_args
+        assert kwargs["mode"] is None
 
 
 @pytest.mark.parametrize(

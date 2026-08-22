@@ -48,6 +48,11 @@ from .models import Autonomy
 logger = logging.getLogger(__name__)
 ACP_HEARTBEAT_INTERVAL_SEC = 30.0
 
+# Sentinel returned as AcpResult.output when the agent produced zero
+# session_update text chunks. Exported so callers (e.g. acp_runtime) can
+# recognize "no output at all" distinctly from a genuine empty string.
+NO_OUTPUT_SENTINEL = "(no output)"
+
 # ── Public types ────────────────────────────────────────────────────────
 
 
@@ -333,6 +338,27 @@ def _find_effort_config_option(
     return None
 
 
+def _find_mode_config_option(
+    config_options: list[Any] | None,
+) -> SessionConfigOptionSelect | None:
+    """Find the optional session-mode selector advertised by an ACP agent.
+
+    Provider-neutral: identifies the selector by category ``mode``, falling
+    back to ``id == "mode"``. Which value (if any) should be requested for a
+    given task is a provider-owned decision (e.g. ``adapters.opencode``) —
+    this helper only locates the selector, it never guesses a value.
+    """
+    if not config_options:
+        return None
+    for opt in config_options:
+        if isinstance(opt, SessionConfigOptionSelect) and getattr(opt, "category", None) == "mode":
+            return opt
+    for opt in config_options:
+        if isinstance(opt, SessionConfigOptionSelect) and getattr(opt, "id", None) == "mode":
+            return opt
+    return None
+
+
 def _model_value_available(option: SessionConfigOptionSelect, value: str) -> bool:
     """Check if *value* exists among *option*'s flat options or grouped options."""
     for entry in option.options:
@@ -357,6 +383,7 @@ async def run_acp_prompt(
     autonomy: str | Autonomy = Autonomy.READ_ONLY,
     model: str,
     effort: str | None = None,
+    mode: str | None = None,
     startup_timeout: float = 30.0,
     on_process_start: Callable[[int], None] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
@@ -392,6 +419,14 @@ async def run_acp_prompt(
         effort: Optional reasoning level. When supplied, the agent must
             advertise a compatible thought-level/effort config selector after
             model selection; the value is validated and set before the prompt.
+        mode: Optional session-mode value (e.g. OpenCode's ``build`` mode for
+            dev tasks). When supplied, the agent must advertise a
+            ``category == "mode"`` (or ``id == "mode"``) selector whose
+            options include *mode*. The selection is then attempted and its
+            acceptance is verified the same way as model/effort. A missing
+            selector/value, or an agent that rejects the value (or errors),
+            raises :class:`AcpProtocolError`; callers that do not request a
+            mode leave this mechanism unused.
         startup_timeout: Maximum seconds for initialize, session creation,
             and model selection before the job fails as a startup timeout.
         on_process_start: Optional callback receiving the child PID.
@@ -503,6 +538,11 @@ async def run_acp_prompt(
                             stage="prompt_delivery",
                         )
 
+                    # Tracks the most recent config_options snapshot so mode
+                    # selection (below) sees any selector shifts caused by
+                    # the effort selection, when present.
+                    latest_options = response_options
+
                     if effort is not None:
                         effort_option = _find_effort_config_option(response_options)
                         if effort_option is None:
@@ -536,6 +576,46 @@ async def run_acp_prompt(
                         ):
                             raise AcpProtocolError(
                                 f"Agent rejected effort {effort!r}: the config option was not applied",
+                                stage="prompt_delivery",
+                            )
+                        latest_options = effort_response_options
+
+                    # Session-mode selection is optional at the API boundary,
+                    # but strict once requested: provider adapters use this
+                    # to require a live, advertised mode for dev tasks.
+                    if mode is not None:
+                        mode_option = _find_mode_config_option(latest_options)
+                        if mode_option is None:
+                            raise AcpProtocolError(
+                                "No mode config option available from agent",
+                                stage="prompt_delivery",
+                            )
+                        if not _model_value_available(mode_option, mode):
+                            raise AcpProtocolError(
+                                f"Requested mode {mode!r} not available from agent",
+                                stage="prompt_delivery",
+                            )
+                        try:
+                            mode_response = await conn.set_config_option(
+                                config_id=mode_option.id,
+                                session_id=session_id,
+                                value=mode,
+                            )
+                        except Exception as exc:
+                            raise AcpProtocolError(
+                                "Failed to set mode config option", stage="prompt_delivery"
+                            ) from exc
+
+                        mode_response_options: list[Any] | None = getattr(
+                            mode_response, "config_options", None
+                        )
+                        response_mode_option = _find_mode_config_option(mode_response_options)
+                        if (
+                            response_mode_option is None
+                            or response_mode_option.current_value != mode
+                        ):
+                            raise AcpProtocolError(
+                                f"Agent rejected mode {mode!r}: the config option was not applied",
                                 stage="prompt_delivery",
                             )
                     return session_id
@@ -663,7 +743,7 @@ async def run_acp_prompt(
                 output = (
                     "".join(client_impl._output_parts)
                     if client_impl._output_parts
-                    else "(no output)"
+                    else NO_OUTPUT_SENTINEL
                 )
 
                 return AcpResult(

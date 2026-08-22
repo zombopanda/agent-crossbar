@@ -87,6 +87,11 @@ class StaticAdapter:
     # Whether this ACP agent advertises an effort/thought-level selector that
     # can be set through session/set_config_option.
     supports_acp_effort: bool = False
+    # The ACP session-mode value (category=="mode") this provider requires
+    # for "dev" tasks, e.g. OpenCode's "build" mode — None means no
+    # provider-specific mode requirement. The generic ACP client requires
+    # live advertisement and acceptance whenever this is non-None.
+    dev_acp_mode: str | None = None
 
     def map_effort(self, effort: str) -> str:
         return normalize_effort(effort, self.effort_map)

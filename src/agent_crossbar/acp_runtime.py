@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_crossbar.acp_client import (
+    NO_OUTPUT_SENTINEL,
     AcpError,
     AcpLaunchError,
     AcpProtocolError,
@@ -47,6 +48,31 @@ def _count_events(store: Any, job_id: str) -> int:
         return int(job.events.last_seq) if job else 0
     except Exception:
         return 0
+
+
+def _resolve_dev_session_mode(provider: str, task: str) -> str | None:
+    """Return the provider-owned ACP session mode for *task*, if any.
+
+    The decision of *which* mode value a "dev" task wants (e.g. OpenCode's
+    "build") is owned by that provider's adapter (``dev_acp_mode``) — this
+    stays provider-agnostic by only reading that declared preference. When an
+    adapter declares a mode, ``run_acp_prompt`` requires live discovery and
+    acceptance of that value before dispatching the prompt.
+    """
+    if task != "dev":
+        return None
+    from agent_crossbar.adapters.registry import get_adapter
+
+    try:
+        adapter = get_adapter(provider)
+    except ValueError:
+        return None
+    return getattr(adapter, "dev_acp_mode", None)
+
+
+def _is_empty_acp_output(output: str) -> bool:
+    """Return True when *output* carries no observable assistant text."""
+    return output == NO_OUTPUT_SENTINEL or not output.strip()
 
 
 async def run_acp_job(
@@ -169,6 +195,7 @@ async def run_acp_job(
             autonomy=autonomy,
             model=model,
             effort=effort,
+            mode=_resolve_dev_session_mode(provider, task),
             on_process_start=_record_acp_pid,
             on_text_delta=_record_acp_text_delta,
             on_execution_heartbeat=_record_acp_execution_heartbeat,
@@ -313,6 +340,41 @@ async def run_acp_job(
             task=task,
             cwd=cwd,
             diagnostics={"error": safe},
+        )
+        return
+
+    # -- fail closed: a "dev" job that produced no observable work ------------------
+    # A successful dev turn may legitimately have concise nonempty text and an
+    # externally empty `changes` field (Agents MCP does not inventory the
+    # workspace) — that alone is not a failure signal. But whitespace-only or
+    # entirely absent output from a dev task means nothing observable happened
+    # at all, so it must never be reported as "completed".
+    if task == "dev" and _is_empty_acp_output(result.output):
+        safe = (
+            "ACP dev task returned no observable output or changes. "
+            "This is treated as a failure rather than a silent no-op completion."
+        )
+        _fail(
+            store=store,
+            job_id=job_id,
+            safe_output=safe,
+            stop_reason=result.stop_reason,
+            stage="execution",
+            code="acp_empty_result",
+            retryable=True,
+            next_action="retry_or_inspect_session_mode_and_prompt",
+            meta=meta,
+            started_at=started_at,
+            provider=provider,
+            model=model,
+            effort=effort,
+            task=task,
+            cwd=cwd,
+            diagnostics={
+                "stop_reason": result.stop_reason,
+                "native_session_id": getattr(result, "session_id", None),
+                "output_len": len(result.output),
+            },
         )
         return
 
