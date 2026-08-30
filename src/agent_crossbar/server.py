@@ -1164,9 +1164,12 @@ def job_stop(
             return result
         meta = store._read_job_meta(job.path)
 
-        # Do not terminate already-terminal jobs
+        # ``awaiting_input`` is still nonterminal: an unhandleable provider
+        # prompt must follow the same explicit stop -> terminal result flow as
+        # a running turn.  Only durable terminal statuses are idempotently
+        # rejected here.
         current_status = meta.get("status", "running")
-        if current_status != "running":
+        if current_status not in {"running", "awaiting_input"}:
             return {
                 "ok": False,
                 "error": "job_already_terminal",
