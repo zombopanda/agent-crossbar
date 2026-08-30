@@ -236,6 +236,28 @@ observed deadline, `3` terminal failure/cancellation, and `4` missing or
 inaccessible job. Do not infer a stall from a quiet `job_tail`, no workspace
 diff, or absent output.
 
+The waiter intentionally never cancels a job. If an unhandleable blocking
+prompt is visible in `job_tail`, or the declared runtime deadline has elapsed,
+use the explicit stop-then-collect wrapper (never for silence alone):
+
+```bash
+python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/terminalize_job.py \
+  "<job-id>" blocking_prompt
+# or, after the runtime deadline:
+python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/terminalize_job.py \
+  "<job-id>" runtime_deadline
+```
+
+It calls the existing provider-neutral `job_stop` lifecycle and then waits for
+terminal `job_result`. `result_not_ready`, `job_tail`, and durable metadata do
+not authorize replacement; if terminalization itself times out, retain the
+original job and report the unresolved state.
+
+`runtime_deadline` is accepted only when the job metadata records a positive
+`max_runtime_sec` and `started_at`, and the current time is past that deadline
+plus the documented 15-second result grace. `blocking_prompt` is accepted only
+for the durable `awaiting_input` state.
+
 Development jobs are serialized by a durable per-canonical-cwd writer lease.
 `agent_start(task="dev")` acquires it before provider launch and releases it
 only after a terminal result (or stop). Controller-local fallback must use the
@@ -252,6 +274,19 @@ python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/wr
 
 The MCP surface remains exactly eight tools; writer-lease commands are an
 internal CLI/controller path, not MCP tools.
+
+An external job lease is never reclaimed by age while its job is nonterminal,
+missing, or corrupt. If a job record is truly missing or corrupt, an operator
+may use the explicit recovery path after preserving the state directory:
+
+```bash
+python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+  recover --cwd "<cwd>" --acknowledgement recover-missing-or-corrupt-job
+```
+
+Recovery refuses nonterminal jobs and corrupt lease files; ordinary
+controllers must wait for `job_result` or call the existing provider-neutral
+`job_stop` lifecycle.
 
 The credential-free `scripts/acp_quiet_live_harness.py` is a lifecycle
 regression harness, not a provider E2E. Maintainers can run the real provider
@@ -307,6 +342,11 @@ provider-credential-free CI.
 | `provider_limit_exhausted` | Provider quota, credits, or rate limit is exhausted | Wait for reset or choose another explicitly available model |
 | `provider_unavailable` | No backend is currently available for the selected model | Choose another model or retry after the provider recovers |
 | `writer_busy` | Another external or controller-local dev writer holds the canonical-cwd lease | Wait for its terminal result/release, or retry after stale reconciliation; do not edit concurrently |
+| `writer_lease_corrupt` | Lease or associated external-job state is unreadable | Preserve the state directory, restore the record, or use the explicit acknowledged recovery path only for a missing/corrupt job |
+| `writer_recovery_confirmation_required` / `writer_recovery_unsafe` | Explicit lease recovery was missing its acknowledgement or targeted a nonterminal/unsupported owner | Wait for terminal `job_result`/`job_stop`; recovery never overrides a nonterminal external job |
+| `terminal_wait_timeout` | Explicit terminal result was not observed before the bounded waiter deadline | Do not replace the writer; inspect the retained job and use explicit `terminalize_job.py` only for a blocking prompt or elapsed runtime deadline |
+| `terminalize_reason_not_permitted` | `blocking_prompt` was requested for a job that is not durably `awaiting_input` | Do not stop it; wait for the provider-required input state or use ordinary `job_stop` only when explicitly requested |
+| `runtime_deadline_not_reached` / `runtime_deadline_unavailable` | Deadline recovery was requested before `max_runtime_sec` + 15s grace, or required metadata was missing/invalid | Do not stop or replace the job; retain it until the recorded deadline is proven |
 | `acp_launch_error` | ACP agent process failed to launch (binary missing, dependency error) | Check provider CLI installation, run `agent-crossbar doctor` |
 | `acp_protocol_error` | ACP protocol handshake or message error (version mismatch, invalid request) | Check provider and protocol logs; provider CLI may need upgrade |
 | `acp_timeout` | ACP job exceeded `max_runtime_sec` while awaiting an already-delivered prompt's response | Follow `failure.next_action`: normally increase `max_runtime_sec`; for OpenCode, `check_provider_limits_or_retry_with_free_model` |

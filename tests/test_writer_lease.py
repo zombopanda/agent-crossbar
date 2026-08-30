@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_crossbar.writer_lease import WriterLeaseStore
+from agent_crossbar.writer_lease import RECOVERY_ACKNOWLEDGEMENT, WriterLeaseStore
 
 
 def test_canonical_cwd_identity_collapses_relative_and_symlink_paths(tmp_path: Path):
@@ -93,11 +93,155 @@ def test_terminal_job_reconciliation_releases_external_lease(tmp_path: Path):
     assert store.acquire(str(workspace), owner_id="next-job").ok is True
 
 
+@pytest.mark.parametrize("job_meta", ["running", "missing", "corrupt"])
+def test_nonterminal_or_unverifiable_external_job_is_never_age_reconciled(
+    tmp_path: Path, job_meta: str
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    job_id = "123456789-job"
+    job_dir = state / "jobs" / job_id
+    if job_meta != "missing":
+        job_dir.mkdir(parents=True)
+        (job_dir / "meta.json").write_text(
+            '{"status":"running"}\n' if job_meta == "running" else "not-json\n"
+        )
+    store = WriterLeaseStore(state, stale_after_sec=1)
+    lease = store.acquire(str(workspace), owner_id=job_id, owner_kind="external_job")
+    assert lease.ok is True and lease.token
+    lease_path = store.lease_path(lease.canonical_cwd)
+    payload = json.loads(lease_path.read_text())
+    payload["heartbeat_at"] = "2000-01-01T00:00:00+00:00"
+    lease_path.write_text(json.dumps(payload))
+    old = time.time() - 120
+    os.utime(lease_path, (old, old))
+
+    assert store.reconcile() == 0
+    blocked = store.acquire(str(workspace), owner_id="next-job")
+    assert blocked.ok is False
+    assert blocked.error == "writer_busy"
+
+
+def test_corrupt_lease_state_fails_closed(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(tmp_path / "state")
+    lease_path = store.lease_path(str(workspace))
+    lease_path.parent.mkdir(parents=True)
+    lease_path.write_text("not-json\n")
+
+    result = store.acquire(str(workspace), owner_id="next-job")
+    assert result.ok is False
+    assert result.error == "writer_lease_corrupt"
+
+
+def test_explicit_recovery_can_clear_only_missing_external_job(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(tmp_path / "state")
+    lease = store.acquire(str(workspace), owner_id="123456789-missing", owner_kind="external_job")
+    assert lease.ok is True
+    refused = store.recover(str(workspace), acknowledgement="wrong")
+    assert refused.ok is False
+    assert refused.error == "writer_recovery_confirmation_required"
+    recovered = store.recover(str(workspace), acknowledgement=RECOVERY_ACKNOWLEDGEMENT)
+    assert recovered.ok is True
+    assert store.acquire(str(workspace), owner_id="next-job").ok is True
+
+
+def test_explicit_recovery_never_clears_nonterminal_external_job(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    job_id = "123456789-running"
+    job_dir = state / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "meta.json").write_text('{"status":"running"}\n')
+    store = WriterLeaseStore(state)
+    lease = store.acquire(str(workspace), owner_id=job_id, owner_kind="external_job")
+    assert lease.ok is True
+    refused = store.recover(str(workspace), acknowledgement=RECOVERY_ACKNOWLEDGEMENT)
+    assert refused.ok is False
+    assert refused.error == "writer_recovery_unsafe"
+    assert store.acquire(str(workspace), owner_id="next-job").error == "writer_busy"
+
+
+def test_root_integration_lease_serializes_external_dev_writer(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(tmp_path / "state")
+    root = store.acquire(str(workspace), owner_id="root", owner_kind="root_integration")
+    assert root.ok is True
+    blocked = store.acquire(str(workspace), owner_id="123456789-job", owner_kind="external_job")
+    assert blocked.ok is False
+    assert blocked.error == "writer_busy"
+    assert store.release(root.token) is True
+    assert (
+        store.acquire(str(workspace), owner_id="123456789-job", owner_kind="external_job").ok
+        is True
+    )
+
+
+def test_agent_start_dev_rejects_root_integration_lease_before_provider_launch(
+    tmp_path: Path, monkeypatch
+):
+    from agent_crossbar import server
+    from agent_crossbar.readiness import ReadinessResult
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = WriterLeaseStore(state).acquire(
+        str(workspace), owner_id="root", owner_kind="root_integration"
+    )
+    assert root.ok is True
+    monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(state))
+    monkeypatch.setattr(
+        "agent_crossbar.readiness.probe_profile",
+        lambda *args, **kwargs: ReadinessResult(
+            profile="reasonix",
+            state="ready",
+            support_tier="experimental",
+            authenticated=True,
+        ),
+    )
+    launched = []
+    monkeypatch.setattr(server, "start_print_job", lambda *args, **kwargs: launched.append(True))
+
+    result = server.agent_start(
+        profile="reasonix",
+        prompt="change the workspace",
+        model="deepseek-v4-flash",
+        task="dev",
+        cwd=str(workspace),
+    )
+    assert result["ok"] is False
+    assert result["error"] == "writer_busy"
+    assert launched == []
+
+
+def test_stale_root_integration_lease_reconciles(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(tmp_path / "state", stale_after_sec=1)
+    root = store.acquire(str(workspace), owner_id="root", owner_kind="root_integration")
+    assert root.ok is True
+    lease_path = store.lease_path(root.canonical_cwd)
+    payload = json.loads(lease_path.read_text())
+    payload["heartbeat_at"] = "2000-01-01T00:00:00+00:00"
+    lease_path.write_text(json.dumps(payload))
+    os.utime(lease_path, (time.time() - 120, time.time() - 120))
+
+    assert store.reconcile() == 1
+    assert store.acquire(str(workspace), owner_id="next", owner_kind="local").ok is True
+
+
 def test_stale_lease_is_reconciled_without_stranding_cwd(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     store = WriterLeaseStore(tmp_path / "state", stale_after_sec=1)
-    lease = store.acquire(str(workspace), owner_id="dead-job")
+    lease = store.acquire(str(workspace), owner_id="dead-job", owner_kind="pending_dev")
     assert lease.ok is True
     lease_path = store.lease_path(lease.canonical_cwd)
     payload = json.loads(lease_path.read_text())
@@ -115,7 +259,7 @@ def test_stale_heartbeat_is_reconciled_even_if_file_mtime_is_fresh(tmp_path: Pat
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     store = WriterLeaseStore(tmp_path / "state", stale_after_sec=1)
-    lease = store.acquire(str(workspace), owner_id="dead-job")
+    lease = store.acquire(str(workspace), owner_id="dead-job", owner_kind="local")
     assert lease.ok is True
     lease_path = store.lease_path(lease.canonical_cwd)
     payload = json.loads(lease_path.read_text())

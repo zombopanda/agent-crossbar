@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -24,6 +25,10 @@ from typing import Any, Iterator
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "stopped", "cancelled"})
+_AGE_RECONCILABLE_OWNERS = frozenset({"pending_dev", "local", "root_integration"})
+_ROOT_INTEGRATION_STALE_AFTER_SEC = 900.0
+_JOB_ID_RE = re.compile(r"^[0-9]{8,}-[a-zA-Z0-9_-]+$")
+RECOVERY_ACKNOWLEDGEMENT = "recover-missing-or-corrupt-job"
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -134,15 +139,27 @@ class WriterLeaseStore:
                 pass
 
     @staticmethod
+    def _external_job_state(state_root: Path, payload: dict[str, Any]) -> str:
+        """Classify external ownership without ever treating uncertainty as safe."""
+        job_id = payload.get("job_id") or payload.get("owner_id")
+        if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+            return "corrupt"
+        job_dir = state_root / "jobs" / job_id
+        meta_path = job_dir / "meta.json"
+        if not meta_path.is_file():
+            return "missing"
+        meta = WriterLeaseStore._read(meta_path)
+        if meta is None:
+            return "corrupt"
+        if meta.get("status") in _TERMINAL_STATUSES:
+            return "terminal"
+        return "nonterminal"
+
+    @staticmethod
     def _job_is_terminal(state_root: Path, payload: dict[str, Any]) -> bool:
         if payload.get("owner_kind") != "external_job":
             return False
-        job_id = payload.get("job_id") or payload.get("owner_id")
-        if not isinstance(job_id, str) or not job_id:
-            return False
-        meta_path = state_root / "jobs" / job_id / "meta.json"
-        meta = WriterLeaseStore._read(meta_path)
-        return bool(meta and meta.get("status") in _TERMINAL_STATUSES)
+        return WriterLeaseStore._external_job_state(state_root, payload) == "terminal"
 
     def _is_stale(self, path: Path, payload: dict[str, Any], now: float) -> bool:
         try:
@@ -166,7 +183,10 @@ class WriterLeaseStore:
                     observed_times.append(datetime.fromisoformat(acquired).timestamp())
                 except ValueError:
                     pass
-        return now - min(observed_times) >= self.stale_after_sec
+        stale_after = self.stale_after_sec
+        if payload.get("owner_kind") == "root_integration":
+            stale_after = min(stale_after, _ROOT_INTEGRATION_STALE_AFTER_SEC)
+        return now - min(observed_times) >= stale_after
 
     def _reconcile_locked(self) -> int:
         removed = 0
@@ -175,11 +195,23 @@ class WriterLeaseStore:
             return removed
         for path in self.leases_root.glob("*.json"):
             payload = self._read(path)
-            if (
-                payload is None
-                or self._job_is_terminal(self.state_root, payload)
-                or self._is_stale(path, payload, now)
-            ):
+            if payload is None:
+                # Corrupt lease state is fail-closed.  Removing it here would
+                # allow an unrelated writer to overlap an unknown owner.
+                continue
+            if payload.get("owner_kind") == "external_job":
+                # An external job's age is never evidence of safe release:
+                # only its durable terminal result or explicit stop is.
+                if self._job_is_terminal(self.state_root, payload):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        continue
+                    removed += 1
+                continue
+            if payload.get("owner_kind") not in _AGE_RECONCILABLE_OWNERS:
+                continue
+            if self._is_stale(path, payload, now):
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -209,6 +241,16 @@ class WriterLeaseStore:
         with self._locked():
             self._reconcile_locked()
             current = self._read(path)
+            if current is None and path.exists():
+                return WriterLeaseResult(
+                    ok=False,
+                    canonical_cwd=identity,
+                    error="writer_lease_corrupt",
+                    message=(
+                        f"writer lease state is unreadable for canonical cwd {identity}; "
+                        "inspect or restore the lease file before retrying"
+                    ),
+                )
             if current is not None:
                 try:
                     age_sec = max(0, int(time.time() - path.stat().st_mtime))
@@ -265,6 +307,67 @@ class WriterLeaseStore:
                 self._write(path, payload)
                 return True
         return False
+
+    def recover(
+        self,
+        cwd: str | Path,
+        *,
+        acknowledgement: str,
+    ) -> WriterLeaseResult:
+        """Explicitly recover only a valid external lease with no readable job.
+
+        This is intentionally not part of the MCP surface.  It requires an
+        exact operator acknowledgement and never recovers a nonterminal job.
+        """
+        identity = canonical_cwd(cwd)
+        path = self.lease_path(identity)
+        if acknowledgement != RECOVERY_ACKNOWLEDGEMENT:
+            return WriterLeaseResult(
+                ok=False,
+                canonical_cwd=identity,
+                error="writer_recovery_confirmation_required",
+                message=f"pass acknowledgement={RECOVERY_ACKNOWLEDGEMENT!r} explicitly",
+            )
+        with self._locked():
+            payload = self._read(path)
+            if payload is None:
+                return WriterLeaseResult(
+                    ok=False,
+                    canonical_cwd=identity,
+                    error="writer_lease_corrupt",
+                    message="corrupt lease state cannot be recovered automatically",
+                )
+            if payload.get("owner_kind") != "external_job":
+                return WriterLeaseResult(
+                    ok=False,
+                    canonical_cwd=identity,
+                    error="writer_recovery_unsafe",
+                    message="only an external lease with a missing or corrupt job may be recovered",
+                )
+            state = self._external_job_state(self.state_root, payload)
+            if state not in {"missing", "corrupt"}:
+                return WriterLeaseResult(
+                    ok=False,
+                    canonical_cwd=identity,
+                    error="writer_recovery_unsafe",
+                    message=f"external job state is {state}; wait for terminal result or explicit stop",
+                )
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return WriterLeaseResult(
+                    ok=False,
+                    canonical_cwd=identity,
+                    error="writer_lease_not_found",
+                    message="writer lease disappeared before recovery",
+                )
+            return WriterLeaseResult(
+                ok=True,
+                canonical_cwd=identity,
+                owner_id=str(payload.get("owner_id") or "unknown"),
+                owner_kind="external_job",
+                message=f"recovered external lease with {state} job state",
+            )
 
     def heartbeat(self, token: str) -> bool:
         """Refresh a lease timestamp while its owner is still running."""
