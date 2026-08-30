@@ -39,6 +39,7 @@ from agent_crossbar.runner import (
 )
 from agent_crossbar.telemetry import TelemetryStore
 from agent_crossbar.validation import validate_start_request
+from agent_crossbar.writer_lease import WriterLeaseResult, WriterLeaseStore
 
 mcp = FastMCP("agents")
 _sync_request_state: ContextVar[tuple[str, threading.Event, asyncio.Task[Any] | None] | None] = (
@@ -526,8 +527,29 @@ def agent_start(
 
     request_payload = dict(req)
 
-    def _handle() -> dict[str, Any]:
-        result = validate_start_request(req, state_root=_state_root())
+    writer_lease_store: WriterLeaseStore | None = None
+    writer_lease_holder: list[WriterLeaseResult | None] | None = None
+
+    def _attach_writer_lease(store: JobStore, job_id: str) -> None:
+        """Bind the pending controller lease to a durable external job."""
+        if writer_lease_store is None or writer_lease_holder is None:
+            return
+        lease = writer_lease_holder[0]
+        if lease is None or lease.token is None:
+            return
+        if not writer_lease_store.attach(lease.token, job_id=job_id):
+            raise RuntimeError("writer lease disappeared before job ownership was attached")
+        store.update_job_meta(
+            job_id,
+            {
+                "writer_lease_token": lease.token,
+                "writer_lease_cwd": lease.canonical_cwd,
+            },
+        )
+        writer_lease_holder[0] = None
+
+    def _handle_impl(prevalidated: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = prevalidated or validate_start_request(req, state_root=_state_root())
         if not result["ok"]:
             return result
 
@@ -587,6 +609,7 @@ def agent_start(
                 client_name=_client_metadata(client, client_name)["name"],
                 cwd=effective_cwd,
             )
+            _attach_writer_lease(store, job.job_id)
 
             # ── Interactive: launch tmux claude attach session ──
             tmux_session_name: str | None = None
@@ -729,6 +752,7 @@ def agent_start(
                     client_name=_client_metadata(client, client_name)["name"],
                     cwd=effective_cwd,
                 )
+                _attach_writer_lease(store, job.job_id)
                 store.update_job_meta(
                     job.job_id,
                     {
@@ -800,6 +824,7 @@ def agent_start(
                 client_name=_client_metadata(client, client_name)["name"],
                 cwd=effective_cwd,
             )
+            _attach_writer_lease(store, job.job_id)
             store.update_job_meta(
                 job.job_id,
                 {
@@ -874,6 +899,7 @@ def agent_start(
             client_name=_client_metadata(client, client_name)["name"],
             cwd=run_req.get("cwd"),
         )
+        _attach_writer_lease(store, job.job_id)
         store.update_job_meta(
             job.job_id,
             {
@@ -911,6 +937,34 @@ def agent_start(
             "operation": result["operation"],
             "warnings": warnings,
         }
+
+    def _handle() -> dict[str, Any]:
+        """Validate before acquiring a lease, then release pending ownership on return."""
+        nonlocal writer_lease_store, writer_lease_holder
+        if task != "dev":
+            return _handle_impl()
+
+        prevalidated = validate_start_request(req, state_root=_state_root())
+        if not prevalidated["ok"]:
+            return prevalidated
+        effective_cwd = req.get("cwd") or os.getcwd()
+        writer_lease_store = WriterLeaseStore(_state_root())
+        pending = writer_lease_store.acquire(
+            effective_cwd,
+            owner_id=f"pending:{uuid.uuid4().hex}",
+            owner_kind="pending_dev",
+        )
+        if not pending.ok:
+            return _tool_error("writer_busy", pending.message or "development writer is busy")
+        writer_lease_holder = [pending]
+        try:
+            return _handle_impl(prevalidated)
+        finally:
+            lease = writer_lease_holder[0] if writer_lease_holder is not None else None
+            if lease is not None and lease.token is not None:
+                writer_lease_store.release(lease.token)
+            writer_lease_holder = None
+            writer_lease_store = None
 
     return _run_logged_tool(
         "agent_start",

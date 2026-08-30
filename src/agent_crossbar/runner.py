@@ -3246,7 +3246,12 @@ def _monitor_tmux_job(
     deadline = time.monotonic() + timeout_sec if timeout_sec else None
     consecutive_complete_observations = 0
     required_complete_observations = 10 if (profile or "").casefold() == "codex" else 1
+    last_lease_heartbeat_at = time.monotonic()
     while True:
+        now = time.monotonic()
+        if now - last_lease_heartbeat_at >= 30.0:
+            store.heartbeat_writer_lease(job_id)
+            last_lease_heartbeat_at = now
         job = store.get_job(job_id)
         if job is not None and store._read_job_meta(job.path).get("status") == "stopped":
             cleanup = run(

@@ -107,6 +107,7 @@ def _run_adapter_job(
 
     last_logs = ""
     last_heartbeat_at: float | None = None
+    last_lease_heartbeat_at = started_monotonic
     _consecutive_idle = 0  # counter for working+idle detection
 
     try:
@@ -170,6 +171,11 @@ def _run_adapter_job(
             status = adapter.status(runner, session_id)
             native_state = status.get("state", "unknown")
 
+            now = time.monotonic()
+            if now - last_lease_heartbeat_at >= _HEARTBEAT_INTERVAL_SEC:
+                store.heartbeat_writer_lease(job_id)
+                last_lease_heartbeat_at = now
+
             # Persist full session ID on every poll, not just terminal
             full_session_id = status.get("session_id")
             if full_session_id:
@@ -199,7 +205,6 @@ def _run_adapter_job(
             # provider can spend minutes reasoning without producing either.
             # Emit a sparse, provider-neutral heartbeat from its native status
             # so a supervising client never has to infer a stall from silence.
-            now = time.monotonic()
             if native_state == "working" and (
                 last_heartbeat_at is None or now - last_heartbeat_at >= _HEARTBEAT_INTERVAL_SEC
             ):

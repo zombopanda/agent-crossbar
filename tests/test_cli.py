@@ -46,6 +46,28 @@ def test_wait_job_help_documents_explicit_state_dir(monkeypatch, capsys) -> None
     assert "--state-dir" in capsys.readouterr().out
 
 
+def test_writer_lease_cli_keeps_lease_commands_outside_mcp_surface():
+    from agent_crossbar.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "writer-lease",
+            "acquire",
+            "--state-dir",
+            "/tmp/state",
+            "--cwd",
+            "/tmp/workspace",
+            "--owner-id",
+            "controller",
+            "--owner-kind",
+            "local",
+        ]
+    )
+    assert args.command == "writer-lease"
+    assert args.writer_lease_command == "acquire"
+    assert args.owner_kind == "local"
+
+
 def _run_wait_job(
     state_root,
     job_id: str,

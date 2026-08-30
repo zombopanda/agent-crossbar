@@ -663,8 +663,44 @@ class JobStore:
             result_path.chmod(_FILE_MODE)
             meta["status"] = "succeeded" if ok else "failed"
             self._write_job_meta(job.path, meta)
-        job.events.write(level="info", type="result", message=summary, data=result_data)
+        try:
+            job.events.write(level="info", type="result", message=summary, data=result_data)
+        finally:
+            self._release_writer_lease(job_id, meta)
         return {"ok": True, "job_id": job_id}
+
+    def _release_writer_lease(self, job_id: str, meta: dict[str, Any] | None = None) -> bool:
+        """Release a dev writer lease after publishing a terminal job state."""
+        metadata = meta
+        if metadata is None:
+            job = self.get_job(job_id)
+            metadata = self._read_job_meta(job.path) if job is not None else {}
+        token = metadata.get("writer_lease_token")
+        if not isinstance(token, str) or not token:
+            return False
+        from agent_crossbar.writer_lease import WriterLeaseStore
+
+        try:
+            return WriterLeaseStore(self.state_root).release(token)
+        except OSError:
+            # The terminal result is authoritative even if cleanup is
+            # temporarily unavailable; the next acquire reconciles it.
+            return False
+
+    def heartbeat_writer_lease(self, job_id: str) -> bool:
+        """Refresh a running dev lease so long jobs are not mistaken for stale ones."""
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        token = self._read_job_meta(job.path).get("writer_lease_token")
+        if not isinstance(token, str) or not token:
+            return False
+        from agent_crossbar.writer_lease import WriterLeaseStore
+
+        try:
+            return WriterLeaseStore(self.state_root).heartbeat(token)
+        except OSError:
+            return False
 
     def set_stopped_result(
         self,
@@ -698,7 +734,10 @@ class JobStore:
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(result_data, separators=(",", ":")) + "\n")
         result_path.chmod(_FILE_MODE)
-        job.events.write(level="info", type="result", message=summary, data=result_data)
+        try:
+            job.events.write(level="info", type="result", message=summary, data=result_data)
+        finally:
+            self._release_writer_lease(job_id, meta)
         return {"ok": True, "job_id": job_id}
 
     def _finalize_completed_tmux_job(self, job: Job) -> None:
@@ -1061,12 +1100,15 @@ class JobStore:
         if handle_data is not None:
             data["run_handle_stop"] = handle_data
 
-        job.events.write(
-            level="info",
-            type="stopped",
-            message=f"Job stopped: {reason}",
-            data=data,
-        )
+        try:
+            job.events.write(
+                level="info",
+                type="stopped",
+                message=f"Job stopped: {reason}",
+                data=data,
+            )
+        finally:
+            self._release_writer_lease(job_id, meta)
         return {"ok": True, "job_id": job_id}
 
     def list_jobs(self, client_session_id: str | None = None) -> list[dict[str, Any]]:

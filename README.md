@@ -236,6 +236,23 @@ observed deadline, `3` terminal failure/cancellation, and `4` missing or
 inaccessible job. Do not infer a stall from a quiet `job_tail`, no workspace
 diff, or absent output.
 
+Development jobs are serialized by a durable per-canonical-cwd writer lease.
+`agent_start(task="dev")` acquires it before provider launch and releases it
+only after a terminal result (or stop). Controller-local fallback must use the
+same configured state through the quota-aware wrapper, which avoids guessing
+the Agents MCP state root:
+
+```bash
+python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+  acquire --cwd "<cwd>" --owner-id "<controller-id>" --owner-kind local
+# hold the returned token for the full edit/test window, then:
+python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+  release --token "<token>"
+```
+
+The MCP surface remains exactly eight tools; writer-lease commands are an
+internal CLI/controller path, not MCP tools.
+
 The credential-free `scripts/acp_quiet_live_harness.py` is a lifecycle
 regression harness, not a provider E2E. Maintainers can run the real provider
 surface gate separately:
@@ -289,6 +306,7 @@ provider-credential-free CI.
 | `missing_model` | `agent_start` omitted or passed an empty `model` | Call `profiles_list`, choose a model, and pass it explicitly |
 | `provider_limit_exhausted` | Provider quota, credits, or rate limit is exhausted | Wait for reset or choose another explicitly available model |
 | `provider_unavailable` | No backend is currently available for the selected model | Choose another model or retry after the provider recovers |
+| `writer_busy` | Another external or controller-local dev writer holds the canonical-cwd lease | Wait for its terminal result/release, or retry after stale reconciliation; do not edit concurrently |
 | `acp_launch_error` | ACP agent process failed to launch (binary missing, dependency error) | Check provider CLI installation, run `agent-crossbar doctor` |
 | `acp_protocol_error` | ACP protocol handshake or message error (version mismatch, invalid request) | Check provider and protocol logs; provider CLI may need upgrade |
 | `acp_timeout` | ACP job exceeded `max_runtime_sec` while awaiting an already-delivered prompt's response | Follow `failure.next_action`: normally increase `max_runtime_sec`; for OpenCode, `check_provider_limits_or_retry_with_free_model` |

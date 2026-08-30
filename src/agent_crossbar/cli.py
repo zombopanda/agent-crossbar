@@ -152,6 +152,43 @@ def wait_job_cmd(
     return WAIT_JOB_TERMINAL_FAILURE
 
 
+def writer_lease_cmd(
+    command: str,
+    *,
+    cwd: str | None = None,
+    owner_id: str | None = None,
+    owner_kind: str = "local",
+    token: str | None = None,
+    state_dir: str | None = None,
+) -> int:
+    """Manage the internal durable dev-writer lease used by controllers."""
+    from agent_crossbar.jobs import default_state_root
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    store = WriterLeaseStore(state_dir or default_state_root())
+    if command == "acquire":
+        if not cwd or not owner_id:
+            print(json.dumps({"ok": False, "error": "cwd_and_owner_required"}))
+            return 1
+        result = store.acquire(cwd, owner_id=owner_id, owner_kind=owner_kind)
+        print(json.dumps(result.to_dict()))
+        return 0 if result.ok else 1
+    if command == "release":
+        released = store.release(token or "")
+        print(json.dumps({"ok": released, "released": released}))
+        return 0 if released else 1
+    if command == "heartbeat":
+        refreshed = store.heartbeat(token or "")
+        print(json.dumps({"ok": refreshed, "refreshed": refreshed}))
+        return 0 if refreshed else 1
+    if command == "reconcile":
+        removed = store.reconcile()
+        print(json.dumps({"ok": True, "removed": removed}))
+        return 0
+    print(json.dumps({"ok": False, "error": "invalid_writer_lease_command"}))
+    return 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the lightweight CLI parser without importing the MCP server."""
     parser = argparse.ArgumentParser(
@@ -193,6 +230,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Seconds between result polls.",
     )
+    writer_lease = subcommands.add_parser(
+        "writer-lease",
+        help="Acquire, release, or reconcile the internal dev-writer lease.",
+    )
+    writer_lease.add_argument(
+        "writer_lease_command",
+        choices=("acquire", "release", "heartbeat", "reconcile"),
+    )
+    writer_lease.add_argument("--state-dir", metavar="PATH")
+    writer_lease.add_argument("--cwd", metavar="PATH")
+    writer_lease.add_argument("--owner-id", metavar="ID")
+    writer_lease.add_argument("--owner-kind", default="local", metavar="KIND")
+    writer_lease.add_argument("--token", metavar="TOKEN")
     return parser
 
 
@@ -206,6 +256,17 @@ def main() -> None:
     if args.command == "wait-job":
         raise SystemExit(
             wait_job_cmd(args.job_id, args.timeout_sec, args.poll_interval_sec, args.state_dir)
+        )
+    if args.command == "writer-lease":
+        raise SystemExit(
+            writer_lease_cmd(
+                args.writer_lease_command,
+                cwd=args.cwd,
+                owner_id=args.owner_id,
+                owner_kind=args.owner_kind,
+                token=args.token,
+                state_dir=args.state_dir,
+            )
         )
 
     from agent_crossbar.server import main as server_main

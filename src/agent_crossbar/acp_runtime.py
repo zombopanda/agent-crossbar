@@ -179,6 +179,7 @@ async def run_acp_job(
         def _record_acp_execution_heartbeat(data: dict[str, Any]) -> None:
             # This is deliberately transport/liveness evidence only.  ACP
             # does not expose a provider-native working state here.
+            store.heartbeat_writer_lease(job_id)
             store.send_event(
                 job_id,
                 level="info",
