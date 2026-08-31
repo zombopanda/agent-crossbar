@@ -1,5 +1,6 @@
 import json
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import agent_crossbar.jobs as jobs_module
@@ -1178,3 +1179,203 @@ def test_cross_session_note_absent_when_job_not_found_at_all(tmp_path):
     tail = store.job_tail("99999999-nonexistent", client_session_id="any-session")
     assert tail["error"] == "job_not_found"
     assert "cross_session_note" not in tail
+
+
+# ── deadline reaper ─────────────────────────────────────────────────────────
+#
+# A job that is still nonterminal after its declared runtime deadline plus the
+# bounded grace window is an orphan: its worker is gone (crashed, interrupted,
+# or the owning process exited). The reaper terminalizes it exactly once and
+# releases any dev writer lease, without ever touching a live job before its
+# declared deadline.
+
+_DEADLINE_GRACE = jobs_module.DEADLINE_REAP_GRACE_SEC
+
+
+def _expired_job(store: JobStore, tmp_path, **extra):
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(tmp_path))
+    base = {
+        "started_at": "2000-01-01T00:00:00+00:00",
+        "max_runtime_sec": 1,
+        "backend": "acp",
+    }
+    base.update(extra)
+    store.update_job_meta(job.job_id, base)
+    return store, job
+
+
+def _read_events(store: JobStore, job_id: str) -> list[dict]:
+    events_path = store.get_job(job_id).path / "events.jsonl"
+    return [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+
+
+def test_reaper_terminalizes_expired_orphan_exactly_once(tmp_path):
+    store, job = _expired_job(JobStore(tmp_path), tmp_path)
+
+    assert store._reap_deadline_expired_job(job) is True
+    assert store.job_status(job.job_id) == "failed"
+    result = store.get_result(job.job_id)
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["stop_reason"] == "max_runtime_exceeded"
+    assert result["failure"]["code"] == "max_runtime_exceeded"
+    assert result["failure"]["stage"] == "execution"
+    assert result["failure"]["retryable"] is True
+
+    result_events = [e for e in _read_events(store, job.job_id) if e["type"] == "result"]
+    assert len(result_events) == 1
+    assert (job.path / "result.json").is_file()
+
+    # Reaping again is a no-op: exactly one durable terminal result.
+    assert store._reap_deadline_expired_job(job) is False
+    assert store.job_status(job.job_id) == "failed"
+    assert len([e for e in _read_events(store, job.job_id) if e["type"] == "result"]) == 1
+
+
+def test_concurrent_reapers_emit_one_terminal_result_and_reap_marker(tmp_path, monkeypatch):
+    """Two sweepers racing an expired job must produce one result and marker."""
+    store, job = _expired_job(JobStore(tmp_path), tmp_path)
+    barrier = threading.Barrier(2)
+    original = store.set_result
+
+    def synchronized_set_result(*args, **kwargs):
+        barrier.wait(timeout=2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "set_result", synchronized_set_result)
+    outcomes: list[bool] = []
+    errors: list[BaseException] = []
+
+    def reap() -> None:
+        try:
+            outcomes.append(store._reap_deadline_expired_job(job))
+        except BaseException as exc:  # pragma: no cover - assertion context
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reap) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert not errors
+    assert sorted(outcomes) == [False, True]
+    events = _read_events(store, job.job_id)
+    assert len([event for event in events if event["type"] == "result"]) == 1
+    assert len([event for event in events if event["type"] == "deadline_reaped"]) == 1
+
+
+def test_reaper_never_reaps_live_job_before_declared_deadline(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(tmp_path))
+    store.update_job_meta(
+        job.job_id,
+        {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "max_runtime_sec": 3600,
+            "backend": "acp",
+        },
+    )
+
+    assert store._reap_deadline_expired_job(job) is False
+    assert store.job_status(job.job_id) == "running"
+    assert not (job.path / "result.json").exists()
+
+
+def test_reaper_skips_job_without_declared_deadline(tmp_path):
+    store = JobStore(tmp_path)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(tmp_path))
+
+    # No runtime bound or start recorded → cannot prove expiry, never reap.
+    assert store._reap_deadline_expired_job(job) is False
+
+    store.update_job_meta(
+        job.job_id, {"started_at": "2000-01-01T00:00:00+00:00", "max_runtime_sec": 0}
+    )
+    assert store._reap_deadline_expired_job(job) is False
+    assert store.job_status(job.job_id) == "running"
+
+
+def test_reaper_skips_awaiting_input_and_terminal_jobs(tmp_path):
+    store = JobStore(tmp_path)
+    awaiting = store.create_job("reasonix", "dev", transport="print", cwd=str(tmp_path))
+    store.update_job_meta(
+        awaiting.job_id,
+        {
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "max_runtime_sec": 1,
+            "status": "awaiting_input",
+        },
+    )
+    assert store._reap_deadline_expired_job(awaiting) is False
+    assert store.job_status(awaiting.job_id) == "awaiting_input"
+
+    done = store.create_job("opencode", "dev", transport="print", cwd=str(tmp_path))
+    store.update_job_meta(
+        done.job_id, {"started_at": "2000-01-01T00:00:00+00:00", "max_runtime_sec": 1}
+    )
+    store.set_result(done.job_id, ok=True, summary="done")
+    assert store._reap_deadline_expired_job(store.get_job(done.job_id)) is False
+    assert store.job_status(done.job_id) == "succeeded"
+
+
+def test_get_result_lazily_reaps_expired_orphan(tmp_path):
+    store, job = _expired_job(JobStore(tmp_path), tmp_path)
+
+    result = store.get_result(job.job_id)
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["failure"]["code"] == "max_runtime_exceeded"
+    assert store.job_status(job.job_id) == "failed"
+
+
+def test_job_tail_lazily_reaps_expired_orphan(tmp_path):
+    store, job = _expired_job(JobStore(tmp_path), tmp_path)
+
+    tail = store.job_tail(job.job_id, client_session_id="*")
+
+    assert tail["status"] == "failed"
+    assert store.job_status(job.job_id) == "failed"
+
+
+def test_list_jobs_lazily_reaps_expired_orphan(tmp_path):
+    store, job = _expired_job(JobStore(tmp_path), tmp_path)
+
+    listed = store.list_jobs()
+
+    assert listed[0]["status"] == "failed"
+    assert store.job_status(job.job_id) == "failed"
+
+
+def test_reap_expired_jobs_sweeps_only_matching_workspace(tmp_path):
+    store = JobStore(tmp_path)
+    ws_a = tmp_path / "a"
+    ws_b = tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    job_a = store.create_job("opencode", "dev", transport="print", cwd=str(ws_a))
+    store.update_job_meta(
+        job_a.job_id, {"started_at": "2000-01-01T00:00:00+00:00", "max_runtime_sec": 1}
+    )
+    job_b = store.create_job("opencode", "dev", transport="print", cwd=str(ws_b))
+    store.update_job_meta(
+        job_b.job_id, {"started_at": "2000-01-01T00:00:00+00:00", "max_runtime_sec": 1}
+    )
+    live = store.create_job("opencode", "dev", transport="print", cwd=str(ws_a))
+    store.update_job_meta(
+        live.job_id,
+        {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "max_runtime_sec": 3600,
+        },
+    )
+
+    assert store.reap_expired_jobs(cwd=str(ws_a)) == 1
+    assert store.job_status(job_a.job_id) == "failed"
+    assert store.job_status(job_b.job_id) == "running"
+    assert store.job_status(live.job_id) == "running"
+
+    # Global sweep finishes the remaining expired job.
+    assert store.reap_expired_jobs() == 1
+    assert store.job_status(job_b.job_id) == "failed"

@@ -967,3 +967,95 @@ class TestSafeAcpTermination:
         from agent_crossbar.acp_runtime import safe_acp_termination  # noqa: F811
 
         assert callable(safe_acp_termination)
+
+
+class TestRunAcpJobCallerInterruption:
+    """A cancelled ACP delegation must persist a durable terminal result before
+    the cancellation propagates, so caller interruption never orphans a job."""
+
+    def test_cancellation_persists_terminal_result_then_propagates(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        store.update_job_meta(job_id, {"acp_pid": 42})
+
+        async def interrupted(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch("agent_crossbar.acp_runtime.run_acp_prompt", new=interrupted),
+            patch(
+                "agent_crossbar.acp_runtime.safe_acp_termination",
+                return_value={"terminated": True, "reason": "process_already_gone", "pid": 42},
+            ) as terminate,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(
+                    run_acp_job(
+                        store,
+                        job_id,
+                        provider="opencode",
+                        prompt=SECRET,
+                        cwd=str(tmp_path),
+                        task="dev",
+                        model="glm",
+                        effort=None,
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        max_runtime_sec=12,
+                    )
+                )
+
+        terminate.assert_called_once()
+        assert terminate.call_args.args[0]["acp_pid"] == 42
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["ok"] is False
+        assert stored["stop_reason"] == "cancelled"
+        assert stored["failure"]["code"] == "acp_interrupted"
+        assert stored["failure"]["stage"] in FAILURE_STAGES
+
+        # No partial/prompt content is persisted.
+        events_text = (store.get_job(job_id).path / "events.jsonl").read_text()
+        meta_text = (store.get_job(job_id).path / "meta.json").read_text()
+        assert SECRET not in events_text
+        assert SECRET not in meta_text
+
+    def test_cancellation_of_already_stopped_job_keeps_exactly_one_result(self, tmp_path):
+        """If job_stop already terminalized the job, the cancellation handler
+        must not overwrite it — exactly one durable terminal result survives."""
+        store, job_id = _create_job_store(tmp_path)
+        store.update_job_meta(job_id, {"status": "stopped", "stop_reason": "user_cancelled"})
+        store.set_stopped_result(
+            job_id,
+            summary="Job stopped: user_cancelled",
+            envelope={
+                "status": "cancelled",
+                "stop_reason": "user_cancelled",
+                "summary": "Job stopped: user_cancelled",
+            },
+        )
+
+        async def interrupted(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        with patch("agent_crossbar.acp_runtime.run_acp_prompt", new=interrupted):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(
+                    run_acp_job(
+                        store,
+                        job_id,
+                        provider="opencode",
+                        prompt=SECRET,
+                        cwd=str(tmp_path),
+                        task="dev",
+                        model="glm",
+                        effort=None,
+                        autonomy=Autonomy.EDIT_LOCAL,
+                        max_runtime_sec=12,
+                    )
+                )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "cancelled"
+        assert stored["stop_reason"] == "user_cancelled"
+        result_events = [e for e in _read_store_events(store, job_id) if e["type"] == "result"]
+        assert len(result_events) == 1

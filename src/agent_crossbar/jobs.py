@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from agent_crossbar.envelope import build_result_envelope
 from agent_crossbar.run_handles import run_handles
 from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete,
@@ -28,6 +29,12 @@ _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
 _EVENT_PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _EVENT_PROCESS_LOCKS_GUARD = threading.Lock()
+
+# A job is only reaped once its declared runtime deadline plus this bounded
+# grace window has elapsed. A live worker publishes its own terminal result at
+# the declared deadline, so a job still nonterminal past the grace window
+# proves its worker is gone — reaping it never races a healthy execution.
+DEADLINE_REAP_GRACE_SEC = 15.0
 
 
 def _event_process_lock(path: Path) -> threading.RLock:
@@ -547,6 +554,7 @@ class JobStore:
 
         meta = self._read_job_meta(job.path)
         if meta.get("status", "running") == "running":
+            self._reap_deadline_expired_job(job)
             self._finalize_completed_tmux_job(job)
 
         events, last_seq = job.events.read_since_with_cursor(since_seq)
@@ -829,6 +837,180 @@ class JobStore:
         )
         self.set_result(job.job_id, ok=ok, summary=summary, artifacts=artifacts)
 
+    def _reap_deadline_expired_job(self, job: Job) -> bool:
+        """Terminalize an orphaned nonterminal job whose runtime deadline elapsed.
+
+        A job is an orphan when it is still ``running`` after
+        ``max_runtime_sec`` plus :data:`DEADLINE_REAP_GRACE_SEC` has elapsed
+        since its recorded start.  Live workers publish their own terminal
+        result at the declared deadline (``agent_runner``/``acp_runtime``
+        timeout paths), so a job that is still nonterminal past the grace
+        window proves its worker is gone (interrupted, crashed, or the owning
+        process exited).  Reaping is guarded by ``set_result`` so exactly one
+        durable terminal result is ever persisted, even when a late worker or
+        a second store instance races the same job.
+
+        ``awaiting_input`` jobs are never reaped: an interactive conversation
+        is user-paced, and the explicit ``job_stop``/``terminalize`` paths
+        exist for it.  Terminal jobs are already settled.
+
+        Returns True only when this call persisted the terminal result.
+        """
+        meta = self._read_job_meta(job.path)
+        if meta.get("status", "running") not in ("running", None, ""):
+            return False
+        if not self._deadline_expired(meta):
+            return False
+        try:
+            max_runtime = float(meta["max_runtime_sec"])
+        except (TypeError, ValueError):
+            return False
+
+        summary = f"max_runtime_sec ({max_runtime:g}s) exceeded and job was orphaned"
+        finished_at = datetime.now(timezone.utc).isoformat()
+        started_at = meta.get("started_at") or meta.get("created")
+        created_at = meta.get("created") or started_at or finished_at
+
+        envelope = build_result_envelope(
+            status="failed",
+            stop_reason="max_runtime_exceeded",
+            output=summary,
+            summary=summary,
+            created_at=created_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            requested={
+                "profile": meta.get("profile"),
+                "model": meta.get("model"),
+                "effort": meta.get("effort"),
+                "task": meta.get("task"),
+                "interactive": meta.get("interactive", False),
+                "cwd": meta.get("cwd"),
+            },
+            resolved={
+                "profile": meta.get("profile"),
+                "model": meta.get("model"),
+                "effort": meta.get("effort"),
+                "task": meta.get("task"),
+                "interactive": meta.get("interactive", False),
+                "backend": meta.get("backend"),
+                "cwd": meta.get("cwd"),
+            },
+            failure={
+                "stage": "execution",
+                "code": "max_runtime_exceeded",
+                "retryable": True,
+                "next_action": "retry_with_higher_timeout",
+                "diagnostics": {
+                    "layer": "timeout",
+                    "max_runtime_sec": max_runtime,
+                    "grace_sec": DEADLINE_REAP_GRACE_SEC,
+                },
+            },
+            technical={
+                "lifecycle_events": self._lifecycle_event_count(job),
+                "native_session_id": meta.get("native_session_id"),
+                "native_full_session_id": meta.get("native_full_session_id"),
+            },
+        )
+
+        # Stop a provider child before publishing the terminal result.  This
+        # keeps a replacement writer from being admitted while an orphaned
+        # ACP subprocess is still running.  The result write below remains
+        # the single race-safe terminal claim: if a late worker or another
+        # reaper won first, set_result returns job_already_terminal and no
+        # second reap event is emitted.
+        termination: dict[str, Any] | None = None
+        if meta.get("backend") == "acp":
+            from agent_crossbar.acp_runtime import safe_acp_termination
+
+            try:
+                termination = safe_acp_termination(meta)
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                # Provider cleanup is best effort; it must never prevent the
+                # durable timeout result from being published.
+                termination = {
+                    "terminated": False,
+                    "reason": "termination_error",
+                    "error": type(exc).__name__,
+                    "pid": meta.get("acp_pid"),
+                }
+            envelope["technical"]["acp_stop"] = termination
+
+        result = self.set_result(job.job_id, ok=False, summary=summary, envelope=envelope)
+        if not result.get("ok", False):
+            return False
+
+        # Publish the reaping marker only after the terminal claim succeeds,
+        # so concurrent sweepers cannot leave duplicate reap evidence behind.
+        self.send_event(
+            job.job_id,
+            level="error",
+            type="deadline_reaped",
+            message=summary,
+            data={
+                "max_runtime_sec": max_runtime,
+                "grace_sec": DEADLINE_REAP_GRACE_SEC,
+                **({"acp_stop": termination} if termination is not None else {}),
+            },
+        )
+        return True
+
+    @staticmethod
+    def _deadline_expired(meta: dict[str, Any]) -> bool:
+        """True when *meta* records a positive runtime bound past its deadline + grace."""
+        max_runtime_raw = meta.get("max_runtime_sec")
+        started_raw = meta.get("started_at") or meta.get("created")
+        try:
+            max_runtime = float(max_runtime_raw)
+            if max_runtime <= 0:
+                return False
+            started_ts = datetime.fromisoformat(str(started_raw)).timestamp()
+        except (TypeError, ValueError):
+            return False
+        deadline = started_ts + max_runtime + DEADLINE_REAP_GRACE_SEC
+        return datetime.now(timezone.utc).timestamp() >= deadline
+
+    @staticmethod
+    def _lifecycle_event_count(job: Job) -> int:
+        """Return the job's highest event sequence number; 0 on any error."""
+        try:
+            return int(job.events.last_seq)
+        except Exception:
+            return 0
+
+    def reap_expired_jobs(self, cwd: str | Path | None = None) -> int:
+        """Reap deadline-expired orphaned jobs and return how many were terminalized.
+
+        When *cwd* is given, only jobs created for that canonical workspace are
+        considered.  Controllers use this before acquiring a dev writer lease so
+        a dead predecessor never blocks a replacement writer past its declared
+        deadline.
+        """
+        target: str | None = None
+        if cwd is not None:
+            from agent_crossbar.writer_lease import canonical_cwd as _canonical_cwd
+
+            target = _canonical_cwd(cwd)
+        jobs_dir = self.state_root / "jobs"
+        if not jobs_dir.is_dir():
+            return 0
+        reaped = 0
+        for entry in sorted(jobs_dir.iterdir()):
+            if not entry.is_dir() or not _JOB_ID_RE.match(entry.name):
+                continue
+            meta = self._read_job_meta(entry)
+            if meta.get("status", "running") not in ("running", None, ""):
+                continue
+            if target is not None:
+                raw_cwd = meta.get("cwd")
+                if raw_cwd is None or _canonical_cwd(str(raw_cwd)) != target:
+                    continue
+            job = self.get_job(entry.name)
+            if job is not None and self._reap_deadline_expired_job(job):
+                reaped += 1
+        return reaped
+
     def get_result(self, job_id: str, client_session_id: str | None = None) -> dict[str, Any]:
         """Read the final result for a job (public API)."""
         job, cross_session_note = self._get_owned_job(job_id, client_session_id)
@@ -877,6 +1059,7 @@ class JobStore:
                 "warnings": [],
             }
         if not result_path.exists():
+            self._reap_deadline_expired_job(job)
             self._finalize_completed_tmux_job(job)
             meta = self._read_job_meta(job.path)  # re-read after lazy finalize
         if not result_path.exists():
@@ -1139,6 +1322,7 @@ class JobStore:
             if meta.get("status", "running") == "running":
                 job = self.get_job(job_id)
                 if job is not None:
+                    self._reap_deadline_expired_job(job)
                     self._finalize_completed_tmux_job(job)
                     meta = self._read_job_meta(entry)
             item = {

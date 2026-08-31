@@ -404,3 +404,122 @@ def test_agent_start_dev_releases_lease_after_terminal_provider_result(tmp_path:
     )
     assert result["ok"] is True
     assert WriterLeaseStore(state).acquire(str(workspace), owner_id="next").ok is True
+
+
+def test_reaper_releases_external_lease_unblocking_fallback(tmp_path: Path):
+    """A deadline-expired orphaned dev job's lease must be released when the
+    reaper terminalizes it, so a replacement writer is admitted only after the
+    preceding job reached its terminal result."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    lease = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert lease.ok and lease.token
+
+    from agent_crossbar.jobs import JobStore
+
+    store = JobStore(state)
+    orphan = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(lease.token, job_id=orphan.job_id)
+    store.update_job_meta(
+        orphan.job_id,
+        {
+            "writer_lease_token": lease.token,
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "max_runtime_sec": 1,
+        },
+    )
+
+    # Nonterminal predecessor blocks the replacement writer.
+    assert leases.acquire(str(workspace), owner_id="blocked").error == "writer_busy"
+
+    # Reaping the orphaned predecessor unblocks the fallback.
+    assert store.reap_expired_jobs(cwd=str(workspace)) == 1
+    assert store.job_status(orphan.job_id) == "failed"
+    assert leases.acquire(str(workspace), owner_id="fallback").ok is True
+
+
+def test_reaper_keeps_lease_while_live_predecessor_is_nonterminal(tmp_path: Path):
+    """A live dev job within its declared deadline must keep its lease — the
+    fallback stays blocked until the preceding job is terminal."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    lease = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert lease.ok and lease.token
+
+    from agent_crossbar.jobs import JobStore
+
+    store = JobStore(state)
+    live = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(lease.token, job_id=live.job_id)
+    store.update_job_meta(
+        live.job_id,
+        {
+            "writer_lease_token": lease.token,
+            "started_at": "2099-01-01T00:00:00+00:00",
+            "max_runtime_sec": 3600,
+        },
+    )
+
+    assert store.reap_expired_jobs(cwd=str(workspace)) == 0
+    assert store.job_status(live.job_id) == "running"
+    assert leases.acquire(str(workspace), owner_id="blocked").error == "writer_busy"
+
+
+def test_agent_start_dev_reaps_expired_orphan_then_admits_fallback(tmp_path: Path, monkeypatch):
+    """agent_start(task='dev') admission reaps a deadline-expired orphaned
+    predecessor for the same workspace before acquiring the writer lease, so a
+    replacement job is admitted without breaking the writer-busy gate for a
+    genuinely live predecessor."""
+    from agent_crossbar import server
+    from agent_crossbar.jobs import JobStore
+    from agent_crossbar.readiness import ReadinessResult
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(state))
+    monkeypatch.setattr(
+        "agent_crossbar.readiness.probe_profile",
+        lambda *args, **kwargs: ReadinessResult(
+            profile="reasonix",
+            state="ready",
+            support_tier="experimental",
+            authenticated=True,
+        ),
+    )
+
+    leases = WriterLeaseStore(state)
+    lease = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert lease.ok and lease.token
+    store = JobStore(state)
+    orphan = store.create_job("reasonix", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(lease.token, job_id=orphan.job_id)
+    store.update_job_meta(
+        orphan.job_id,
+        {
+            "writer_lease_token": lease.token,
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "max_runtime_sec": 1,
+        },
+    )
+
+    launched = []
+    monkeypatch.setattr(
+        server,
+        "start_print_job",
+        lambda *args, **kwargs: launched.append(True),
+    )
+    result = server.agent_start(
+        profile="reasonix",
+        prompt="fallback work",
+        model="deepseek-v4-flash",
+        task="dev",
+        cwd=str(workspace),
+    )
+    assert result["ok"] is True, f"fallback admission failed: {result}"
+    assert launched == [True]
+    assert store.job_status(orphan.job_id) == "failed"

@@ -1,5 +1,6 @@
 """ACP runtime: direct official-SDK integration via acp_client."""
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -322,6 +323,50 @@ async def run_acp_job(
             diagnostics={"error": safe},
         )
         return
+    except asyncio.CancelledError:
+        # Caller interruption (server shutdown, request cancellation) must not
+        # leave a durable job orphaned. Persist a terminal failure before the
+        # cancellation propagates; set_result is guarded so a concurrent stop or
+        # a late provider completion still yields exactly one terminal result.
+        # ``run_acp_prompt`` records its child PID through the callback after
+        # this function's initial metadata snapshot, so refresh before trying
+        # to clean up an interrupted provider process.
+        current_meta = meta
+        current_job = store.get_job(job_id)
+        if current_job is not None:
+            current_meta = store._read_job_meta(current_job.path)
+        try:
+            termination = safe_acp_termination(current_meta)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            # Persist the interruption even if child cleanup itself fails.
+            termination = {
+                "terminated": False,
+                "reason": "termination_error",
+                "error": type(exc).__name__,
+                "pid": current_meta.get("acp_pid"),
+            }
+        _fail(
+            store=store,
+            job_id=job_id,
+            safe_output=(
+                "Job was interrupted before the provider produced a result. "
+                "No partial result is claimed."
+            ),
+            stop_reason="cancelled",
+            stage="execution",
+            code="acp_interrupted",
+            retryable=True,
+            next_action="retry",
+            meta=meta,
+            started_at=started_at,
+            provider=provider,
+            model=model,
+            effort=effort,
+            task=task,
+            cwd=cwd,
+            diagnostics={"interrupted": True, "acp_stop": termination},
+        )
+        raise
     except Exception as exc:
         safe = _safe_error(exc, prompt)
         _fail(

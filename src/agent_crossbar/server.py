@@ -836,7 +836,7 @@ def agent_start(
                     "interactive": interactive,
                     "cwd": effective_cwd,
                     "adapter_name": adapter.name,
-                    "max_runtime_sec": max_runtime_sec,
+                    "max_runtime_sec": timeout_sec,
                 },
             )
             job.events.write(
@@ -948,6 +948,10 @@ def agent_start(
         if not prevalidated["ok"]:
             return prevalidated
         effective_cwd = req.get("cwd") or os.getcwd()
+        # A deadline-expired orphaned predecessor must not block a replacement
+        # dev writer past its declared runtime. Reap before acquiring the lease
+        # so the admission is decided against the durable terminal state.
+        _job_store().reap_expired_jobs(cwd=effective_cwd)
         writer_lease_store = WriterLeaseStore(_state_root())
         pending = writer_lease_store.acquire(
             effective_cwd,
