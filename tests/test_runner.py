@@ -1268,7 +1268,8 @@ def test_tmux_monitor_preserves_stopped_status(tmp_path):
     assert result["error"] == "job_stopped"
     assert store.job_tail(job.job_id)["status"] == "stopped"
     stopped_result = store.get_result(job.job_id)
-    assert stopped_result["ok"] is True
+    assert stopped_result["ok"] is False
+    assert stopped_result["error"] == "result_not_ready"
     assert stopped_result["status"] == "stopped"
     assert "stop_reason" in stopped_result
 

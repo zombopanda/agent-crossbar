@@ -16,6 +16,7 @@ from acp.schema import (
     SessionConfigSelectGroup,
     SessionConfigSelectOption,
     TextContentBlock,
+    ToolCallLocation,
     ToolCallUpdate,
 )
 
@@ -38,8 +39,14 @@ def _opt(option_id, kind):
     return PermissionOption(option_id=option_id, name=option_id, kind=kind)
 
 
-def _call(kind, title=None):
-    return ToolCallUpdate(tool_call_id="tc-1", kind=kind, title=title)
+def _call(kind, title=None, locations=None, raw_input=None):
+    return ToolCallUpdate(
+        tool_call_id="tc-1",
+        kind=kind,
+        title=title,
+        locations=locations,
+        raw_input=raw_input,
+    )
 
 
 def _assert_selected(response, id):
@@ -211,12 +218,30 @@ def test_permission_reject_non_edit(autonomy, kind):
     _assert_selected(resp, "reject")
 
 
-# B. EDIT_LOCAL: non-edit kinds → reject
+# B. EDIT_LOCAL: permit the local work a coding agent needs.
 @pytest.mark.parametrize(
     "kind",
-    ["read", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other", None],
+    ["read", "delete", "move", "search", "execute", "think", "edit"],
 )
-def test_edit_local_non_edit_kinds_reject(kind):
+def test_edit_local_permits_local_coding_kinds(kind):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
+    locations = [ToolCallLocation(path="/tmp/file")] if kind != "execute" else None
+    raw_input = {"cwd": "/tmp", "command": "pwd"} if kind == "execute" else None
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call(kind, locations=locations, raw_input=raw_input),
+            [
+                _opt("allow", "allow_once"),
+                _opt("reject", "reject_once"),
+            ],
+        )
+    )
+    _assert_selected(resp, "allow")
+
+
+@pytest.mark.parametrize("kind", ["switch_mode", "other", None])
+def test_edit_local_rejects_unknown_or_session_control_kinds(kind):
     client = _OneShotClient(Autonomy.EDIT_LOCAL)
     resp = _run(
         client.request_permission(
@@ -232,11 +257,11 @@ def test_edit_local_non_edit_kinds_reject(kind):
 
 
 def test_edit_local_edit_allows():
-    client = _OneShotClient(Autonomy.EDIT_LOCAL)
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
     resp = _run(
         client.request_permission(
             "s",
-            _call("edit"),
+            _call("edit", locations=[ToolCallLocation(path="/tmp/file")]),
             [
                 _opt("allow", "allow_once"),
                 _opt("reject", "reject_once"),
@@ -261,31 +286,212 @@ def test_edit_local_edit_allow_always_and_reject():
     _assert_selected(resp, "reject")
 
 
-def test_edit_local_deny_no_reject_option():
-    client = _OneShotClient(Autonomy.EDIT_LOCAL)
+def test_edit_local_allows_coding_kind_without_reject_option():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
     resp = _run(
         client.request_permission(
             "s",
-            _call("read"),
+            _call("read", locations=[ToolCallLocation(path="/tmp/file")]),
             [
                 _opt("allow", "allow_once"),
                 _opt("always", "allow_always"),
             ],
         )
     )
-    _assert_cancelled(resp)
+    _assert_selected(resp, "allow")
 
 
-def test_edit_local_read_titled_edit_file():
-    client = _OneShotClient(Autonomy.EDIT_LOCAL)
+def test_edit_local_allows_read_regardless_of_title():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
     resp = _run(
         client.request_permission(
             "s",
-            _call("read", title="Edit file"),
+            _call(
+                "read",
+                title="Edit file",
+                locations=[ToolCallLocation(path="/tmp/file")],
+            ),
             [
                 _opt("allow", "allow_once"),
                 _opt("reject", "reject_once"),
             ],
+        )
+    )
+    _assert_selected(resp, "allow")
+
+
+def test_edit_local_rejects_fetch_even_with_local_target():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("fetch", locations=[ToolCallLocation(path="/tmp/file")]),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+@pytest.mark.parametrize("kind", ["read", "edit", "delete", "move", "search"])
+def test_edit_local_rejects_filesystem_targets_outside_job_cwd(kind):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call(kind, locations=[ToolCallLocation(path="/tmp/other/file")]),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_unprovable_filesystem_target():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("delete"),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_execute_with_external_cwd():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call(
+                "execute",
+                raw_input={"cwd": "/tmp/other", "command": "pytest"},
+            ),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_execute_with_external_absolute_target():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"command": "rm -f /tmp/other/file"}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_execute_with_relative_traversal_target():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"command": "rm -rf ../other"}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_remote_execute_command():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"cwd": "/tmp/job", "command": "curl https://example.com"}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+@pytest.mark.parametrize("raw_input", [None, "curl https://example.com"])
+def test_edit_local_rejects_unstructured_execute_payload(raw_input):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input=raw_input),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git config --global user.name attacker",
+        "git submodule update --init",
+        "find . -exec python3 -c 'print(1)' {} +",
+    ],
+)
+def test_edit_local_rejects_unbounded_execute_commands(command):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"cwd": "/tmp/job", "command": command}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_allows_bounded_execute_in_job_cwd():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"cwd": "/tmp/job", "command": "pwd"}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "allow")
+
+
+@pytest.mark.parametrize("command", ["ls", "ls -la .", "ls --color=never /tmp/job"])
+def test_edit_local_allows_only_bounded_ls_commands(command):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"cwd": "/tmp/job", "command": command}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "allow")
+
+
+@pytest.mark.parametrize("command", ["ls -R .", "ls ../other", "ls -e .", "ls; pwd"])
+def test_edit_local_rejects_unsafe_ls_commands(command):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"cwd": "/tmp/job", "command": command}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
+
+
+def test_edit_local_rejects_interpreter_execute_even_with_bounded_target():
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp/job")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call(
+                "execute",
+                raw_input={
+                    "cwd": "/tmp/job",
+                    "command": "/usr/bin/python -m pytest tests/test_app.py",
+                },
+            ),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
         )
     )
     _assert_selected(resp, "reject")

@@ -449,7 +449,117 @@ def test_stop_marks_terminal_before_tmux_termination(tmp_path):
     assert store.get_result(job.job_id)["status"] == "stopped"
 
 
-def test_stop_cannot_be_overwritten_by_inflight_provider_completion(tmp_path, monkeypatch):
+def test_stopped_job_publishes_envelope_and_cannot_resurrect_awaiting_input(tmp_path):
+    """A stop wins the lifecycle race and leaves a durable terminal result."""
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="claude", operation="advice", transport="tmux")
+
+    stopped = store.stop_job(job.job_id, reason="blocking_prompt")
+
+    assert stopped["ok"] is True
+    result_path = job.path / "result.json"
+    assert result_path.exists()
+    stored = json.loads(result_path.read_text())
+    assert stored["envelope"]["status"] == "cancelled"
+    assert store.get_result(job.job_id)["status"] == "stopped"
+
+    resurrected = store.transition_job_status(
+        job.job_id,
+        "awaiting_input",
+        allowed_from={"running", "awaiting_input"},
+        updates={"waiting_for": "follow_up"},
+    )
+    assert resurrected["ok"] is False
+    assert resurrected["error"] == "job_already_terminal"
+    assert resurrected["current_status"] == "stopped"
+    assert store.job_status(job.job_id) == "stopped"
+
+
+def test_stopped_without_envelope_is_not_reported_as_completion(tmp_path):
+    """A legacy/incomplete stop remains result_not_ready until an envelope exists."""
+    store = JobStore(tmp_path)
+    job = store.create_job(profile="claude", operation="advice", transport="tmux")
+    store.update_job_meta(job.job_id, {"status": "stopped", "stop_reason": "user_cancelled"})
+
+    result = store.get_result(job.job_id)
+
+    assert result["ok"] is False
+    assert result["error"] == "result_not_ready"
+    assert result["status"] == "stopped"
+
+
+def test_stop_persists_result_and_releases_lease_when_event_log_fails(tmp_path, monkeypatch):
+    """Event telemetry failure must not erase the durable stop decision."""
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    pending = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert pending.ok and pending.token
+
+    store = JobStore(state)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(pending.token, job_id=job.job_id)
+    store.update_job_meta(job.job_id, {"writer_lease_token": pending.token})
+
+    def fail_event(*_args, **_kwargs):
+        raise OSError("events unavailable")
+
+    monkeypatch.setattr(jobs_module.EventWriter, "write", fail_event)
+
+    stopped = store.stop_job(job.job_id, reason="user_cancelled")
+
+    assert stopped["ok"] is True
+    assert stopped["warnings"]
+    assert (job.path / "result.json").exists()
+    assert store.get_result(job.job_id)["status"] == "stopped"
+    assert leases.acquire(str(workspace), owner_id="next").ok is True
+
+
+def test_acp_stop_can_persist_after_stop_event_failure_without_early_release(tmp_path, monkeypatch):
+    """The ACP two-phase stop keeps its lease until set_stopped_result succeeds."""
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    pending = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert pending.ok and pending.token
+
+    store = JobStore(state)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(pending.token, job_id=job.job_id)
+    store.update_job_meta(job.job_id, {"writer_lease_token": pending.token})
+
+    def fail_event(*_args, **_kwargs):
+        raise OSError("events unavailable")
+
+    monkeypatch.setattr(jobs_module.EventWriter, "write", fail_event)
+
+    stopped = store.stop_job(
+        job.job_id,
+        reason="user_cancelled",
+        persist_result=False,
+        release_writer_lease=False,
+    )
+    assert stopped["ok"] is True
+    assert not (job.path / "result.json").exists()
+    assert leases.acquire(str(workspace), owner_id="blocked").error == "writer_busy"
+
+    persisted = store.set_stopped_result(
+        job.job_id,
+        summary="Job stopped: user_cancelled",
+        envelope={"status": "cancelled", "stop_reason": "user_cancelled"},
+    )
+    assert persisted["ok"] is True
+    assert persisted["warnings"]
+    assert leases.acquire(str(workspace), owner_id="next").ok is True
+
+
+def test_stop_cannot_overwrite_already_published_provider_completion(tmp_path, monkeypatch):
     producer = JobStore(tmp_path)
     stopper = JobStore(tmp_path)
     job = producer.create_job(profile="reasonix", operation="dev", transport="tmux")
@@ -467,7 +577,13 @@ def test_stop_cannot_be_overwritten_by_inflight_provider_completion(tmp_path, mo
     producer_thread = threading.Thread(
         target=lambda: producer.set_result(job.job_id, ok=True, summary="late success")
     )
-    stop_thread = threading.Thread(target=lambda: (stopper.stop_job(job.job_id), stopped.set()))
+    stop_result: dict = {}
+
+    def stop():
+        stop_result.update(stopper.stop_job(job.job_id))
+        stopped.set()
+
+    stop_thread = threading.Thread(target=stop)
 
     producer_thread.start()
     assert ready.wait(timeout=2)
@@ -478,7 +594,8 @@ def test_stop_cannot_be_overwritten_by_inflight_provider_completion(tmp_path, mo
     stop_thread.join(timeout=2)
 
     assert stopped.is_set()
-    assert stopper.get_result(job.job_id)["status"] == "stopped"
+    assert stop_result["error"] == "job_already_terminal"
+    assert stopper.get_result(job.job_id)["status"] == "succeeded"
 
 
 def test_tmux_metadata_update_cannot_overwrite_inflight_stop(tmp_path, monkeypatch):

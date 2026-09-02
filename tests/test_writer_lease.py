@@ -86,6 +86,7 @@ def test_terminal_job_reconciliation_releases_external_lease(tmp_path: Path):
     jobs = state / "jobs" / "123456789-job"
     jobs.mkdir(parents=True)
     (jobs / "meta.json").write_text('{"status":"succeeded","cwd":"%s"}\n' % workspace)
+    (jobs / "result.json").write_text('{"ok":true,"summary":"done"}\n')
     store = WriterLeaseStore(state)
     lease = store.acquire(str(workspace), owner_id="123456789-job", owner_kind="external_job")
     assert lease.ok is True

@@ -8,6 +8,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import Any
 from unittest import mock
@@ -993,6 +994,9 @@ class TestDeterministicRace:
         assert result["status"] == "stopped"
         assert result["ok"] is True
 
-        # Verify no result.json was written by the late set_result
+        # The explicit stop owns the durable result; the late set_result must
+        # not overwrite that envelope.
         result_path = job.path / "result.json"
-        assert not result_path.exists(), "Late set_result must not write result.json on stopped job"
+        assert result_path.exists(), "Stop must publish a durable terminal result"
+        stored = json.loads(result_path.read_text())
+        assert stored["envelope"]["status"] == "cancelled"

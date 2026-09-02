@@ -23,10 +23,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shlex
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
@@ -123,6 +125,29 @@ _UNAVAILABLE_MARKERS = (
     "provider unavailable",
     "model unavailable",
 )
+_EDIT_LOCAL_PERMISSION_KINDS = frozenset(
+    {"read", "edit", "delete", "move", "search", "execute", "think"}
+)
+_PATH_PERMISSION_KINDS = frozenset({"read", "edit", "delete", "move", "search"})
+_PATH_KEYS = frozenset(
+    {
+        "path",
+        "cwd",
+        "directory",
+        "root",
+        "file",
+        "target",
+        "source",
+        "destination",
+        "dest",
+        "from",
+        "to",
+    }
+)
+_SAFE_EXECUTABLES = frozenset({"ls", "pwd"})
+_SAFE_LS_FLAGS = frozenset({"a", "A", "l", "1"})
+_SAFE_LS_LONG_FLAGS = frozenset({"--color=never"})
+_SYSTEM_COMMAND_ROOTS = frozenset({"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin"})
 
 
 def classify_provider_failure(text: str) -> tuple[str, str] | None:
@@ -159,9 +184,12 @@ class _OneShotClient:
         self,
         autonomy: Autonomy,
         on_text_delta: Callable[[str], None] | None = None,
+        *,
+        cwd: str | None = None,
     ) -> None:
         self._autonomy = autonomy
         self._on_text_delta = on_text_delta
+        self._cwd = Path(cwd).expanduser().resolve(strict=False) if cwd else None
         self._session_id: str | None = None
         self._output_parts: list[str] = []
         self._stop_reason = "unknown"
@@ -180,9 +208,122 @@ class _OneShotClient:
         options: list[PermissionOption],
         **kwargs: Any,
     ) -> RequestPermissionResponse:
-        if self._autonomy is Autonomy.EDIT_LOCAL and getattr(tool_call, "kind", None) == "edit":
+        kind = getattr(tool_call, "kind", None)
+        # A coding agent must be able to inspect, search, execute local checks,
+        # and make the complete set of filesystem changes required by its task.
+        # Restricting EDIT_LOCAL to the literal "edit" kind leaves OpenCode
+        # unable to perform its normal read/search/execute workflow and makes
+        # healthy ACP jobs appear to make no progress.
+        if self._autonomy is Autonomy.EDIT_LOCAL and kind in _EDIT_LOCAL_PERMISSION_KINDS:
+            if kind == "execute" and not self._bounded_local_execute(tool_call):
+                return _select_reject_once(options)
+            paths = self._permission_paths(tool_call)
+            if kind in _PATH_PERMISSION_KINDS and not paths:
+                # A file operation without a target cannot be proven local.
+                return _select_reject_once(options)
+            if self._cwd is None or any(not self._path_is_within_cwd(path) for path in paths):
+                return _select_reject_once(options)
             return _select_allow_once(options)
         return _select_reject_once(options)
+
+    def _path_is_within_cwd(self, value: str) -> bool:
+        """Return whether *value* resolves beneath the canonical job cwd."""
+        if self._cwd is None or not isinstance(value, str) or not value.strip():
+            return False
+        if value.startswith(("$", "~")):
+            return False
+        try:
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = self._cwd / candidate
+            resolved = candidate.resolve(strict=False)
+            return resolved == self._cwd or self._cwd in resolved.parents
+        except (OSError, RuntimeError, TypeError):
+            return False
+
+    def _permission_paths(self, tool_call: Any) -> list[str]:
+        """Extract explicit file/cwd targets from an ACP permission payload."""
+        paths: list[str] = []
+        for location in getattr(tool_call, "locations", None) or []:
+            path = getattr(location, "path", None)
+            if isinstance(path, str):
+                paths.append(path)
+
+        def visit(value: Any, *, key: str | None = None) -> None:
+            if isinstance(value, str):
+                if key in _PATH_KEYS:
+                    paths.append(value)
+                return
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    visit(child, key=str(child_key))
+                return
+            if isinstance(value, (list, tuple)):
+                for child in value:
+                    visit(child, key=("command" if key in {"args", "arguments", "argv"} else key))
+
+        visit(getattr(tool_call, "raw_input", None))
+        for content in getattr(tool_call, "content", None) or []:
+            path = getattr(content, "path", None)
+            if isinstance(path, str):
+                paths.append(path)
+        return paths
+
+    def _bounded_local_execute(self, tool_call: Any) -> bool:
+        """Prove an execute request is a minimal, bounded local command."""
+        raw_input = getattr(tool_call, "raw_input", None)
+        if not isinstance(raw_input, dict):
+            return False
+        command = next(
+            (
+                raw_input.get(key)
+                for key in ("command", "cmd", "shell")
+                if isinstance(raw_input.get(key), str)
+            ),
+            None,
+        )
+        if not isinstance(command, str) or not command.strip():
+            return False
+        if any(marker in command for marker in (";", "&&", "||", "|", ">", "<", "`")):
+            return False
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        executable = Path(tokens[0]).name
+        if executable not in _SAFE_EXECUTABLES:
+            return False
+        if tokens[0].startswith("/") and str(Path(tokens[0]).parent) not in _SYSTEM_COMMAND_ROOTS:
+            return False
+
+        args = raw_input.get("args", raw_input.get("arguments", raw_input.get("argv")))
+        if args is not None and (
+            not isinstance(args, list) or any(not isinstance(item, str) for item in args)
+        ):
+            return False
+        command_tokens = [*tokens, *(args or [])]
+        if executable == "pwd":
+            # pwd has no target and therefore accepts no additional args.
+            if len(command_tokens) != 1:
+                return False
+        else:
+            after_command = command_tokens[1:]
+            end_of_flags = False
+            for token in after_command:
+                if token == "--":
+                    end_of_flags = True
+                    continue
+                if not end_of_flags and token in _SAFE_LS_LONG_FLAGS:
+                    continue
+                if not end_of_flags and token.startswith("-"):
+                    if not token or any(flag not in _SAFE_LS_FLAGS for flag in token[1:]):
+                        return False
+                    continue
+                if not self._path_is_within_cwd(token):
+                    return False
+        return True
 
     async def session_update(
         self,
@@ -450,7 +591,11 @@ async def run_acp_prompt(
     except ValueError:
         raise AcpProtocolError(f"Invalid autonomy: {autonomy}", stage="prompt_delivery") from None
 
-    client_impl = _OneShotClient(normalized_autonomy, on_text_delta=on_text_delta)
+    client_impl = _OneShotClient(
+        normalized_autonomy,
+        on_text_delta=on_text_delta,
+        cwd=cwd,
+    )
 
     async def _run() -> AcpResult:
         try:

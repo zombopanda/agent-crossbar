@@ -184,10 +184,18 @@ def _run_adapter_job(
             if native_state == "done" and meta.get("interactive"):
                 interactive_meta = store._read_job_meta(store.get_job(job_id).path)
                 if interactive_meta.get("status") != "awaiting_input":
-                    store.update_job_meta(
+                    transitioned = store.transition_job_status(
                         job_id,
-                        {"status": "awaiting_input", "waiting_for": "follow_up"},
+                        "awaiting_input",
+                        allowed_from={"running"},
+                        updates={"waiting_for": "follow_up"},
                     )
+                    if not transitioned.get("ok"):
+                        # A stop may have won the race while the provider
+                        # reported its turn complete.  Never resurrect the
+                        # stopped job or emit a misleading awaiting_input
+                        # event after the terminal claim.
+                        return
                     store.send_event(
                         job_id,
                         level="info",
@@ -364,10 +372,15 @@ def _run_adapter_job(
                     return
                 else:
                     # Interactive job blocked → awaiting_input
-                    meta_i = store._read_job_meta(store.get_job(job_id).path)
-                    meta_i["status"] = "awaiting_input"
-                    meta_i["waiting_for"] = status.get("waiting_for")
-                    store._write_job_meta(store.get_job(job_id).path, meta_i)
+                    transitioned = store.transition_job_status(
+                        job_id,
+                        "awaiting_input",
+                        allowed_from={"running", "awaiting_input"},
+                        updates={"waiting_for": status.get("waiting_for")},
+                    )
+                    if not transitioned.get("ok"):
+                        # A concurrent stop is terminal and must remain so.
+                        return
                     store.send_event(
                         job_id,
                         level="info",

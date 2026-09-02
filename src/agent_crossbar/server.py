@@ -1215,11 +1215,15 @@ def job_stop(
         if backend == "acp":
             # Mark stopped BEFORE termination so background completion cannot
             # resurrect the job via set_result.
-            store.stop_job(
+            stopped = store.stop_job(
                 job_id,
                 reason=reason,
                 client_session_id=_effective_client_session_id(client, client_session_id),
+                persist_result=False,
+                release_writer_lease=False,
             )
+            if not stopped.get("ok"):
+                return stopped
             from agent_crossbar.acp_runtime import safe_acp_termination
 
             meta = store._read_job_meta(job.path)  # re-read after stop_job
@@ -1258,7 +1262,9 @@ def job_stop(
                 },
                 technical={"acp_stop": acp_stop_data},
             )
-            store.set_stopped_result(job_id, summary=summary, envelope=envelope)
+            persisted = store.set_stopped_result(job_id, summary=summary, envelope=envelope)
+            if not persisted.get("ok"):
+                return persisted
             return {
                 "ok": True,
                 "job_id": job_id,

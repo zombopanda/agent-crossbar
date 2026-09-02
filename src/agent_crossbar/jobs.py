@@ -382,6 +382,41 @@ class JobStore:
             self._write_job_meta(job.path, meta)
         return {"ok": True, "job_id": job_id}
 
+    def transition_job_status(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        allowed_from: set[str] | frozenset[str],
+        updates: dict[str, Any] | None = None,
+        remove: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Atomically apply a nonterminal lifecycle transition.
+
+        Terminal statuses are never overwritten.  Workers use this helper for
+        ``running``/``awaiting_input`` transitions so a stop racing a native
+        completion cannot resurrect a job by writing metadata directly.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            current_status = meta.get("status", "running")
+            if current_status not in allowed_from:
+                return {
+                    "ok": False,
+                    "error": "job_already_terminal",
+                    "job_id": job_id,
+                    "current_status": current_status,
+                }
+            meta.update(updates or {})
+            for key in remove:
+                meta.pop(key, None)
+            meta["status"] = status
+            self._write_job_meta(job.path, meta)
+        return {"ok": True, "job_id": job_id, "status": status}
+
     def _refresh_known_ids_locked(self) -> None:
         """Load existing job IDs so new JobStore instances avoid collisions."""
         jobs_dir = self.state_root / "jobs"
@@ -671,11 +706,17 @@ class JobStore:
             result_path.chmod(_FILE_MODE)
             meta["status"] = "succeeded" if ok else "failed"
             self._write_job_meta(job.path, meta)
+        event_error: str | None = None
         try:
             job.events.write(level="info", type="result", message=summary, data=result_data)
+        except Exception as exc:  # durable result remains authoritative
+            event_error = type(exc).__name__
         finally:
             self._release_writer_lease(job_id, meta)
-        return {"ok": True, "job_id": job_id}
+        result = {"ok": True, "job_id": job_id}
+        if event_error is not None:
+            result["warnings"] = [{"code": "result_event_write_failed", "error": event_error}]
+        return result
 
     def _release_writer_lease(self, job_id: str, meta: dict[str, Any] | None = None) -> bool:
         """Release a dev writer lease after publishing a terminal job state."""
@@ -721,32 +762,72 @@ class JobStore:
         job = self.get_job(job_id)
         if job is None:
             return {"ok": False, "error": "job_not_found", "job_id": job_id}
-        meta = self._read_job_meta(job.path)
-        if meta.get("status") != "stopped":
-            return {
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            if meta.get("status") != "stopped":
+                return {
+                    "ok": False,
+                    "error": "job_not_stopped",
+                    "job_id": job_id,
+                }
+            result_path = job.path / "result.json"
+            if result_path.exists():
+                return {"ok": True, "job_id": job_id, "already_persisted": True}
+            result_data = {
                 "ok": False,
-                "error": "job_not_stopped",
-                "job_id": job_id,
+                "summary": summary,
+                "artifacts": [],
+                "envelope": envelope,
+                "ts": datetime.now(timezone.utc).isoformat(),
             }
-        result_path = job.path / "result.json"
-        if result_path.exists():
-            return {"ok": True, "job_id": job_id, "already_persisted": True}
-        result_data = {
-            "ok": False,
-            "summary": summary,
-            "artifacts": [],
-            "envelope": envelope,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        fd = os.open(str(result_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(result_data, separators=(",", ":")) + "\n")
-        result_path.chmod(_FILE_MODE)
+            fd = os.open(str(result_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(result_data, separators=(",", ":")) + "\n")
+            result_path.chmod(_FILE_MODE)
+        event_error: str | None = None
         try:
             job.events.write(level="info", type="result", message=summary, data=result_data)
+        except Exception as exc:  # durable result remains authoritative
+            event_error = type(exc).__name__
         finally:
             self._release_writer_lease(job_id, meta)
-        return {"ok": True, "job_id": job_id}
+        result = {"ok": True, "job_id": job_id}
+        if event_error is not None:
+            result["warnings"] = [{"code": "result_event_write_failed", "error": event_error}]
+        return result
+
+    @staticmethod
+    def _build_stopped_envelope(
+        meta: dict[str, Any],
+        *,
+        reason: str,
+        summary: str,
+        technical: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the durable terminal envelope for a provider-neutral stop."""
+        requested = {
+            "profile": meta.get("profile"),
+            "model": meta.get("model"),
+            "effort": meta.get("effort"),
+            "task": meta.get("task"),
+            "interactive": meta.get("interactive", False),
+            "cwd": meta.get("cwd"),
+        }
+        resolved = {
+            **requested,
+            "backend": meta.get("backend"),
+        }
+        return build_result_envelope(
+            status="cancelled",
+            stop_reason=reason,
+            output=summary,
+            summary=summary,
+            created_at=meta.get("created") or meta.get("started_at") or "",
+            started_at=meta.get("started_at"),
+            requested=requested,
+            resolved=resolved,
+            technical=technical,
+        )
 
     def _finalize_completed_tmux_job(self, job: Job) -> None:
         """Persist tmux results left behind by a short-lived MCP process."""
@@ -1031,10 +1112,18 @@ class JobStore:
             if result_path.exists():
                 result_data = json.loads(result_path.read_text())
                 envelope = result_data.get("envelope", {})
+                envelope_technical = envelope.get("technical") or {}
                 result = {
                     "ok": True,
                     "job_id": job_id,
-                    "status": envelope.get("status", "stopped"),
+                    # Provider-neutral stores expose ``stopped`` while the
+                    # ACP server exposes its adapter-level ``cancelled``
+                    # status.  Preserve both existing API shapes.
+                    "status": (
+                        "stopped"
+                        if "stop" in envelope_technical
+                        else envelope.get("status", "stopped")
+                    ),
                     "stop_reason": envelope.get(
                         "stop_reason", meta.get("stop_reason", "user_cancelled")
                     ),
@@ -1050,13 +1139,14 @@ class JobStore:
                         result[key] = envelope[key]
                 return result
             return {
-                "ok": True,
+                "ok": False,
                 "job_id": job_id,
                 "status": "stopped",
+                "error": "result_not_ready",
                 "stop_reason": meta.get("stop_reason", "user_cancelled"),
-                "summary": f"Job stopped: {meta.get('stop_reason', 'user_cancelled')}",
-                "artifacts": [],
+                "message": "Stopped job has no durable terminal result envelope",
                 "warnings": [],
+                "job_created": True,
             }
         if not result_path.exists():
             self._reap_deadline_expired_job(job)
@@ -1066,13 +1156,14 @@ class JobStore:
             # Stopped jobs return a stable "stopped" response even without result.json
             if meta.get("status") == "stopped":
                 return {
-                    "ok": True,
+                    "ok": False,
                     "job_id": job_id,
                     "status": "stopped",
+                    "error": "result_not_ready",
                     "stop_reason": meta.get("stop_reason", "user_cancelled"),
-                    "summary": f"Job stopped: {meta.get('stop_reason', 'user_cancelled')}",
-                    "artifacts": [],
+                    "message": "Stopped job has no durable terminal result envelope",
                     "warnings": [],
+                    "job_created": True,
                 }
             return {
                 "ok": False,
@@ -1086,6 +1177,10 @@ class JobStore:
 
         response: dict[str, Any] = {"ok": True, "job_id": job_id}
         response.update(result_data)
+        # Legacy/provider results may not carry an envelope.  Surface the
+        # durable metadata status so callers never infer completion from a
+        # bare ``ok``/summary response.
+        response.setdefault("status", meta.get("status"))
 
         # Surface envelope fields at top level for adapter-based jobs
         if result_data.get("envelope"):
@@ -1137,6 +1232,16 @@ class JobStore:
             self._inject_cross_session_note(result, cross_session_note)
             return result
         meta = self._read_job_meta(job.path)
+        initial_status = meta.get("status", "running")
+        if initial_status not in {"running", "awaiting_input"}:
+            return {
+                "ok": False,
+                "error": "job_already_terminal",
+                "job_id": job_id,
+                "status": initial_status,
+                "warnings": [],
+                "job_created": True,
+            }
         interactive = bool(meta.get("interactive", job.interactive))
         if not interactive:
             return {
@@ -1191,10 +1296,15 @@ class JobStore:
 
         # A successful reply starts another provider turn.  This matters for
         # adapters that previously surfaced a native `awaiting_input` state.
-        if meta.get("status") == "awaiting_input":
-            meta["status"] = "running"
-            meta.pop("waiting_for", None)
-            self._write_job_meta(job.path, meta)
+        if initial_status == "awaiting_input":
+            resumed = self.transition_job_status(
+                job_id,
+                "running",
+                allowed_from={"awaiting_input"},
+                remove=("waiting_for",),
+            )
+            if not resumed.get("ok"):
+                return resumed
 
         return {"ok": True, "job_id": job_id, "seq": seq}
 
@@ -1206,8 +1316,17 @@ class JobStore:
         reason: str = "user_cancelled",
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
         client_session_id: str | None = None,
+        *,
+        persist_result: bool = True,
+        release_writer_lease: bool = True,
     ) -> dict[str, Any]:
-        """Write a stopped event for a job."""
+        """Stop a job and publish its durable terminal result envelope.
+
+        ``persist_result=False`` and ``release_writer_lease=False`` are used
+        only by the ACP server path, which must add provider termination
+        metadata before claiming the stopped result.  Every public stop still
+        defaults to the fail-closed durable result path.
+        """
         job, cross_session_note = self._get_owned_job(job_id, client_session_id)
         if job is None:
             result = {"ok": False, "error": "job_not_found", "job_id": job_id}
@@ -1215,6 +1334,51 @@ class JobStore:
             return result
         with self._job_meta_lock(job.path):
             meta = self._read_job_meta(job.path)
+            current_status = meta.get("status", "running")
+            if current_status == "stopped":
+                # Stopping an already stopped job is idempotent.  The first
+                # stop owns the durable result; callers may safely repeat the
+                # request without changing its terminal envelope.
+                if (job.path / "result.json").exists():
+                    repeated_data: dict[str, Any] = {"reason": meta.get("stop_reason", reason)}
+                    repeated_handle = run_handles.cancel(job_id)
+                    if repeated_handle is not None:
+                        repeated_data["run_handle_stop"] = repeated_handle
+                    repeated_warning: dict[str, Any] | None = None
+                    try:
+                        job.events.write(
+                            level="info",
+                            type="stopped",
+                            message=f"Job stopped: {meta.get('stop_reason', reason)}",
+                            data=repeated_data,
+                        )
+                    except Exception as exc:  # result already exists
+                        repeated_warning = {
+                            "code": "stopped_event_write_failed",
+                            "error": type(exc).__name__,
+                        }
+                    response = {
+                        "ok": True,
+                        "job_id": job_id,
+                        "already_terminal": True,
+                        "status": current_status,
+                    }
+                    if repeated_warning is not None:
+                        response["warnings"] = [repeated_warning]
+                    return response
+                return {
+                    "ok": False,
+                    "error": "result_not_ready",
+                    "job_id": job_id,
+                    "status": current_status,
+                }
+            if current_status not in ("running", "awaiting_input", None, ""):
+                return {
+                    "ok": False,
+                    "error": "job_already_terminal",
+                    "job_id": job_id,
+                    "status": current_status,
+                }
             # Make a stop terminal before attempting provider cleanup. A runner
             # that observes its process exit while cleanup is in flight must not
             # publish a late success over the caller's explicit stop request.
@@ -1283,6 +1447,30 @@ class JobStore:
         if handle_data is not None:
             data["run_handle_stop"] = handle_data
 
+        if persist_result:
+            summary = f"Job stopped: {reason}"
+            envelope = self._build_stopped_envelope(
+                meta,
+                reason=reason,
+                summary=summary,
+                technical={"stop": data},
+            )
+            try:
+                persisted = self.set_stopped_result(
+                    job_id,
+                    summary=summary,
+                    envelope=envelope,
+                )
+            except OSError as exc:
+                persisted = {
+                    "ok": False,
+                    "error": "terminal_result_persist_failed",
+                    "job_id": job_id,
+                    "message": type(exc).__name__,
+                }
+            if not persisted.get("ok"):
+                return persisted
+        event_error: str | None = None
         try:
             job.events.write(
                 level="info",
@@ -1290,9 +1478,18 @@ class JobStore:
                 message=f"Job stopped: {reason}",
                 data=data,
             )
+        except Exception as exc:  # durable result remains authoritative
+            event_error = type(exc).__name__
         finally:
-            self._release_writer_lease(job_id, meta)
-        return {"ok": True, "job_id": job_id}
+            if not persist_result and release_writer_lease:
+                self._release_writer_lease(job_id, meta)
+        result = {"ok": True, "job_id": job_id}
+        warnings = list(persisted.get("warnings", [])) if persist_result else []
+        if event_error is not None:
+            warnings.append({"code": "stopped_event_write_failed", "error": event_error})
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def list_jobs(self, client_session_id: str | None = None) -> list[dict[str, Any]]:
         """List all existing jobs under the state root."""

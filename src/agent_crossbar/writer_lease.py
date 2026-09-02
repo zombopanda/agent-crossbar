@@ -151,7 +151,12 @@ class WriterLeaseStore:
         meta = WriterLeaseStore._read(meta_path)
         if meta is None:
             return "corrupt"
-        if meta.get("status") in _TERMINAL_STATUSES:
+        # Metadata becomes terminal before some stop paths publish their
+        # result envelope.  Do not release an external writer lease until the
+        # durable result file exists as well; otherwise a replacement writer
+        # can overlap the still-uncollected stop lifecycle.
+        result_path = job_dir / "result.json"
+        if meta.get("status") in _TERMINAL_STATUSES and result_path.is_file():
             return "terminal"
         return "nonterminal"
 
