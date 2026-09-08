@@ -4,6 +4,39 @@ from __future__ import annotations
 
 import pytest
 
+from agent_crossbar.adapters.base import ModelCatalog
+
+# Representative live-discovery catalogs handed to every ordinary unit test.
+# Profiles with ``live_model_discovery`` must appear here or their tests fall
+# through to a real provider CLI probe (missing in CI). Model ids mirror the
+# documented ``reasonix doctor --json`` providers shape — never invented.
+REPRESENTATIVE_CATALOGS: dict[str, ModelCatalog] = {
+    "codex": ModelCatalog(
+        models=("gpt-5.6-sol", "gpt-5.6-terra"),
+        default_model="gpt-5.6-sol",
+        native_efforts=("low", "medium", "high", "max"),
+        source="test fixture",
+    ),
+    "claude": ModelCatalog(
+        models=("claude-sonnet-5", "claude-opus-5"),
+        default_model="claude-sonnet-5",
+        native_efforts=("low", "medium", "high"),
+        source="test fixture",
+    ),
+    "opencode": ModelCatalog(
+        models=("opencode-go/qwen3.6-plus", "opencode-go/glm-5.2"),
+        default_model="opencode-go/qwen3.6-plus",
+        native_efforts=("low", "medium", "high"),
+        source="test fixture",
+    ),
+    "reasonix": ModelCatalog(
+        models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"),
+        default_model="deepseek-flash/deepseek-v4-flash",
+        native_efforts=(),
+        source="test fixture",
+    ),
+}
+
 
 @pytest.fixture(autouse=True)
 def _no_real_browser_windows(monkeypatch):
@@ -31,28 +64,8 @@ def _no_live_model_discovery_in_unit_tests(request, monkeypatch):
         return
 
     import agent_crossbar.discovery as discovery
-    from agent_crossbar.adapters.base import ModelCatalog
 
-    catalogs = {
-        "codex": ModelCatalog(
-            models=("gpt-5.6-sol", "gpt-5.6-terra"),
-            default_model="gpt-5.6-sol",
-            native_efforts=("low", "medium", "high", "max"),
-            source="test fixture",
-        ),
-        "claude": ModelCatalog(
-            models=("claude-sonnet-5", "claude-opus-5"),
-            default_model="claude-sonnet-5",
-            native_efforts=("low", "medium", "high"),
-            source="test fixture",
-        ),
-        "opencode": ModelCatalog(
-            models=("opencode-go/qwen3.6-plus", "opencode-go/glm-5.2"),
-            default_model="opencode-go/qwen3.6-plus",
-            native_efforts=("low", "medium", "high"),
-            source="test fixture",
-        ),
-    }
+    catalogs = REPRESENTATIVE_CATALOGS
     original_discover = discovery.discover_profile_models
 
     def discover(state_root, profile, *, refresh=False):

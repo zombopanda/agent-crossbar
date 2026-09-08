@@ -797,14 +797,53 @@ def _process_is_zombie(pid: int) -> bool:
         return False
 
 
+def _process_group_has_live_member(pgid: int) -> bool:
+    """Return whether a process group has a non-zombie member.
+
+    ``killpg(pgid, 0)`` also succeeds for a group containing only zombie
+    entries.  Use the platform process table to distinguish that case from a
+    live descendant.  Any failed or ambiguous probe is treated as live so
+    callers never claim cleanup without proof.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pgid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        return True
+
+    saw_row = False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        saw_row = True
+        if len(fields) < 2:
+            return True
+        try:
+            row_pgid = int(fields[0])
+        except ValueError:
+            return True
+        if row_pgid == pgid and not fields[1].startswith("Z"):
+            return True
+    return not saw_row
+
+
 def _process_exit_confirmed(pid: int, pgid: int | None, timeout: float = 2.0) -> bool:
     """Return only after the recorded leader and owned group are gone."""
     deadline = time.monotonic() + timeout
     while True:
+        leader_is_zombie = _process_is_zombie(pid)
         leader_alive = False
         try:
             os.kill(pid, 0)
-            leader_alive = not _process_is_zombie(pid)
+            leader_alive = not leader_is_zombie
         except ProcessLookupError:
             leader_alive = False
         except OSError:
@@ -815,7 +854,10 @@ def _process_exit_confirmed(pid: int, pgid: int | None, timeout: float = 2.0) ->
         if pgid is not None and pgid > 1 and pgid != os.getpgrp():
             try:
                 os.killpg(pgid, 0)
-                group_alive = True
+                # killpg(0) succeeds while a dead leader's zombie entry still
+                # belongs to the group. Only a process-table probe can tell
+                # whether a live descendant remains in that group.
+                group_alive = _process_group_has_live_member(pgid)
             except ProcessLookupError:
                 group_alive = False
             except OSError:

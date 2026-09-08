@@ -1360,6 +1360,107 @@ class TestSafeAcpTermination:
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_zombie_leader_with_live_group_member_is_not_confirmed(self, monkeypatch):
+        """A zombie leader must not hide a live descendant from cleanup."""
+        import signal
+
+        import agent_crossbar.acp_runtime as runtime
+
+        group_signals: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            runtime,
+            "_capture_process_identity",
+            lambda _pid: {"start": "start", "pgid": 123},
+        )
+        monkeypatch.setattr(runtime, "_process_is_zombie", lambda _pid: True)
+        monkeypatch.setattr(runtime, "_process_group_has_live_member", lambda _pgid: True)
+        monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
+        clock = iter((0.0, 3.0))
+        monkeypatch.setattr(runtime.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(
+            runtime.os,
+            "kill",
+            lambda _target, _sig: None,
+        )
+        monkeypatch.setattr(
+            runtime.os,
+            "killpg",
+            lambda pgid, sig: group_signals.append((pgid, sig)),
+        )
+
+        result = runtime.safe_acp_termination(
+            {"acp_pid": 123, "acp_process_start": "start", "acp_pgid": 123}
+        )
+
+        assert result["terminated"] is False
+        assert result["reason"] == "death_unconfirmed"
+        assert (123, signal.SIGTERM) in group_signals
+        assert (123, signal.SIGKILL) in group_signals
+
+    def test_process_group_probe_fails_closed_and_ignores_zombies(self, monkeypatch):
+        import agent_crossbar.acp_runtime as runtime
+
+        class _Result:
+            returncode = 0
+            stdout = "123 S\n123 Z+\n"
+
+        monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: _Result())
+        assert runtime._process_group_has_live_member(123) is True
+
+        class _ZombieOnlyResult:
+            returncode = 0
+            stdout = "123 Z\n123 Z+\n"
+
+        monkeypatch.setattr(
+            runtime.subprocess,
+            "run",
+            lambda *args, **kwargs: _ZombieOnlyResult(),
+        )
+        assert runtime._process_group_has_live_member(123) is False
+
+        class _EmptyResult:
+            returncode = 0
+            stdout = ""
+
+        monkeypatch.setattr(
+            runtime.subprocess,
+            "run",
+            lambda *args, **kwargs: _EmptyResult(),
+        )
+        assert runtime._process_group_has_live_member(123) is True
+
+        class _FailedResult:
+            returncode = 1
+            stdout = ""
+
+        monkeypatch.setattr(
+            runtime.subprocess,
+            "run",
+            lambda *args, **kwargs: _FailedResult(),
+        )
+        assert runtime._process_group_has_live_member(123) is True
+
+    def test_reaped_leader_still_checks_owned_group(self, monkeypatch):
+        """A missing leader does not prove zombie descendants are gone."""
+        import agent_crossbar.acp_runtime as runtime
+
+        probes: list[int] = []
+
+        def missing_leader(_pid, _sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(runtime.os, "kill", missing_leader)
+        monkeypatch.setattr(runtime.os, "killpg", lambda _pgid, _sig: None)
+        monkeypatch.setattr(runtime.os, "getpgrp", lambda: 999)
+        monkeypatch.setattr(
+            runtime,
+            "_process_group_has_live_member",
+            lambda pgid: probes.append(pgid) or False,
+        )
+
+        assert runtime._process_exit_confirmed(123, 123, timeout=0) is True
+        assert probes == [123]
+
     def test_importable_from_acp_runtime(self):
         """safe_acp_termination must be importable — no ImportError."""
         from agent_crossbar.acp_runtime import safe_acp_termination  # noqa: F811

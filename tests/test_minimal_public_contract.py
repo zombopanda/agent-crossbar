@@ -165,6 +165,29 @@ def test_minimal_agent_start_review_creates_job_without_target_fields(
     assert "context_target" not in result
 
 
+def test_unit_test_fixture_covers_every_live_discovery_profile() -> None:
+    """The conftest representative catalogs must cover every profile that
+    enables live model discovery.
+
+    Profiles with ``live_model_discovery`` resolve their model catalog through
+    ``discovery.discover_profile_models``. If a new discovery-capable profile
+    is added without a representative catalog in ``tests/conftest.py``, ordinary
+    unit tests silently fall through to a real provider CLI probe that is absent
+    in CI — the regression that broke the py3.11/3.12/3.13 CI matrix.
+    """
+    import conftest
+
+    from agent_crossbar.adapters.registry import get_adapter
+    from agent_crossbar.profiles import profile_registry
+
+    for profile in profile_registry():
+        if get_adapter(profile).live_model_discovery:
+            assert profile in conftest.REPRESENTATIVE_CATALOGS, (
+                f"profile '{profile}' enables live_model_discovery but has no "
+                "representative catalog in tests/conftest.py"
+            )
+
+
 def test_agent_start_rejects_unknown_task_without_creating_job(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
