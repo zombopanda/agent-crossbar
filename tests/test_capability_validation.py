@@ -54,6 +54,13 @@ def _no_live_model_discovery(tmp_path, monkeypatch):
                 native_efforts=("low", "medium", "high"),
                 source="test",
             )
+        if profile == "reasonix":
+            return ModelCatalog(
+                models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"),
+                default_model="deepseek-flash/deepseek-v4-flash",
+                native_efforts=(),
+                source="reasonix doctor --json",
+            )
         raise RuntimeError(f"no live {profile} probe in unit tests")
 
     monkeypatch.setattr(_disc, "discover_profile_models", _boom)
@@ -140,7 +147,7 @@ def test_reasonix_review_requires_explicit_flash_model(tmp_path):
         state_root=tmp_path,
     )
     assert result["ok"] is True
-    assert result["model"] == "deepseek-v4-flash"
+    assert result["model"] == "deepseek-flash/deepseek-v4-flash"
 
 
 def test_reasonix_review_rejects_unknown_model(tmp_path):
@@ -209,19 +216,7 @@ def test_opencode_flat_schema(tmp_path):
     """OpenCode profile uses flat schema — no nested capabilities."""
     profiles = profiles_list(client_name="codex")["profile_details"]
     opencode = profiles["opencode"]
-    assert opencode["models"] == [
-        "opencode/deepseek-v4-flash-free",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "glm-5.1",
-        "glm-5.2",
-        "kimi-k2.6",
-        "kimi-k2.7-code",
-        "mimo-v2.5",
-        "mimo-v2.5-pro",
-        "minimax-m2.7",
-        "minimax-m3",
-    ]
+    assert opencode["models"] == []
     assert opencode["operations"] == ["review", "text", "advice", "dev"]
     assert opencode["interactive"] is False
 

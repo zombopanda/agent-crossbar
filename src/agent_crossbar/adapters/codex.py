@@ -5,13 +5,27 @@ from __future__ import annotations
 from typing import Any
 
 from ..discovery_runner import CodexSession, PopenCodexSession, discover_codex_models
-from ..profiles.codex import SUPPORT_TIER
-from .base import ModelCatalog, ModelInfo, StaticAdapter
+from ..profiles.codex import CODEX_DEFAULT_EFFORT, CODEX_EFFORT_ALIASES, SUPPORT_TIER
+from .base import PUBLIC_EFFORTS, ModelCatalog, ModelInfo, StaticAdapter
 
 # ── Session factory (injectable for tests) ───────────────────────────────────
 
 
 _CODEX_SESSION_FACTORY: type[CodexSession] | None = None
+
+
+def _acp_readiness(runner: Any) -> dict[str, Any]:
+    # Resolve at call time so tests/controllers can replace the probe without
+    # rebuilding the adapter registry.
+    from ..acp_lifecycle import check_codex_acp_readiness
+
+    return check_codex_acp_readiness(runner)
+
+
+def _readiness_probe(runner=None):
+    from ..readiness import check_codex_readiness
+
+    return check_codex_readiness(runner)
 
 
 def _create_codex_session() -> CodexSession:
@@ -89,6 +103,12 @@ class CodexAdapter(StaticAdapter):
             # codex-acp v1.1.7 exposes `reasoning_effort` as a
             # `thought_level` session config option.
             supports_acp_effort=True,
+            acp_readiness=_acp_readiness,
+            live_model_discovery=True,
+            default_effort=CODEX_DEFAULT_EFFORT,
+            effort_aliases=CODEX_EFFORT_ALIASES,
+            review_warning="context bypass risk accepted for native Codex review",
+            readiness_probe=_readiness_probe,
         )
 
     def discover_models(self, runner: Any) -> ModelCatalog:
@@ -143,6 +163,33 @@ class CodexAdapter(StaticAdapter):
                 f"by model '{model_id}'. Supported: {', '.join(supported)}"
             )
         return None
+
+    def validate_effort(
+        self,
+        effort: str | None,
+        catalog: ModelCatalog | None,
+        model_id: str | None,
+    ) -> tuple[str | None, str | None, tuple[str, str] | None]:
+        """Codex always resolves an effort — defaulting, aliasing, then
+        validating against public efforts and the model's discovered
+        capabilities.
+        """
+        resolved_public = effort or self.default_effort
+        resolved_public = self.effort_aliases.get(resolved_public, resolved_public)
+        if resolved_public not in PUBLIC_EFFORTS:
+            return (
+                None,
+                None,
+                (
+                    "invalid_effort",
+                    f"Effort '{resolved_public}' is not supported for profile '{self.name}'",
+                ),
+            )
+        native = self.resolve_effort(resolved_public, catalog, model_id)
+        err = self.validate_effort_for_model(resolved_public, catalog, model_id)
+        if err is not None:
+            return None, None, ("unsupported_effort_for_model", err)
+        return resolved_public, native, None
 
 
 adapter = CodexAdapter()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,7 @@ def test_profiles_list_returns_canonical(tmp_path, monkeypatch):
     assert "qwen" not in result["profiles"]
     assert len(result["profiles"]) == 5
     assert result["profile_details"]["claude"]["aliases"] == ["opus", "fable"]
-    assert result["profile_details"]["codex"]["models"] == ["gpt-5.6-sol", "gpt-5.6-terra"]
+    assert result["profile_details"]["codex"]["models"] == []
     assert "default_model" not in result["profile_details"]["codex"]
     assert result["profile_details"]["codex"]["operations"] == ["review", "text", "dev"]
     assert result["profile_details"]["codex"]["interactive"] is False
@@ -189,15 +190,13 @@ def test_profiles_list_uses_cached_models_when_available(tmp_path, monkeypatch):
         assert set(entry.keys()) == allowed
 
 
-def test_profiles_list_falls_back_to_static_without_cache(tmp_path, monkeypatch):
-    """With no cache and a failed live probe, profiles_list returns the
-    deterministic static models — never empty."""
+def test_profiles_list_is_truthful_without_cache(tmp_path, monkeypatch):
+    """Without live discovery, profiles_list does not advertise guessed models."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
 
     result = profiles_list()
     assert result["ok"] is True
-    assert result["profile_details"]["codex"]["models"] == ["gpt-5.6-sol", "gpt-5.6-terra"]
-    assert result["profile_details"]["codex"]["models"] != []
+    assert result["profile_details"]["codex"]["models"] == []
 
 
 def test_profiles_list_invokes_live_discovery_on_clean_cache(tmp_path, monkeypatch):
@@ -260,4 +259,41 @@ def test_job_stop_acp_persists_terminal_result(tmp_path, monkeypatch):
     result = store.get_result(job.job_id)
     assert result["status"] == "cancelled"
     assert result["stop_reason"] == "test_stop"
-    assert result["technical"]["acp_stop"]["reason"] == "no_acp_pid_in_meta"
+    assert result["technical"]["provider_cleanup"]["reason"] == "no_acp_pid_in_meta"
+
+
+def test_strict_admission_denial_precedes_job_creation(tmp_path, monkeypatch):
+    """A denied canonical request cannot create a job or provider state."""
+    import agent_crossbar.server as server_module
+
+    monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_CROSSBAR_ADMISSION_MODE", "strict")
+    monkeypatch.setenv(
+        "AGENT_CROSSBAR_ADMISSION_COMMAND",
+        json.dumps(
+            [
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'version':1,'decision':'deny','reason':'quota denied'}))",
+            ]
+        ),
+    )
+
+    def fail_if_created():
+        raise AssertionError("admission denial must precede JobStore access")
+
+    monkeypatch.setattr(server_module, "_job_store", fail_if_created)
+    result = server_module._validate_and_create_job(
+        {
+            "operation": "advice",
+            "profile": "chatgpt_pro",
+            "transport": "gui",
+            "autonomy": "read_only",
+            "sensitivity": "normal",
+            "prompt": "explain",
+            "model": "6-pro",
+        }
+    )
+    assert result["ok"] is False
+    assert result["error"] == "admission_denied"
+    assert not list(tmp_path.glob("**/meta.json"))

@@ -8,6 +8,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import subprocess
+import sys
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
@@ -33,6 +36,7 @@ from agent_crossbar.acp_runtime import build_acp_agent_command, run_acp_job
 from agent_crossbar.envelope import FAILURE_STAGES
 from agent_crossbar.jobs import JobStore
 from agent_crossbar.models import Autonomy
+from agent_crossbar.run_handles import run_handles
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -200,7 +204,7 @@ class TestRunAcpJobSuccess:
         # provider="opencode" + task="dev" resolves the adapter-owned "build"
         # session mode (see adapters/opencode.py OpencodeAdapter.dev_acp_mode).
         mock_run.assert_awaited_once_with(
-            ["opencode", "acp"],
+            [sys.executable, "-m", "agent_crossbar.acp_process_wrapper", "opencode", "acp"],
             SECRET,
             str(tmp_path),
             timeout=12,
@@ -208,7 +212,10 @@ class TestRunAcpJobSuccess:
             model="glm",
             effort=None,
             mode="build",
+            startup_lock=ANY,
+            before_process_start=ANY,
             on_process_start=ANY,
+            before_prompt=ANY,
             on_text_delta=ANY,
             on_execution_heartbeat=ANY,
         )
@@ -366,10 +373,257 @@ class TestRunAcpJobDevEmptyResultFailsClosed:
         assert stored["output"] == "Done."
         assert stored["envelope"]["changes"] == []
 
+    def test_stop_before_worker_start_never_invokes_provider(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        stopped = store.stop_job(job_id, reason="user_cancelled")
+        assert stopped["ok"] is True
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(side_effect=AssertionError("provider must not start")),
+        ) as prompt:
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+        prompt.assert_not_awaited()
+
+    def test_stop_after_final_fence_blocks_provider_start(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+
+        async def stop_before_spawn(*_args, before_process_start, **_kwargs):
+            run_handles.cancel(job_id)
+            before_process_start()
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=stop_before_spawn,
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["failure"]["code"] == "acp_protocol_error"
+        assert stored["technical"]["provider_cleanup"]["reason"] == (
+            "startup_cancelled_before_spawn"
+        )
+
+    def test_cancel_before_process_identity_fence_blocks_prompt(self, tmp_path):
+        """The in-memory stop fence wins before durable status is published."""
+        store, job_id = _create_job_store(tmp_path)
+        prompt_started = False
+
+        async def stop_during_spawn(*_args, on_process_start, **_kwargs):
+            nonlocal prompt_started
+            run_handles.cancel(job_id)
+            # stop_job requests the handle before it writes status=stopped. The
+            # production callback must persist identity, then reject this
+            # before any provider prompt.
+            on_process_start(7001)
+            prompt_started = True
+
+        with (
+            patch(
+                "agent_crossbar.acp_runtime.run_acp_prompt",
+                new=stop_during_spawn,
+            ),
+            patch(
+                "agent_crossbar.acp_runtime._capture_process_identity",
+                return_value={"pgid": 7001, "start": "launch-1", "command": "fake"},
+            ),
+            patch(
+                "agent_crossbar.acp_runtime.safe_acp_termination",
+                return_value={"terminated": False, "reason": "death_unconfirmed", "pid": 7001},
+            ) as terminate,
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert prompt_started is False
+        assert stored["status"] == "failed"
+        assert stored["failure"]["code"] == "acp_protocol_error"
+        assert _read_store_meta(store, job_id)["acp_pid"] == 7001
+        assert stored["technical"]["provider_cleanup"] == {
+            "terminated": False,
+            "reason": "death_unconfirmed",
+            "pid": 7001,
+        }
+        assert terminate.call_count == 2
+        assert terminate.call_args_list[-1].args[0]["acp_pid"] == 7001
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    def test_pid_record_failure_keeps_post_spawn_cleanup_receipt(self, tmp_path, cancel):
+        """A metadata failure after spawn never becomes a pre-spawn success."""
+        store, job_id = _create_job_store(tmp_path)
+        original_update = store.update_job_meta
+        prompt_started = False
+
+        def fail_pid_record(update_job_id, updates):
+            if "acp_pid" in updates:
+                raise OSError("metadata unavailable")
+            return original_update(update_job_id, updates)
+
+        async def fail_after_spawn(*_args, on_process_start, **_kwargs):
+            nonlocal prompt_started
+            if cancel:
+                run_handles.cancel(job_id)
+            try:
+                on_process_start(7001)
+            except OSError as exc:
+                raise AcpProtocolError("could not persist process identity") from exc
+            prompt_started = True
+
+        with (
+            patch("agent_crossbar.acp_runtime.run_acp_prompt", new=fail_after_spawn),
+            patch(
+                "agent_crossbar.acp_runtime._capture_process_identity",
+                return_value={"pgid": 7001, "start": "launch-1", "command": "fake"},
+            ),
+            patch(
+                "agent_crossbar.acp_runtime.safe_acp_termination",
+                return_value={"terminated": False, "reason": "death_unconfirmed", "pid": 7001},
+            ) as terminate,
+            patch.object(store, "update_job_meta", side_effect=fail_pid_record),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert prompt_started is False
+        assert stored["status"] == "failed"
+        assert stored["failure"]["code"] == "acp_protocol_error"
+        assert stored["technical"]["provider_cleanup"] == {
+            "terminated": False,
+            "reason": "death_unconfirmed",
+            "pid": 7001,
+        }
+        assert stored["technical"]["cleanup_confirmed"] is False
+        assert stored["technical"]["native_session_id"] == 7001
+        assert terminate.call_args_list[-1].args[0]["acp_pid"] == 7001
+
+    def test_failure_after_launch_marker_refresh_retains_lease_before_pid(self, tmp_path):
+        """Early provider errors refresh durable launch intent before release."""
+        from agent_crossbar.writer_lease import WriterLeaseStore
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        state = tmp_path / "state"
+        leases = WriterLeaseStore(state)
+        pending = leases.acquire(workspace, owner_id="pending", owner_kind="pending_dev")
+        assert pending.ok and pending.token
+        store = JobStore(state)
+        job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+        assert leases.attach(pending.token, job_id=job.job_id)
+        store.update_job_meta(job.job_id, {"writer_lease_token": pending.token})
+
+        async def provider_error(*_args, **_kwargs):
+            raise AcpProviderUnavailableError(
+                "provider_unavailable", "provider failed before PID callback"
+            )
+
+        with patch("agent_crossbar.acp_runtime.run_acp_prompt", new=provider_error):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job.job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(workspace),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        result = store.get_result(job.job_id)
+        assert result["status"] == "failed"
+        assert _read_store_meta(store, job.job_id)["acp_launch_pending"] is True
+        assert leases.acquire(workspace, owner_id="replacement").error == "writer_busy"
+
+    def test_cancel_before_prompt_fence_blocks_provider_prompt(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        prompt_started = False
+
+        async def stop_before_prompt(*_args, before_prompt, **_kwargs):
+            nonlocal prompt_started
+            run_handles.cancel(job_id)
+            before_prompt()
+            prompt_started = True
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=stop_before_prompt,
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert prompt_started is False
+        assert stored["status"] == "failed"
+        assert stored["failure"]["code"] == "acp_protocol_error"
+        assert stored["technical"]["provider_cleanup"]["reason"] == (
+            "startup_cancelled_before_spawn"
+        )
+
     @pytest.mark.parametrize("task", ["ask", "review"])
-    def test_non_dev_whitespace_output_is_unaffected(self, tmp_path, task):
-        """Preserves pre-existing behaviour for ask/review — only "dev" gets
-        the fail-closed empty-output gate."""
+    def test_non_dev_whitespace_output_fails_closed(self, tmp_path, task):
+        """Ask/review must not claim success without provider output either."""
         store = JobStore(tmp_path)
         job = store.create_job(
             profile="opencode",
@@ -400,9 +654,40 @@ class TestRunAcpJobDevEmptyResultFailsClosed:
             )
 
         stored = store.get_result(job_id)
-        assert stored["status"] == "completed"
-        assert stored["ok"] is True
-        assert stored["output"] == "\n\n"
+        assert stored["status"] == "failed"
+        assert stored["ok"] is False
+        assert stored["failure"]["code"] == "acp_empty_result"
+
+    @pytest.mark.parametrize("task", ["ask", "review"])
+    def test_non_dev_no_output_sentinel_fails_closed(self, tmp_path, task):
+        from agent_crossbar.acp_client import NO_OUTPUT_SENTINEL
+
+        store, job_id = _create_job_store(tmp_path)
+        acp_result = AcpResult(
+            output=NO_OUTPUT_SENTINEL, stop_reason="end_turn", session_id="native-1"
+        )
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(return_value=acp_result),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt="hello",
+                    cwd=str(tmp_path),
+                    task=task,
+                    model="glm",
+                    autonomy=Autonomy.READ_ONLY,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["ok"] is False
+        assert stored["failure"]["code"] == "acp_empty_result"
 
 
 class TestRunAcpJobTimeout:
@@ -962,6 +1247,119 @@ class TestSafeAcpTermination:
         assert r1 == r2
         assert r1["terminated"] is True
 
+    def test_pid_reuse_is_not_signalled(self, monkeypatch):
+        import agent_crossbar.acp_runtime as runtime
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(runtime.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+        monkeypatch.setattr(
+            runtime,
+            "_capture_process_identity",
+            lambda pid: {"start": "new-start", "pgid": pid},
+        )
+        result = runtime.safe_acp_termination(
+            {"acp_pid": 123, "acp_process_start": "old-start", "acp_pgid": 123}
+        )
+        assert result["terminated"] is False
+        assert result["reason"] == "pid_reused"
+        assert calls == [(123, 0)]
+
+    def test_live_pid_without_launch_identity_is_not_signalled(self, monkeypatch):
+        import agent_crossbar.acp_runtime as runtime
+
+        calls: list[tuple[int, int]] = []
+        pid = 4321
+        monkeypatch.setattr(runtime.os, "kill", lambda target, sig: calls.append((target, sig)))
+        monkeypatch.setattr(runtime.os, "getpid", lambda: pid)
+
+        result = runtime.safe_acp_termination({"acp_pid": pid})
+
+        assert result == {
+            "terminated": False,
+            "reason": "process_identity_unverifiable",
+            "pid": pid,
+        }
+        assert calls == [(pid, 0)]
+
+    def test_owned_identity_cannot_adopt_foreign_process_group(self, monkeypatch):
+        import agent_crossbar.acp_runtime as runtime
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(runtime.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+        monkeypatch.setattr(
+            runtime,
+            "_capture_process_identity",
+            lambda pid: {"start": "same-start", "pgid": pid + 1},
+        )
+        result = runtime.safe_acp_termination(
+            {"acp_pid": 123, "acp_process_start": "same-start", "acp_pgid": 123}
+        )
+        assert result["terminated"] is False
+        assert result["reason"] == "process_group_reused"
+        assert calls == [(123, 0)]
+
+    def test_shared_group_uses_leader_signal_without_killpg(self, monkeypatch):
+        import signal
+
+        import agent_crossbar.acp_runtime as runtime
+
+        calls: list[tuple[str, int, int]] = []
+        monkeypatch.setattr(
+            runtime.os,
+            "kill",
+            lambda pid, sig: calls.append(("kill", pid, sig)),
+        )
+        monkeypatch.setattr(
+            runtime.os,
+            "killpg",
+            lambda pgid, sig: calls.append(("killpg", pgid, sig)),
+        )
+        monkeypatch.setattr(
+            runtime, "_capture_process_identity", lambda _pid: {"start": "same", "pgid": 456}
+        )
+        monkeypatch.setattr(runtime, "_process_exit_confirmed", lambda *_args: True)
+        monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
+
+        result = runtime.safe_acp_termination(
+            {"acp_pid": 123, "acp_process_start": "same", "acp_pgid": 456}
+        )
+
+        assert result["terminated"] is True
+        assert not any(kind == "killpg" for kind, _pid, _sig in calls)
+        assert ("kill", 123, signal.SIGTERM) in calls
+
+    def test_owned_process_group_kills_provider_and_grandchild(self):
+        import agent_crossbar.acp_runtime as runtime
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "agent_crossbar.acp_process_wrapper",
+                sys.executable,
+                "-c",
+                "import subprocess,time; subprocess.Popen(['sleep','30']); time.sleep(30)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(0.1)
+            identity = runtime._capture_process_identity(proc.pid)
+            result = runtime.safe_acp_termination(
+                {
+                    "acp_pid": proc.pid,
+                    "acp_pgid": identity.get("pgid"),
+                    "acp_process_start": identity.get("start"),
+                }
+            )
+            assert result["terminated"] is True
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
     def test_importable_from_acp_runtime(self):
         """safe_acp_termination must be importable — no ImportError."""
         from agent_crossbar.acp_runtime import safe_acp_termination  # noqa: F811
@@ -1038,24 +1436,62 @@ class TestRunAcpJobCallerInterruption:
             raise asyncio.CancelledError()
 
         with patch("agent_crossbar.acp_runtime.run_acp_prompt", new=interrupted):
-            with pytest.raises(asyncio.CancelledError):
-                asyncio.run(
-                    run_acp_job(
-                        store,
-                        job_id,
-                        provider="opencode",
-                        prompt=SECRET,
-                        cwd=str(tmp_path),
-                        task="dev",
-                        model="glm",
-                        effort=None,
-                        autonomy=Autonomy.EDIT_LOCAL,
-                        max_runtime_sec=12,
-                    )
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt=SECRET,
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    effort=None,
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
                 )
+            )
 
         stored = store.get_result(job_id)
         assert stored["status"] == "cancelled"
         assert stored["stop_reason"] == "user_cancelled"
+
+    def test_cancellation_with_unconfirmed_cleanup_retains_writer_lease(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        released: list[str] = []
+        store._release_writer_lease = lambda job_id, meta=None: released.append(job_id) or True
+
+        async def interrupted(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        cleanup = {
+            "terminated": False,
+            "reason": "process_identity_unverifiable",
+            "pid": 123,
+        }
+        with (
+            patch("agent_crossbar.acp_runtime.run_acp_prompt", new=interrupted),
+            patch("agent_crossbar.acp_runtime.safe_acp_termination", return_value=cleanup),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt=SECRET,
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["technical"]["provider_cleanup"] == cleanup
+        assert stored["technical"]["cleanup_confirmed"] is False
+        assert released == []
+        meta = store._read_job_meta(store.get_job(job_id).path)
+        assert meta["cleanup_pending"] is True
         result_events = [e for e in _read_store_events(store, job_id) if e["type"] == "result"]
         assert len(result_events) == 1

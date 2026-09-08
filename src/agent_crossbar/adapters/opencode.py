@@ -22,6 +22,18 @@ _MODEL_ID_RE = re.compile(r"^(?!.*://)(?!.*//)[a-zA-Z0-9~][-a-zA-Z0-9._~@/:]*/[-
 _QUALIFIED_DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
 
 
+def _acp_readiness(runner) -> dict:
+    from ..acp_lifecycle import check_opencode_acp_readiness
+
+    return check_opencode_acp_readiness(runner)
+
+
+def _readiness_probe(runner=None):
+    from ..readiness import check_opencode_readiness
+
+    return check_opencode_readiness(runner)
+
+
 def _select_default_model(model_ids: list[str]) -> str | None:
     """Pick the catalog default from live-discovered *model_ids*.
 
@@ -190,6 +202,10 @@ class OpencodeAdapter(StaticAdapter):
             # tasks require "build" so edits actually happen — the live
             # session must advertise and accept this value before prompting.
             dev_acp_mode="build",
+            acp_readiness=_acp_readiness,
+            live_model_discovery=True,
+            fuzzy_model_suffix_match=True,
+            readiness_probe=_readiness_probe,
         )
 
     def discover_models(self, runner: DiscoveryProcess) -> ModelCatalog:
@@ -258,6 +274,20 @@ class OpencodeAdapter(StaticAdapter):
                 f"by model '{model_id}'. Supported: {', '.join(supported)}"
             )
         return None
+
+    def validate_effort(
+        self,
+        effort: str | None,
+        catalog: ModelCatalog | None,
+        model_id: str | None,
+    ) -> tuple[str | None, str | None, tuple[str, str] | None]:
+        """OpenCode only validates effort when the caller explicitly requests one."""
+        if effort is None:
+            return None, None, None
+        err = self.validate_effort_for_model(effort, catalog, model_id)
+        if err is not None:
+            return None, None, ("unsupported_effort_for_model", err)
+        return effort, self.map_effort(effort), None
 
 
 adapter = OpencodeAdapter()

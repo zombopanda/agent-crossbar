@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import subprocess
 import sys
+import tarfile
 import tomllib
 from dataclasses import fields
 from pathlib import Path
@@ -106,6 +108,26 @@ def test_sdist_excludes_nested_release_archives():
     py = _load_pyproject()
     excludes = py["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
     assert "*.tgz" in excludes
+    assert ".beads/**" in excludes
+    assert "**/AGENTS.md" in excludes
+    assert "**/CLAUDE.md" in excludes
+
+
+def test_built_sdist_contains_no_internal_state_or_private_docs(tmp_path):
+    out = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--sdist", "--out-dir", str(out)],
+        cwd=PKG_DIR,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    archives = list(out.glob("*.tar.gz"))
+    assert len(archives) == 1
+    with tarfile.open(archives[0], "r:gz") as archive:
+        names = archive.getnames()
+    forbidden = ("/.beads/", "/AGENTS.md", "/CLAUDE.md", "/.memsearch/", "/.reasonix/")
+    assert not any(any(marker in name for marker in forbidden) for name in names)
 
 
 def test_wheel_includes_deprecated_import_shim():
@@ -251,9 +273,11 @@ def test_release_creation_is_idempotent():
     assert 'gh release upload "${GITHUB_REF_NAME}" dist/* --clobber' in workflow
 
 
-def test_live_gate_uses_protected_environment():
-    workflow = (ROOT / ".github" / "workflows" / "live-gate.yml").read_text()
-    assert "environment: live-gates" in workflow
+def test_live_gate_is_maintainer_local_not_stock_github_workflow():
+    assert not (ROOT / ".github" / "workflows" / "live-gate.yml").exists()
+    readme = (ROOT / "README.md").read_text()
+    assert "Maintainer live gate prerequisites" in readme
+    assert "stock `ubuntu-latest` runners" in readme
 
 
 def test_install_smoke_uses_an_isolated_virtual_environment():

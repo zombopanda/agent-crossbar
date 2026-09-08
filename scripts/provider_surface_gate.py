@@ -7,6 +7,7 @@ provider/harness behavior changes, not as part of the default unit test suite.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -111,7 +112,15 @@ def _agent_start_args(case: GateCase, cwd: str | None = None) -> dict[str, Any]:
             args["cwd"] = cwd
     else:
         # ask or review — both use sentinel prompt
-        args["prompt"] = "Reply with exactly GPT_PRO_PROVIDER_GATE_OK"
+        # Claude's safety layer can classify imperative gate wording as a
+        # prompt-injection probe. Use a semantically equivalent neutral
+        # identifier request for that provider while preserving the exact
+        # sentinel contract.
+        args["prompt"] = (
+            "Output this identifier as a standalone line: GPT_PRO_PROVIDER_GATE_OK"
+            if case.profile == "claude"
+            else "Reply with exactly GPT_PRO_PROVIDER_GATE_OK"
+        )
 
     if case.effort:
         args["effort"] = case.effort
@@ -148,7 +157,7 @@ def _workspace_tempdir() -> tempfile.TemporaryDirectory[str]:
     return tempfile.TemporaryDirectory(prefix=".agents-provider-gate-work-", dir=PACKAGE_DIR)
 
 
-def _verify_reverse_words_workspace(cwd: Path) -> CheckResult:
+def _verify_reverse_words_workspace(cwd: Path, *, output_path: Path | None = None) -> CheckResult:
     code_path = cwd / "reverse_words.py"
     test_path = cwd / "test_reverse_words.py"
     if not code_path.exists():
@@ -164,12 +173,46 @@ def _verify_reverse_words_workspace(cwd: Path) -> CheckResult:
         capture_output=True,
         timeout=120,
     )
+    if output_path is not None:
+        output_path.write_text(
+            completed.stdout + completed.stderr,
+            encoding="utf-8",
+        )
     if completed.returncode != 0:
         output = (completed.stdout + completed.stderr)[-4000:]
         return CheckResult(
             False, f"generated tests failed with exit {completed.returncode}:\n{output}"
         )
     return CheckResult(True, "generated tests passed")
+
+
+def _retain_dev_artifact(
+    cwd: Path,
+    artifact_dir: Path | None,
+    case: GateCase,
+    job_id: str,
+    result: dict[str, Any],
+    tail: dict[str, Any],
+) -> Path | None:
+    """Copy generated fixtures and receipts before the disposable workspace is removed."""
+    if artifact_dir is None:
+        return None
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", case.label)
+    destination = artifact_dir / "provider-fixtures" / f"{safe_label}-{job_id}"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("reverse_words.py", "test_reverse_words.py", "AGENTS.md"):
+        source = cwd / name
+        if source.exists():
+            shutil.copy2(source, destination / name)
+    (destination / "job-result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (destination / "job-tail.json").write_text(
+        json.dumps(tail, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return destination
 
 
 async def _call(
@@ -218,6 +261,33 @@ async def _wait_for_result(
     final_tail = await _call(
         session, "job_tail", {"job_id": job_id, "max_bytes": 20000}, timeout_sec=60
     )
+    # ``job_tail`` clips complete events from the front of a large stream and
+    # returns a cursor for the next page.  Dev jobs can produce enough ACP
+    # deltas to hide the terminal event from the first page, so walk the
+    # cursor before validating lifecycle ordering.  This keeps the gate from
+    # reporting a false missing ``acp_completed`` after a successful job.
+    if final_tail.get("truncated"):
+        events = list(final_tail.get("events") or [])
+        cursor = final_tail.get("last_seq")
+        while isinstance(cursor, int) and cursor > 0:
+            page = await _call(
+                session,
+                "job_tail",
+                {"job_id": job_id, "since_seq": cursor, "max_bytes": 20000},
+                timeout_sec=60,
+            )
+            page_events = page.get("events") or []
+            if isinstance(page_events, list):
+                events.extend(event for event in page_events if isinstance(event, dict))
+            next_cursor = page.get("last_seq")
+            if (
+                not page.get("truncated")
+                or not isinstance(next_cursor, int)
+                or next_cursor <= cursor
+            ):
+                final_tail = {**final_tail, **page, "events": events}
+                break
+            cursor = next_cursor
     final_tail_text = json.dumps(final_tail, ensure_ascii=False)
     if _contains_blocking_prompt(final_tail_text):
         return {
@@ -327,7 +397,13 @@ def _claude_sentinel_received(sentinel: str, output: str) -> bool:
     return False
 
 
-async def _run_dev_case(session: ClientSession, case: GateCase, cwd: Path) -> CheckResult:
+async def _run_dev_case(
+    session: ClientSession,
+    case: GateCase,
+    cwd: Path,
+    *,
+    artifact_dir: Path | None = None,
+) -> CheckResult:
     """Run a dev task via agent_start, poll for completion, verify output."""
     args = _agent_start_args(case, cwd=str(cwd))
 
@@ -345,27 +421,39 @@ async def _run_dev_case(session: ClientSession, case: GateCase, cwd: Path) -> Ch
         timeout_sec=case.max_runtime_sec + RESULT_COMPLETION_GRACE_SEC,
     )
     tail_text = json.dumps(tail, ensure_ascii=False)
+    retained = _retain_dev_artifact(cwd, artifact_dir, case, job_id, result, tail)
+    retained_note = f"; artifacts retained at {retained}" if retained is not None else ""
 
     if _contains_blocking_prompt(tail_text):
-        return CheckResult(False, f"{case.label} blocked on provider prompt:\n{tail_text[-4000:]}")
+        return CheckResult(
+            False,
+            f"{case.label} blocked on provider prompt{retained_note}:\n{tail_text[-4000:]}",
+        )
     if not result.get("ok"):
         summary = str(result.get("summary") or result.get("output") or "")[-4000:]
         return CheckResult(
-            False, f"{case.label} failed: {result.get('error', 'unknown')}\n{summary}"
+            False,
+            f"{case.label} failed{retained_note}: {result.get('error', 'unknown')}\n{summary}",
         )
 
     stream = _check_acp_stream(case, start, tail)
     if stream is not None:
         return stream
 
-    workspace = _verify_reverse_words_workspace(cwd)
+    if retained is None:
+        workspace = _verify_reverse_words_workspace(cwd)
+    else:
+        workspace = _verify_reverse_words_workspace(
+            cwd,
+            output_path=retained / "pytest-output.txt",
+        )
     if not workspace.ok:
         summary = str(result.get("summary") or "")[-4000:]
         return CheckResult(
             False,
-            f"{case.label} workspace verification failed: {workspace.message}\nProvider summary:\n{summary}",
+            f"{case.label} workspace verification failed{retained_note}: {workspace.message}\nProvider summary:\n{summary}",
         )
-    return CheckResult(True, f"{case.label}: {workspace.message}")
+    return CheckResult(True, f"{case.label}: {workspace.message}{retained_note}")
 
 
 async def _run_ask_case(session: ClientSession, case: GateCase) -> CheckResult:
@@ -823,11 +911,20 @@ async def _run_cases(
     cases: list[GateCase],
     lifecycle: bool = False,
     all_supported_tools: bool = False,
+    artifact_dir: str | None = None,
 ) -> int:
-    with tempfile.TemporaryDirectory(prefix="agents-provider-gate-state-") as state_root:
+    artifact_path: Path | None = None
+    if artifact_dir:
+        artifact_path = Path(artifact_dir).expanduser().resolve()
+        artifact_path.mkdir(parents=True, exist_ok=True)
+        state_context = contextlib.nullcontext(str(artifact_path))
+    else:
+        state_context = tempfile.TemporaryDirectory(prefix="agents-provider-gate-state-")
+    with state_context as state_root:
         env = os.environ.copy()
         env["AGENT_CROSSBAR_STATE_DIR"] = state_root
         env["AGENT_CROSSBAR_CLIENT_NAME"] = "provider-surface-gate"
+        env["AGENT_CROSSBAR_SKIP_PROFILES"] = "reasonix"
 
         params = _server_params(env)
         failed = False
@@ -868,7 +965,12 @@ async def _run_cases(
                                 )
                                 failed = True
                                 continue
-                            result = await _run_dev_case(session, case, cwd)
+                            result = await _run_dev_case(
+                                session,
+                                case,
+                                cwd,
+                                artifact_dir=artifact_path,
+                            )
                     else:
                         result = await _run_ask_case(session, case)
                     print(result.message)
@@ -918,6 +1020,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--max-runtime-sec", type=int, default=DEFAULT_MAX_RUNTIME_SEC)
     parser.add_argument(
+        "--artifact-dir",
+        help="Retain the Agents MCP state/results under this directory for independent review.",
+    )
+    parser.add_argument(
         "--chatgpt-lifecycle",
         action="store_true",
         help=(
@@ -966,9 +1072,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     cases = _cases_from_args(args)
+    if any(case.profile.casefold() in {"reasonix", "deepseek"} for case in cases):
+        print(
+            "Reasonix live gates are disabled; use OpenCode Go opencode-go/* instead.",
+            file=sys.stderr,
+        )
+        return 2
     if args.chatgpt_lifecycle:
-        return anyio.run(_run_cases, cases, True, args.all_supported_tools)
-    return anyio.run(_run_cases, cases, False, args.all_supported_tools)
+        return anyio.run(_run_cases, cases, True, args.all_supported_tools, args.artifact_dir)
+    return anyio.run(_run_cases, cases, False, args.all_supported_tools, args.artifact_dir)
 
 
 if __name__ == "__main__":

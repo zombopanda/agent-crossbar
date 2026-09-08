@@ -284,7 +284,10 @@ class _OneShotClient:
         )
         if not isinstance(command, str) or not command.strip():
             return False
-        if any(marker in command for marker in (";", "&&", "||", "|", ">", "<", "`")):
+        if any(
+            marker in command
+            for marker in (";", "&&", "||", "|", ">", "<", "`", "&", "\n", "\r", "$", "\\")
+        ):
             return False
         try:
             tokens = shlex.split(command)
@@ -292,10 +295,18 @@ class _OneShotClient:
             return False
         if not tokens:
             return False
-        executable = Path(tokens[0]).name
-        if executable not in _SAFE_EXECUTABLES:
-            return False
-        if tokens[0].startswith("/") and str(Path(tokens[0]).parent) not in _SYSTEM_COMMAND_ROOTS:
+        executable_token = tokens[0]
+        executable = Path(executable_token).name
+        # Only the bare allowlisted executable or its canonical system path is
+        # valid. ``./ls`` must not be normalized into ``ls`` because an
+        # attacker could replace that path inside the workspace.
+        bare_executable = executable_token in _SAFE_EXECUTABLES
+        system_executable = (
+            executable_token.startswith("/")
+            and str(Path(executable_token).parent) in _SYSTEM_COMMAND_ROOTS
+            and executable in _SAFE_EXECUTABLES
+        )
+        if not (bare_executable or system_executable):
             return False
 
         args = raw_input.get("args", raw_input.get("arguments", raw_input.get("argv")))
@@ -315,6 +326,8 @@ class _OneShotClient:
                 if token == "--":
                     end_of_flags = True
                     continue
+                if token in {"&", ";", "&&", "||", "|"}:
+                    return False
                 if not end_of_flags and token in _SAFE_LS_LONG_FLAGS:
                     continue
                 if not end_of_flags and token.startswith("-"):
@@ -526,7 +539,10 @@ async def run_acp_prompt(
     effort: str | None = None,
     mode: str | None = None,
     startup_timeout: float = 30.0,
+    startup_lock: threading.Lock | None = None,
+    before_process_start: Callable[[], None] | None = None,
     on_process_start: Callable[[int], None] | None = None,
+    before_prompt: Callable[[], None] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
     on_execution_heartbeat: Callable[[dict[str, Any]], None] | None = None,
 ) -> AcpResult:
@@ -570,6 +586,8 @@ async def run_acp_prompt(
             mode leave this mechanism unused.
         startup_timeout: Maximum seconds for initialize, session creation,
             and model selection before the job fails as a startup timeout.
+        before_prompt: Optional final cancellation/status fence after ACP
+            startup and before sending the provider prompt.
         on_process_start: Optional callback receiving the child PID.
         on_text_delta: Optional callback receiving each assistant text chunk.
             Observer failures are logged and never interrupt the provider run.
@@ -598,7 +616,22 @@ async def run_acp_prompt(
     )
 
     async def _run() -> AcpResult:
+        # The fence itself is synchronous, so use the optional lock only while
+        # checking it.  Never hold a threading.Lock across the awaited process
+        # context manager: a synchronous stop can run on this same event loop
+        # and must be able to record cancellation while startup is pending.
+        def _check_before_process_start() -> None:
+            if startup_lock is not None:
+                startup_lock.acquire()
+            try:
+                if before_process_start is not None:
+                    before_process_start()
+            finally:
+                if startup_lock is not None:
+                    startup_lock.release()
+
         try:
+            _check_before_process_start()
             async with spawn_agent_process(
                 client_impl,
                 provider_command[0],
@@ -793,6 +826,8 @@ async def run_acp_prompt(
                     session_id = await prepare_task
 
                     # 3. session/prompt
+                    if before_prompt is not None:
+                        before_prompt()
                     client_impl.prompt_sent = True
                     prompt_started_at = time.monotonic()
                     client_impl.last_protocol_activity_at = prompt_started_at
@@ -896,6 +931,8 @@ async def run_acp_prompt(
                     stop_reason=stop_reason,
                     session_id=session_id,
                 )
+        except asyncio.CancelledError:
+            raise
         except FileNotFoundError as exc:
             raise AcpLaunchError(f"Provider binary not found: {provider_command[0]}") from exc
         except AcpError:

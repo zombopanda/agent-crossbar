@@ -203,6 +203,41 @@ def test_reasonix_print_runner_uses_run_with_config_and_model():
     ]
 
 
+def test_reasonix_launch_plan_preserves_qualified_model_id():
+    """The live qualified model id (<provider>/<model>) must flow unchanged
+    into the reasonix launch argv — the validated plan is what gets executed."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return _completed("DEEPSEEK_OK\n")
+
+    result = run_print_request(
+        {
+            "profile": "reasonix",
+            "operation": "review",
+            "transport": "print",
+            "prompt": "review this",
+            "model": "deepseek-flash/deepseek-v4-flash",
+        },
+        run=fake_run,
+    )
+
+    assert result["ok"] is True
+    assert result["selected_candidate"] == "reasonix deepseek-flash/deepseek-v4-flash"
+    assert calls == [
+        [
+            "reasonix",
+            "run",
+            "-m",
+            "deepseek-flash/deepseek-v4-flash",
+            "--effort",
+            "high",
+            "review this",
+        ]
+    ]
+
+
 def test_reasonix_dev_print_runner_uses_high_effort_run_with_config():
     calls: list[list[str]] = []
     envs: list[dict[str, str]] = []
@@ -4423,3 +4458,26 @@ def test_generating_flag_cleared_after_turn(tmp_path, monkeypatch):
         "nonce",
     )
     assert runner_module._chatgpt_turn_generating.is_set() is False
+
+
+def test_opencode_print_fallback_forwards_explicit_effort():
+    seen: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["input"] = kwargs.get("input")
+        return _completed("OK\n")
+
+    result = run_print_request(
+        {
+            "profile": "opencode",
+            "operation": "review",
+            "transport": "print",
+            "prompt": "review",
+            "model": "glm-5.2",
+            "effort": "high",
+        },
+        run=fake_run,
+    )
+    assert result["ok"] is True
+    assert seen["args"] == ["opencode", "run", "-m", "opencode-go/glm-5.2", "--effort", "high"]

@@ -29,6 +29,7 @@ _AGE_RECONCILABLE_OWNERS = frozenset({"pending_dev", "local", "root_integration"
 _ROOT_INTEGRATION_STALE_AFTER_SEC = 900.0
 _JOB_ID_RE = re.compile(r"^[0-9]{8,}-[a-zA-Z0-9_-]+$")
 RECOVERY_ACKNOWLEDGEMENT = "recover-missing-or-corrupt-job"
+RECOVERY_CLEANUP_ACKNOWLEDGEMENT = "recover-cleanup-pending-after-audit"
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -53,13 +54,22 @@ class WriterLeaseResult:
     error: str | None = None
     message: str | None = None
     age_sec: int | None = None
+    session_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "ok": self.ok,
             "canonical_cwd": self.canonical_cwd,
         }
-        for key in ("token", "owner_id", "owner_kind", "error", "message", "age_sec"):
+        for key in (
+            "token",
+            "owner_id",
+            "owner_kind",
+            "error",
+            "message",
+            "age_sec",
+            "session_id",
+        ):
             value = getattr(self, key)
             if value is not None:
                 result[key] = value
@@ -157,6 +167,8 @@ class WriterLeaseStore:
         # can overlap the still-uncollected stop lifecycle.
         result_path = job_dir / "result.json"
         if meta.get("status") in _TERMINAL_STATUSES and result_path.is_file():
+            if meta.get("cleanup_pending") is True:
+                return "terminal_cleanup_pending"
             return "terminal"
         return "nonterminal"
 
@@ -235,6 +247,7 @@ class WriterLeaseStore:
         *,
         owner_id: str,
         owner_kind: str = "external_job",
+        session_id: str | None = None,
     ) -> WriterLeaseResult:
         """Atomically acquire the lease or return a stable ``writer_busy`` error."""
         identity = canonical_cwd(cwd)
@@ -257,6 +270,29 @@ class WriterLeaseStore:
                     ),
                 )
             if current is not None:
+                current_identity = current.get("canonical_cwd")
+                if not isinstance(current_identity, str) or not current_identity.strip():
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        error="writer_lease_corrupt",
+                        message="writer lease has no trusted workspace identity",
+                    )
+                try:
+                    if canonical_cwd(current_identity) != current_identity:
+                        return WriterLeaseResult(
+                            ok=False,
+                            canonical_cwd=identity,
+                            error="writer_lease_corrupt",
+                            message="writer lease has a noncanonical workspace identity",
+                        )
+                except (OSError, RuntimeError, TypeError):
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        error="writer_lease_corrupt",
+                        message="writer lease has an invalid workspace identity",
+                    )
                 try:
                     age_sec = max(0, int(time.time() - path.stat().st_mtime))
                 except OSError:
@@ -275,7 +311,68 @@ class WriterLeaseStore:
                         f"{current_kind} {current_owner}; wait for terminal release or stale "
                         "reconciliation"
                     ),
+                    session_id=str(current.get("session_id"))
+                    if current.get("session_id") is not None
+                    else None,
                 )
+            # A lease for /repo covers /repo/src and vice versa. Hashing only
+            # the exact cwd allowed nested writers to overlap and corrupt the
+            # same checkout. Sibling worktrees remain independent.
+            requested_path = Path(identity)
+            for existing_path in self.leases_root.glob("*.json"):
+                payload = self._read(existing_path)
+                if payload is None:
+                    # A corrupt lease cannot prove its scope or owner. Keep
+                    # acquisition fail-closed until an operator recovers it.
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        error="writer_lease_corrupt",
+                        message="an existing writer lease is unreadable; recover it before retrying",
+                    )
+                raw_identity = payload.get("canonical_cwd")
+                if not isinstance(raw_identity, str) or not raw_identity.strip():
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        error="writer_lease_corrupt",
+                        message="an existing writer lease has no trusted workspace identity",
+                    )
+                try:
+                    if canonical_cwd(raw_identity) != raw_identity:
+                        return WriterLeaseResult(
+                            ok=False,
+                            canonical_cwd=identity,
+                            error="writer_lease_corrupt",
+                            message="an existing writer lease has a noncanonical workspace identity",
+                        )
+                except (OSError, RuntimeError, TypeError):
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        error="writer_lease_corrupt",
+                        message="an existing writer lease has an invalid workspace identity",
+                    )
+                existing = Path(raw_identity)
+                if (
+                    existing == requested_path
+                    or existing in requested_path.parents
+                    or requested_path in existing.parents
+                ):
+                    return WriterLeaseResult(
+                        ok=False,
+                        canonical_cwd=identity,
+                        owner_id=str(payload.get("owner_id") or "unknown"),
+                        owner_kind=str(payload.get("owner_kind") or "unknown"),
+                        error="writer_busy",
+                        message=(
+                            f"development writer lease overlaps canonical cwd {identity} "
+                            f"held for {raw_identity}"
+                        ),
+                        session_id=str(payload.get("session_id"))
+                        if payload.get("session_id") is not None
+                        else None,
+                    )
             token = uuid.uuid4().hex
             payload = {
                 "version": 1,
@@ -287,6 +384,8 @@ class WriterLeaseStore:
                 "acquired_at": self._now_iso(),
                 "heartbeat_at": self._now_iso(),
             }
+            if session_id:
+                payload["session_id"] = session_id
             self._write(path, payload)
             return WriterLeaseResult(
                 ok=True,
@@ -294,6 +393,7 @@ class WriterLeaseStore:
                 token=token,
                 owner_id=owner_id,
                 owner_kind=owner_kind,
+                session_id=session_id,
             )
 
     def attach(self, token: str, *, job_id: str) -> bool:
@@ -326,12 +426,19 @@ class WriterLeaseStore:
         """
         identity = canonical_cwd(cwd)
         path = self.lease_path(identity)
-        if acknowledgement != RECOVERY_ACKNOWLEDGEMENT:
+        if acknowledgement not in {
+            RECOVERY_ACKNOWLEDGEMENT,
+            RECOVERY_CLEANUP_ACKNOWLEDGEMENT,
+        }:
             return WriterLeaseResult(
                 ok=False,
                 canonical_cwd=identity,
                 error="writer_recovery_confirmation_required",
-                message=f"pass acknowledgement={RECOVERY_ACKNOWLEDGEMENT!r} explicitly",
+                message=(
+                    "pass an explicit recovery acknowledgement: "
+                    f"{RECOVERY_ACKNOWLEDGEMENT!r} or "
+                    f"{RECOVERY_CLEANUP_ACKNOWLEDGEMENT!r}"
+                ),
             )
         with self._locked():
             payload = self._read(path)
@@ -350,7 +457,10 @@ class WriterLeaseStore:
                     message="only an external lease with a missing or corrupt job may be recovered",
                 )
             state = self._external_job_state(self.state_root, payload)
-            if state not in {"missing", "corrupt"}:
+            allowed_states = {"missing", "corrupt"}
+            if acknowledgement == RECOVERY_CLEANUP_ACKNOWLEDGEMENT:
+                allowed_states.add("terminal_cleanup_pending")
+            if state not in allowed_states:
                 return WriterLeaseResult(
                     ok=False,
                     canonical_cwd=identity,

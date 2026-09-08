@@ -1,6 +1,11 @@
 import asyncio
+import json
+import os
+import subprocess
+import sys
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -178,6 +183,129 @@ def _spawn(conn, state):
     return _ctx
 
 
+def test_cancel_during_async_startup_does_not_deadlock_event_loop():
+    """A synchronous stop must not wait on ACP's awaited startup context.
+
+    This runs the interleaving in a bounded child process because the old
+    implementation synchronously blocked the event loop while holding
+    ``startup_lock``.  An ``asyncio.wait_for`` in this process could not
+    observe that deadlock or clean it up.
+    """
+    script = r"""
+import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from agent_crossbar.acp_client import AcpProtocolError, run_acp_prompt
+from agent_crossbar.run_handles import RunHandle
+
+
+class Connection:
+    def __init__(self):
+        self.prompt_called = False
+
+    async def initialize(self, protocol_version, **_kwargs):
+        return SimpleNamespace(protocol_version=protocol_version)
+
+    async def new_session(self, **_kwargs):
+        option = SimpleNamespace(
+            category="model",
+            id="model",
+            current_value="model",
+            options=[SimpleNamespace(value="model")],
+        )
+        return SimpleNamespace(session_id="startup-race", config_options=[option])
+
+    async def set_config_option(self, **_kwargs):
+        option = SimpleNamespace(
+            category="model",
+            id="model",
+            current_value="model",
+            options=[SimpleNamespace(value="model")],
+        )
+        return SimpleNamespace(config_options=[option])
+
+    async def prompt(self, **_kwargs):
+        self.prompt_called = True
+        return SimpleNamespace(stop_reason="end_turn")
+
+
+async def main():
+    connection = Connection()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    @asynccontextmanager
+    async def spawn(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        try:
+            yield connection, SimpleNamespace(pid=7001, stderr=None)
+        finally:
+            cleaned.set()
+
+    handle = RunHandle("startup-race")
+
+    def on_process_start(_pid):
+        if handle.cancelled:
+            raise AcpProtocolError("startup was cancelled", stage="prompt_delivery")
+
+    with patch("agent_crossbar.acp_client.spawn_agent_process", spawn):
+        task = asyncio.create_task(
+            run_acp_prompt(
+                ["fake"],
+                "safe",
+                "/tmp",
+                model="model",
+                startup_lock=handle.startup_lock,
+                on_process_start=on_process_start,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        started = time.monotonic()
+        cancellation = handle.cancel()
+        elapsed = time.monotonic() - started
+        release.set()
+        try:
+            await task
+        except AcpProtocolError:
+            pass
+        else:
+            raise AssertionError("cancelled startup reached provider prompt")
+
+    assert await asyncio.wait_for(cleaned.wait(), timeout=1.0) is True
+    print(json.dumps({
+        "cancel_requested": cancellation["cancel_requested"],
+        "elapsed": elapsed,
+        "prompt_called": connection.prompt_called,
+    }))
+
+
+asyncio.run(main())
+"""
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4.0,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result["cancel_requested"] is True
+    assert result["prompt_called"] is False
+    assert result["elapsed"] < 0.5
+
+
 # --- _run --------------------------------------------------------------
 
 
@@ -238,6 +366,22 @@ def test_edit_local_permits_local_coding_kinds(kind):
         )
     )
     _assert_selected(resp, "allow")
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["ls\nrm x", "ls & touch x", "ls; rm x", "./ls", "../ls"],
+)
+def test_edit_local_rejects_shell_composition_and_path_confusion(command):
+    client = _OneShotClient(Autonomy.EDIT_LOCAL, cwd="/tmp")
+    resp = _run(
+        client.request_permission(
+            "s",
+            _call("execute", raw_input={"command": command}),
+            [_opt("allow", "allow_once"), _opt("reject", "reject_once")],
+        )
+    )
+    _assert_selected(resp, "reject")
 
 
 @pytest.mark.parametrize("kind", ["switch_mode", "other", None])

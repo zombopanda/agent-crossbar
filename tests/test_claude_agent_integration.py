@@ -909,6 +909,68 @@ def test_monitor_blocked_noninteractive_produces_execution_failure(
     assert final["summary"] == "needs approval"
 
 
+def test_monitor_does_not_cancel_startup_block_without_prompt_evidence(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """A transient startup blocked state must not become a cancellation."""
+    blocked_without_prompt = RunResult(
+        0,
+        json.dumps(
+            [
+                {
+                    "id": "deadbeef",
+                    "sessionId": "deadbeef-native",
+                    "state": "blocked",
+                    "status": "running",
+                    "waitingFor": None,
+                    "cwd": "/repo",
+                    "startedAt": 1784739414928,
+                }
+            ]
+        ),
+        "",
+    )
+    runner = FakeRunner(
+        [
+            _auth_ok(),
+            _launch_ok("deadbeef"),
+            blocked_without_prompt,
+            _logs_ok("[Screen Reader Mode: on via flag]"),
+            _agents_entry("done", "deadbeef"),
+            _logs_ok("GPT_PRO_PROVIDER_GATE_OK"),
+        ]
+    )
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+    from agent_crossbar.agent_runner import monitor_agent_job
+
+    result = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
+        interactive=False,
+        client_name="test",
+    )
+    assert result.get("ok") is True, result
+    job_id = result["job_id"]
+
+    store = JobStore(claude_state_root)
+    import agent_crossbar.adapters.registry as reg
+
+    monitor_agent_job(store, job_id, reg.get_adapter("claude"), poll_interval_sec=0.01)
+
+    final = store.get_result(job_id)
+    assert final["status"] == "completed"
+    assert final["stop_reason"] == "done"
+    assert final["output"] == "GPT_PRO_PROVIDER_GATE_OK"
+    event_types = [event["type"] for event in store.get_job(job_id).events.read_since(0)]
+    assert "blocked_unconfirmed" in event_types
+    assert "blocked" not in event_types
+    assert not any("cancel" in str(call["args"]).lower() for call in runner.calls)
+
+
 def test_monitor_claude_limit_is_actionable_and_never_returns_raw_tui(
     claude_state_root: Path, monkeypatch, suppress_background_monitor
 ):

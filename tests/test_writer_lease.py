@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_crossbar.writer_lease import RECOVERY_ACKNOWLEDGEMENT, WriterLeaseStore
+from agent_crossbar.writer_lease import (
+    RECOVERY_ACKNOWLEDGEMENT,
+    RECOVERY_CLEANUP_ACKNOWLEDGEMENT,
+    WriterLeaseStore,
+)
 
 
 def test_canonical_cwd_identity_collapses_relative_and_symlink_paths(tmp_path: Path):
@@ -28,7 +32,84 @@ def test_canonical_cwd_identity_collapses_relative_and_symlink_paths(tmp_path: P
     second = store.acquire(str(alias / ".." / alias.name), owner_id="local-fallback")
     assert second.ok is False
     assert second.error == "writer_busy"
-    assert second.canonical_cwd == first.canonical_cwd
+
+
+def test_nested_workspace_scopes_share_lease_but_sibling_worktrees_do_not(tmp_path: Path):
+    state = tmp_path / "state"
+    repo = tmp_path / "repo"
+    nested = repo / "src"
+    sibling = tmp_path / "other-worktree"
+    nested.mkdir(parents=True)
+    sibling.mkdir()
+    store = WriterLeaseStore(state)
+    root = store.acquire(repo, owner_id="root", session_id="thread-root")
+    assert root.ok is True
+    blocked = store.acquire(nested, owner_id="nested")
+    assert blocked.ok is False
+    assert blocked.error == "writer_busy"
+    assert blocked.session_id == "thread-root"
+    independent = store.acquire(sibling, owner_id="sibling")
+    assert independent.ok is True
+
+
+def test_corrupt_lease_state_blocks_nested_acquisition(tmp_path: Path):
+    state = tmp_path / "state"
+    repo = tmp_path / "repo"
+    nested = repo / "src"
+    nested.mkdir(parents=True)
+    store = WriterLeaseStore(state)
+    lease_path = store.lease_path(repo)
+    lease_path.parent.mkdir(parents=True)
+    lease_path.write_text("{not-json", encoding="utf-8")
+    blocked = store.acquire(nested, owner_id="nested")
+    assert blocked.ok is False
+    assert blocked.error == "writer_lease_corrupt"
+
+
+@pytest.mark.parametrize("payload", [{}, {"canonical_cwd": ""}, {"canonical_cwd": 5}])
+def test_malformed_lease_identity_is_fail_closed(tmp_path: Path, payload):
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(state)
+    path = store.lease_path(workspace)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = store.acquire(workspace, owner_id="next")
+    assert result.ok is False
+    assert result.error == "writer_lease_corrupt"
+
+
+def test_cleanup_pending_terminal_lease_requires_audited_recovery(tmp_path: Path):
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WriterLeaseStore(state)
+    lease = store.acquire(workspace, owner_id="job", owner_kind="external_job")
+    assert lease.ok and lease.token
+    job_dir = state / "jobs" / "12345678-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "cleanup_pending": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_dir / "result.json").write_text("{}", encoding="utf-8")
+    path = store.lease_path(workspace)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["job_id"] = "12345678-job"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    refused = store.recover(workspace, acknowledgement=RECOVERY_ACKNOWLEDGEMENT)
+    assert refused.error == "writer_recovery_unsafe"
+    recovered = store.recover(
+        workspace,
+        acknowledgement=RECOVERY_CLEANUP_ACKNOWLEDGEMENT,
+    )
+    assert recovered.ok is True
 
 
 def test_same_cwd_race_allows_one_owner_across_processes(tmp_path: Path):

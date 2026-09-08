@@ -33,6 +33,13 @@ class RunHandle:
         self.job_id = job_id
         self.cancel_event = cancel_event or threading.Event()
         self.on_cancel = on_cancel
+        # ACP uses this worker-owned lock for its synchronous final startup
+        # fence.  Cancellation must never acquire it: the worker can be
+        # awaiting provider startup while this caller runs on the same
+        # asyncio event loop.  The cancel event and durable job status are the
+        # cross-thread fence; the worker re-checks both before recording a
+        # process identity and before sending a prompt.
+        self.startup_lock = threading.Lock()
         self._lock = threading.Lock()
         self._cancel_data: dict[str, Any] | None = None
 
@@ -47,6 +54,10 @@ class RunHandle:
                 data = dict(self._cancel_data)
                 data["repeated"] = True
                 return data
+            # Never wait for startup_lock here.  ACP holds that synchronous
+            # lock while its async process context is starting; acquiring it
+            # from this synchronous stop path would freeze the event loop and
+            # prevent startup from reaching its cancellation fence.
             self.cancel_event.set()
             data = {"cancel_requested": True, "repeated": False}
             if self.on_cancel is not None:
@@ -97,11 +108,24 @@ class RunHandleRegistry:
         with self._lock:
             return self._handles.get(job_id)
 
-    def cancel(self, job_id: str) -> dict[str, Any] | None:
-        """Cancel *job_id* if a handle exists.  Returns bounded stop metadata."""
+    def cancel(self, job_id: str, *, preserve: bool = False) -> dict[str, Any] | None:
+        """Cancel a handle, optionally preserving a pre-start cancellation."""
         handle = self.get(job_id)
         if handle is None:
-            return None
+            if not preserve:
+                return None
+            # Preserve a pre-start stop so a worker registering after the
+            # durable stop inherits the cancellation event.  Mark cleanup as
+            # unconfirmed: no provider identity was observed yet.
+            handle = self.register(job_id)
+            data = handle.cancel()
+            data.update(
+                {
+                    "provider_stop": "requested",
+                    "provider_stop_confirmed": False,
+                }
+            )
+            return data
         return handle.cancel()
 
     def is_cancelled(self, job_id: str) -> bool:

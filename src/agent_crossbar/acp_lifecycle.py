@@ -25,6 +25,28 @@ class SubprocessRunner(Protocol):
     def run(self, args, *, timeout=None, cwd=None, env=None) -> Any: ...
 
 
+_ACP_READINESS_PROBES = {
+    "codex": "check_codex_acp_readiness",
+    "opencode": "check_opencode_acp_readiness",
+}
+
+
+def check_acp_readiness(profile: str, runner: SubprocessRunner) -> dict:
+    """Dispatch an ACP readiness probe through the adapter-owned registry."""
+    try:
+        probe_name = _ACP_READINESS_PROBES[profile]
+        probe = globals()[probe_name]
+    except KeyError:
+        return {
+            "ready": False,
+            "state": "unsupported",
+            "error_code": "acp_profile_unsupported",
+            "remediation": f"No ACP readiness probe is registered for '{profile}'.",
+            "version": None,
+        }
+    return probe(runner)
+
+
 def _parse_version(output: str):
     match = _VERSION_RE.search(output)
     if not match:

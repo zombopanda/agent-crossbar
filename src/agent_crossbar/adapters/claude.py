@@ -13,15 +13,29 @@ import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from ..profiles.claude import SUPPORT_TIER
+from ..subprocess_runner import LocalSubprocessRunner, RunResult, SubprocessRunner
 from .base import ModelCatalog, ModelInfo, StaticAdapter, normalize_effort
 from .claude_model_probe import (
     ClaudeModelProbe,
     PosixClaudeModelProbe,
     probe_to_catalog,
 )
+
+
+def _readiness_probe(runner=None):
+    from ..readiness import check_claude_readiness
+
+    return check_claude_readiness(runner)
+
+
+__all__ = [
+    "LocalSubprocessRunner",
+    "RunResult",
+    "SubprocessRunner",
+]
 
 CLAUDE_NATIVE_STATES = frozenset({"working", "blocked", "done", "failed", "stopped"})
 CLAUDE_EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high", "max": "max"}
@@ -78,47 +92,6 @@ _EMPTY_MCP_CONFIG = json.dumps({"mcpServers": {}}, separators=(",", ":"))
 _DIRECT_WORKSPACE_SETTINGS = json.dumps(
     {"worktree": {"bgIsolation": "none"}}, separators=(",", ":")
 )
-
-
-@dataclass(frozen=True)
-class RunResult:
-    returncode: int
-    stdout: str
-    stderr: str
-
-
-class SubprocessRunner(Protocol):
-    def run(
-        self,
-        args: list[str],
-        *,
-        timeout: float | None = None,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-    ) -> RunResult: ...
-
-
-class LocalSubprocessRunner:
-    """Production runner with an argv-only subprocess boundary."""
-
-    def run(
-        self,
-        args: list[str],
-        *,
-        timeout: float | None = None,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-    ) -> RunResult:
-        completed = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=cwd,
-            env=env,
-            check=False,
-        )
-        return RunResult(completed.returncode, completed.stdout, completed.stderr)
 
 
 @dataclass(frozen=True)
@@ -456,6 +429,9 @@ class ClaudeAdapter(StaticAdapter):
             backend="claude_bg",
             supports_interactive=True,
             effort_map=CLAUDE_EFFORT_MAP,
+            native_lifecycle=True,
+            live_model_discovery=True,
+            readiness_probe=_readiness_probe,
         )
 
     def discover_models(
@@ -556,6 +532,28 @@ class ClaudeAdapter(StaticAdapter):
             evidence=parsed["evidence"],
         )
 
+    def validate_effort(
+        self,
+        effort: str | None,
+        catalog: ModelCatalog | None,
+        model_id: str | None,
+    ) -> tuple[str | None, str | None, tuple[str, str] | None]:
+        """Validate Claude's public effort through the adapter boundary."""
+        if effort is None:
+            return None, None, None
+        try:
+            native = self.map_effort(effort)
+        except ValueError:
+            return (
+                None,
+                None,
+                (
+                    "invalid_effort",
+                    f"Effort '{effort}' is not supported for profile '{self.name}'",
+                ),
+            )
+        return effort, native, None
+
     def launch(
         self,
         runner: SubprocessRunner,
@@ -626,6 +624,19 @@ class ClaudeAdapter(StaticAdapter):
     def normalize_result(self, entry: dict[str, Any], logs: str) -> NormalizedResult:
         """Normalize a Claude agents entry + logs into a lifecycle result."""
         return normalize_claude_result(entry, logs)
+
+    def start_lifecycle(self, **kwargs: Any) -> dict[str, Any]:
+        """Adapter-owned entry point for the full job lifecycle (readiness,
+        launch, tmux attach, background polling).
+
+        The server detects lifecycle-owning adapters by duck-typing
+        ``check_readiness``/``launch`` and dispatches here instead of
+        importing a Claude-specific module directly, keeping the normal
+        request path provider-neutral.
+        """
+        from .claude_lifecycle import start_claude_job
+
+        return start_claude_job(adapter=self, **kwargs)
 
 
 adapter = ClaudeAdapter()

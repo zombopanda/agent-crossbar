@@ -14,7 +14,7 @@ def _tmux_dev_plan(profile: str):
         operation="dev",
         transport="tmux",
         prompt="Smoke only. Reply READY.",
-        model="deepseek-v4-flash" if profile == "reasonix" else None,
+        model="deepseek-flash/deepseek-v4-flash" if profile == "reasonix" else None,
         cwd="/repo",
         job_dir="/state/jobs/12345678-job",
     )
@@ -45,7 +45,7 @@ def _assert_interactive_tmux_candidate(profile: str, args: list[str]) -> None:
 
 def test_reasonix_rejects_invalid_model():
     result = build_launch_plan(
-        profile="reasonix", operation="review", transport="print", prompt="x", model="gpt-4"
+        profile="reasonix", operation="review", transport="print", prompt="x", model="bad model"
     )
     assert result.error == "invalid_model"
 
@@ -104,7 +104,7 @@ def test_reasonix_tmux_non_dev_includes_isolation_flags():
         operation="advice",
         transport="tmux",
         prompt="hello",
-        model="deepseek-v4-flash",
+        model="deepseek-flash/deepseek-v4-flash",
         job_dir="/tmp/jobs/gate-abc123",
     )
     assert not plan.error, plan.message

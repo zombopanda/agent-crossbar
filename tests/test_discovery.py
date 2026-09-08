@@ -6,7 +6,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -24,8 +24,10 @@ from agent_crossbar.discovery import (
     _compact_model_info,
     _compact_model_info_with_fallback,
     _dict_to_catalog,
+    _fetch_reasonix,
     _get_cli_version,
     _group_model_info_by_provider,
+    _parse_reasonix_doctor_providers,
     build_profile_health_entry,
     cached_models_for_listing,
     cached_profile_health_entry,
@@ -545,7 +547,7 @@ def test_profile_health_codex_live_shape(tmp_path: Path) -> None:
         assert entry["name"] == "codex"
         assert entry["runtime_checked"] is True
         assert entry["discovery_available"] is True
-        assert entry["default_model"] == "gpt-5.6-sol"
+        assert "default_model" not in entry
         assert entry["native_efforts"] == ["low", "medium", "high", "xhigh"]
         # plain (no "/") ids group under the "" provider key
         assert list(entry["model_info"].keys()) == [""]
@@ -599,7 +601,7 @@ def test_profile_health_claude_live_shape(tmp_path: Path) -> None:
         assert entry["name"] == "claude"
         assert entry["runtime_checked"] is True
         assert entry["discovery_available"] is True
-        assert entry["default_model"] == "claude-opus-4-8"
+        assert "default_model" not in entry
         assert entry["native_efforts"] == ["low", "medium", "high"]
         assert list(entry["model_info"].keys()) == [""]
         assert len(entry["model_info"][""]) == 4
@@ -610,13 +612,40 @@ def test_profile_health_claude_live_shape(tmp_path: Path) -> None:
         _disc._get_cli_version = _orig_version
 
 
-def test_profile_health_reasonix_returns_honest_unavailable(tmp_path: Path) -> None:
-    """Reasonix profile has discovery_available: False with honest error."""
-    catalog = discover_profile_models(tmp_path, "reasonix")
+def test_profile_health_reasonix_reflects_live_discovery_failure(tmp_path: Path) -> None:
+    """Reasonix is a discovery profile — a failed doctor probe surfaces an
+    honest error rather than a stale static model list."""
+    catalog = ModelCatalog(
+        models=(),
+        default_model=None,
+        native_efforts=(),
+        source="reasonix doctor --json",
+        error="reasonix doctor --json did not report any providers with models "
+        "(providers missing, malformed, or empty)",
+    )
     entry = build_profile_health_entry(tmp_path, "reasonix", catalog)
 
-    assert entry["discovery_available"] is False
-    assert "does not support live model discovery" in entry["error"]
+    assert entry["discovery_available"] is True
+    assert entry["runtime_checked"] is True
+    assert "did not report any providers with models" in entry["error"]
+
+
+def test_profile_health_reasonix_reflects_live_discovery_success(tmp_path: Path) -> None:
+    """A proven doctor probe advertises qualified, deduplicated per-provider models."""
+    catalog = ModelCatalog(
+        models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"),
+        default_model="deepseek-flash/deepseek-v4-flash",
+        native_efforts=(),
+        source="reasonix doctor --json",
+    )
+    entry = build_profile_health_entry(tmp_path, "reasonix", catalog)
+
+    assert entry["discovery_available"] is True
+    assert entry["error"] is None
+    assert entry["model_info"] == {
+        "deepseek-flash": [{"id": "deepseek-v4-flash"}],
+        "deepseek-pro": [{"id": "deepseek-v4-pro"}],
+    }
 
 
 def test_profile_health_chatgpt_pro_returns_honest_unavailable(tmp_path: Path) -> None:
@@ -913,7 +942,7 @@ def test_codex_discover_models_error_catalog() -> None:
 
 
 def test_discovery_profiles_set() -> None:
-    assert _PROFILES_WITH_DISCOVERY == {"codex", "opencode", "claude"}
+    assert _PROFILES_WITH_DISCOVERY == {"codex", "opencode", "claude", "reasonix"}
 
 
 # ── Claude adapter discover_models with fake probe ────────────────────────────
@@ -1079,9 +1108,9 @@ def test_validation_fails_when_codex_discovery_fails(tmp_path: Path) -> None:
 
 def test_get_cli_version_unknown_for_non_discovery_profiles() -> None:
     """Non-discovery profiles return 'unknown'; discovery profiles get real CLI version."""
-    assert _get_cli_version("reasonix") == "unknown"
-    # Claude is now a discovery profile — returns real version when claude is installed,
-    # or "unknown" when not.  Don't assert a fixed value.
+    assert _get_cli_version("chatgpt_pro") == "unknown"
+    # Claude and Reasonix are discovery profiles — return real version when
+    # installed, or "unknown" when not. Don't assert a fixed value.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2481,6 +2510,99 @@ def test_opencode_preflight_discovers_on_first_call(tmp_path):
         assert args[1] == "opencode"
 
 
+def test_opencode_preflight_rejects_ambiguous_short_name(tmp_path):
+    """A short name matching more than one discovered provider must be
+    rejected rather than silently resolved to whichever provider comes
+    first in the catalog — that would launch a different model than the
+    caller expects."""
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.validation import validate_start_request
+
+    catalog = _make_catalog(
+        models=["opencode-go/glm-5.2", "other-provider/glm-5.2"],
+        default_model="opencode-go/glm-5.2",
+        cache_hit=False,
+    )
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        req = {
+            "operation": "review",
+            "profile": "opencode",
+            "transport": "print",
+            "autonomy": "read_only",
+            "external_context": "allowed",
+            "sensitivity": "normal",
+            "prompt": "x",
+            "model": "glm-5.2",  # short name — ambiguous across two providers
+        }
+        result = validate_start_request(req, state_root=tmp_path)
+
+        assert result["ok"] is False
+        assert result["error"] == "ambiguous_model"
+        assert result["job_created"] is False
+        assert "opencode-go/glm-5.2" in result["message"]
+        assert "other-provider/glm-5.2" in result["message"]
+
+
+def test_opencode_preflight_unique_short_name_still_normalizes(tmp_path):
+    """Regression guard for the ambiguity fix above: a short name that
+    matches exactly one provider must keep resolving as before."""
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.validation import validate_start_request
+
+    catalog = _make_catalog(
+        models=["opencode-go/glm-5.2", "other-provider/kimi-k2.7-code"],
+        default_model="opencode-go/glm-5.2",
+        cache_hit=False,
+    )
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        req = {
+            "operation": "review",
+            "profile": "opencode",
+            "transport": "print",
+            "autonomy": "read_only",
+            "external_context": "allowed",
+            "sensitivity": "normal",
+            "prompt": "x",
+            "model": "glm-5.2",  # short name — matches exactly one provider
+        }
+        result = validate_start_request(req, state_root=tmp_path)
+
+        assert result["ok"] is True
+        assert result["model"] == "opencode-go/glm-5.2"
+
+
+def test_opencode_preflight_explicit_qualified_id_bypasses_ambiguity_check(tmp_path):
+    """An explicit, fully qualified id that matches a catalog entry exactly
+    must be accepted as-is even when its short name is otherwise ambiguous —
+    the ambiguity check only applies to the short-name expansion branch."""
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.validation import validate_start_request
+
+    catalog = _make_catalog(
+        models=["opencode-go/glm-5.2", "other-provider/glm-5.2"],
+        default_model="opencode-go/glm-5.2",
+        cache_hit=False,
+    )
+
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        req = {
+            "operation": "review",
+            "profile": "opencode",
+            "transport": "print",
+            "autonomy": "read_only",
+            "external_context": "allowed",
+            "sensitivity": "normal",
+            "prompt": "x",
+            "model": "other-provider/glm-5.2",  # fully qualified — no ambiguity
+        }
+        result = validate_start_request(req, state_root=tmp_path)
+
+        assert result["ok"] is True
+        assert result["model"] == "other-provider/glm-5.2"
+
+
 def test_opencode_preflight_uses_cache_path(tmp_path):
     """When cache is fresh, discover_profile_models returns cache_hit=True.
     Validation must still resolve models correctly from cached data."""
@@ -2626,8 +2748,8 @@ def test_cached_models_for_listing_falls_back_when_probe_fails(tmp_path: Path) -
         models, default_model = cached_models_for_listing(
             tmp_path, "codex", ["gpt-5.6-sol", "gpt-5.6-terra"], "gpt-5.6-sol"
         )
-    assert models == ["gpt-5.6-sol", "gpt-5.6-terra"]
-    assert default_model == "gpt-5.6-sol"
+    assert models == []
+    assert default_model is None
 
 
 def test_cached_models_for_listing_uses_fresh_cache(tmp_path: Path) -> None:
@@ -2672,19 +2794,17 @@ def test_cached_models_for_listing_falls_back_on_cached_error(tmp_path: Path) ->
         models, default_model = cached_models_for_listing(
             tmp_path, "codex", ["gpt-5.6-sol", "gpt-5.6-terra"], "gpt-5.6-sol"
         )
-        assert models == ["gpt-5.6-sol", "gpt-5.6-terra"]
-        assert default_model == "gpt-5.6-sol"
+        assert models == []
+        assert default_model is None
     finally:
         _disc._get_cli_version = _orig_version
 
 
 def test_cached_models_for_listing_ignores_non_discovery_profiles(tmp_path: Path) -> None:
-    """reasonix/chatgpt_pro are not live-discovery profiles — always static."""
-    models, default_model = cached_models_for_listing(
-        tmp_path, "reasonix", ["deepseek-v4-flash", "deepseek-v4-pro"], "deepseek-v4-flash"
-    )
-    assert models == ["deepseek-v4-flash", "deepseek-v4-pro"]
-    assert default_model == "deepseek-v4-flash"
+    """chatgpt_pro is not a live-discovery profile — always its static fallback."""
+    models, default_model = cached_models_for_listing(tmp_path, "chatgpt_pro", ["manual"], "manual")
+    assert models == ["manual"]
+    assert default_model == "manual"
 
 
 def test_live_profile_registry_overlays_discovered_models(tmp_path: Path) -> None:
@@ -2707,14 +2827,10 @@ def test_live_profile_registry_overlays_discovered_models(tmp_path: Path) -> Non
 
     assert registry["opencode"]["models"] == ["opencode-go/live-model"]
     assert "default_model" not in registry["opencode"]  # removed from public API
-    # codex/claude probes failed → static fallback preserved
-    from agent_crossbar.profiles import profile_registry
-
-    static = profile_registry()
-    assert registry["codex"]["models"] == static["codex"]["models"]
-    assert registry["claude"]["models"] == static["claude"]["models"]
-    # Untouched non-discovery profiles keep their static values
-    assert registry["reasonix"]["models"] == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    # codex/claude/reasonix probes failed → no unverifiable models advertised
+    assert registry["codex"]["models"] == []
+    assert registry["claude"]["models"] == []
+    assert registry["reasonix"]["models"] == []
     # Schema stays minimal — no new keys introduced
     allowed = {"aliases", "models", "operations", "interactive", "support_tier"}
     for entry in registry.values():
@@ -2722,16 +2838,45 @@ def test_live_profile_registry_overlays_discovered_models(tmp_path: Path) -> Non
 
 
 def test_live_profile_registry_falls_back_when_discovery_fails(tmp_path: Path) -> None:
-    """When every live probe fails, live_profile_registry matches the static registry."""
+    """When every live probe fails, discovery-capable profiles surface an
+    empty model list — never their static registry entry."""
     import agent_crossbar.discovery as _disc
-    from agent_crossbar.profiles import profile_registry
 
     with patch.object(_disc, "discover_profile_models", side_effect=RuntimeError("boom")):
         registry = live_profile_registry(tmp_path)
 
-    static = profile_registry()
-    assert registry["codex"]["models"] == static["codex"]["models"]
-    assert registry["claude"]["models"] == static["claude"]["models"]
+    assert registry["codex"]["models"] == []
+    assert registry["claude"]["models"] == []
+    assert registry["reasonix"]["models"] == []
+
+
+def test_live_profile_registry_reasonix_never_advertises_static_models_on_failure(
+    tmp_path: Path,
+) -> None:
+    """Regression: profiles_list/live_profile_registry must not fall back to
+    the static REASONIX_MODELS allowlist when live doctor discovery fails —
+    that list backs validation only, never a live-discovery advertisement."""
+    import agent_crossbar.discovery as _disc
+    from agent_crossbar.profiles.reasonix import REASONIX_MODELS
+
+    def _fake_discover(state_root, profile, *, refresh=False):
+        if profile == "reasonix":
+            return ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source="reasonix doctor --json",
+                error="reasonix doctor --json did not report any providers with models "
+                "(providers missing, malformed, or empty)",
+            )
+        raise RuntimeError(f"no live {profile} probe in unit tests")
+
+    with patch.object(_disc, "discover_profile_models", side_effect=_fake_discover):
+        registry = live_profile_registry(tmp_path)
+
+    assert registry["reasonix"]["models"] == []
+    for static_model in REASONIX_MODELS:
+        assert static_model not in registry["reasonix"]["models"]
 
 
 # ── Task 4.2: cache-only profile_health model surfacing ─────────────────────
@@ -2786,10 +2931,278 @@ def test_cached_profile_health_entry_never_spawns_subprocess_for_discovery(tmp_p
 
 
 def test_cached_profile_health_entry_reasonix_honest_unavailable(tmp_path: Path) -> None:
-    """Non-discovery profiles keep the same honest 'unavailable' shape."""
-    entry = cached_profile_health_entry(tmp_path, "reasonix")
+    """Non-discovery profiles (chatgpt_pro) keep the honest 'unavailable' shape."""
+    entry = cached_profile_health_entry(tmp_path, "chatgpt_pro")
     assert entry["discovery_available"] is False
     assert "does not support live model discovery" in entry["error"]
+
+
+def _reasonix_doctor_payload(**overrides: Any) -> dict[str, Any]:
+    """The actual live `reasonix doctor --json` shape (v1.31.0)."""
+    payload: dict[str, Any] = {
+        "version": "v1.31.0",
+        "providers": [
+            {"name": "deepseek-flash", "models": ["deepseek-v4-flash"], "key_present": True},
+            {"name": "deepseek-pro", "models": ["deepseek-v4-pro"], "key_present": True},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestFetchReasonix:
+    """`_fetch_reasonix` against the actual `reasonix doctor --json` shape:
+    a top-level ``providers`` array of ``{name, models, key_present}``."""
+
+    def test_qualified_deduplicated_models_from_providers(self) -> None:
+        doctor_json = json.dumps(_reasonix_doctor_payload())
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == [
+            "deepseek-flash/deepseek-v4-flash",
+            "deepseek-pro/deepseek-v4-pro",
+        ]
+        assert data["default_model"] == "deepseek-flash/deepseek-v4-flash"
+        assert data["error"] is None
+        assert data["source"] == "reasonix doctor --json"
+
+    def test_duplicate_models_within_a_provider_are_deduplicated(self) -> None:
+        doctor_json = json.dumps(
+            _reasonix_doctor_payload(
+                providers=[
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash", "deepseek-v4-flash"],
+                        "key_present": True,
+                    },
+                ]
+            )
+        )
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == ["deepseek-flash/deepseek-v4-flash"]
+
+    def test_same_provider_repeated_across_entries_is_deduplicated(self) -> None:
+        """Two provider entries yielding the same qualified id collapse to one."""
+        doctor_json = json.dumps(
+            _reasonix_doctor_payload(
+                providers=[
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": True,
+                    },
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": False,
+                    },
+                ]
+            )
+        )
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == ["deepseek-flash/deepseek-v4-flash"]
+
+    def test_key_present_alone_never_proves_reachability_but_models_still_listed(self) -> None:
+        """key_present is a credential-configured flag, not a reachability proof —
+        discovery must not gate on it, and must not attach any 'verified' claim."""
+        doctor_json = json.dumps(
+            _reasonix_doctor_payload(
+                providers=[
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": True,
+                    },
+                    {"name": "deepseek-pro", "models": ["deepseek-v4-pro"], "key_present": False},
+                ]
+            )
+        )
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        # Both providers' models surface regardless of key_present — discovery
+        # only reports what the doctor listed, never a reachability verdict.
+        assert data["models"] == [
+            "deepseek-flash/deepseek-v4-flash",
+            "deepseek-pro/deepseek-v4-pro",
+        ]
+        assert "key_present" not in json.dumps(data)
+
+    def test_missing_providers_field_yields_no_models(self) -> None:
+        doctor_json = json.dumps({"version": "v1.31.0"})
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["default_model"] is None
+        assert data["error"] is not None
+
+    def test_providers_not_a_list_yields_no_models(self) -> None:
+        doctor_json = json.dumps({"providers": {"name": "deepseek-flash"}})
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["error"] is not None
+
+    def test_malformed_provider_entries_are_skipped_not_fatal(self) -> None:
+        """Fail closed per-entry: a malformed provider is dropped, valid
+        siblings still surface."""
+        doctor_json = json.dumps(
+            {
+                "providers": [
+                    "not-a-dict",
+                    {"models": ["deepseek-v4-orphan"]},  # missing name
+                    {"name": "", "models": ["deepseek-v4-blank-name"]},  # blank name
+                    {"name": "deepseek-pro", "models": "deepseek-v4-pro"},  # models not a list
+                    {"name": "deepseek-flash", "models": [123, "", "deepseek-v4-flash"]},
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": True,
+                    },
+                ]
+            }
+        )
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == ["deepseek-flash/deepseek-v4-flash"]
+        assert data["error"] is None
+
+    def test_all_malformed_providers_yields_honest_error_not_a_guess(self) -> None:
+        doctor_json = json.dumps(
+            {"providers": ["garbage", {"name": 42, "models": ["x"]}, {"name": "ok"}]}
+        )
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, doctor_json, "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["default_model"] is None
+        assert data["error"] is not None
+
+    def test_non_json_doctor_output_yields_honest_error(self) -> None:
+        runner = FakeDiscoveryProcess([DiscoveryRun(0, "not json", "")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["error"] is not None
+
+    def test_doctor_probe_exception_yields_honest_error_no_static_fallback(self) -> None:
+        runner = Mock()
+        runner.run.side_effect = FileNotFoundError("reasonix")
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["default_model"] is None
+        assert data["error"] is not None
+        # No static REASONIX_MODELS names leak into the failure payload.
+        from agent_crossbar.profiles.reasonix import REASONIX_MODELS
+
+        assert not any(m in json.dumps(data) for m in REASONIX_MODELS)
+
+    def test_nonzero_doctor_exit_yields_honest_error(self) -> None:
+        runner = FakeDiscoveryProcess([DiscoveryRun(1, "", "boom")])
+
+        data = _fetch_reasonix(runner)
+
+        assert data["models"] == []
+        assert data["error"] is not None
+
+
+class TestParseReasonixDoctorProviders:
+    def test_extracts_qualified_ids_preserving_provider_namespace(self) -> None:
+        assert _parse_reasonix_doctor_providers(_reasonix_doctor_payload()) == [
+            "deepseek-flash/deepseek-v4-flash",
+            "deepseek-pro/deepseek-v4-pro",
+        ]
+
+    def test_dedupes_within_and_across_providers(self) -> None:
+        payload = {
+            "providers": [
+                {
+                    "name": "deepseek-flash",
+                    "models": ["deepseek-v4-flash", "deepseek-v4-flash"],
+                    "key_present": True,
+                },
+                {
+                    "name": "deepseek-flash",
+                    "models": ["deepseek-v4-flash"],
+                    "key_present": True,
+                },
+            ]
+        }
+        assert _parse_reasonix_doctor_providers(payload) == ["deepseek-flash/deepseek-v4-flash"]
+
+    def test_missing_providers_key_yields_empty_list(self) -> None:
+        assert _parse_reasonix_doctor_providers({}) == []
+
+    def test_providers_wrong_type_yields_empty_list(self) -> None:
+        assert _parse_reasonix_doctor_providers({"providers": "deepseek-flash"}) == []
+
+    def test_non_dict_provider_entries_are_skipped(self) -> None:
+        payload = {"providers": [None, 42, "deepseek-flash", ["nested"]]}
+        assert _parse_reasonix_doctor_providers(payload) == []
+
+    def test_missing_or_blank_name_is_skipped(self) -> None:
+        payload = {
+            "providers": [
+                {"models": ["deepseek-v4-flash"]},
+                {"name": "", "models": ["deepseek-v4-flash"]},
+                {"name": "   ", "models": ["deepseek-v4-flash"]},
+                {"name": 7, "models": ["deepseek-v4-flash"]},
+            ]
+        }
+        assert _parse_reasonix_doctor_providers(payload) == []
+
+    def test_models_not_a_list_is_skipped(self) -> None:
+        payload = {"providers": [{"name": "deepseek-flash", "models": "deepseek-v4-flash"}]}
+        assert _parse_reasonix_doctor_providers(payload) == []
+
+    def test_non_string_or_blank_model_entries_are_skipped(self) -> None:
+        payload = {
+            "providers": [
+                {"name": "deepseek-flash", "models": [123, "", "   ", None, "deepseek-v4-flash"]}
+            ]
+        }
+        assert _parse_reasonix_doctor_providers(payload) == ["deepseek-flash/deepseek-v4-flash"]
+
+    def test_key_present_is_never_consulted(self) -> None:
+        """A provider with key_present False still contributes its models —
+        discovery is not a reachability/auth check."""
+        payload = {
+            "providers": [
+                {"name": "deepseek-pro", "models": ["deepseek-v4-pro"], "key_present": False}
+            ]
+        }
+        assert _parse_reasonix_doctor_providers(payload) == ["deepseek-pro/deepseek-v4-pro"]
+
+
+def test_cached_profile_health_entry_reasonix_no_cache_is_honest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reasonix is a discovery profile — same honest 'no cache yet' shape as codex/claude."""
+    monkeypatch.setattr("agent_crossbar.discovery._get_cli_version", lambda profile: "0.53.2")
+    entry = cached_profile_health_entry(tmp_path, "reasonix")
+    assert entry["discovery_available"] is True
+    assert entry["cache_hit"] is False
+    assert entry["model_info"] == {}
+    assert entry["error"] is not None
 
 
 # ── Bug: discovery fallback discards the actual failure ─────────────────────
@@ -2811,7 +3224,7 @@ def test_cached_models_for_listing_records_diagnostic_on_exception(tmp_path: Pat
             tmp_path, "codex", ["gpt-5.6-sol"], "gpt-5.6-sol"
         )
 
-    assert models == ["gpt-5.6-sol"]
+    assert models == []
     diagnostic = discovery_diagnostics.get("codex")
     assert diagnostic is not None
     assert "connection refused" in diagnostic

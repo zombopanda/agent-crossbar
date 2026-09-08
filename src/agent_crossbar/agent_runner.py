@@ -13,9 +13,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_crossbar.adapters.base import LifecycleAdapter
-from agent_crossbar.adapters.claude import LocalSubprocessRunner
 from agent_crossbar.adapters.claude_model_probe import strip_ansi
 from agent_crossbar.envelope import build_result_envelope, sanitize_diagnostic_text
+from agent_crossbar.run_handles import run_handles
+from agent_crossbar.subprocess_runner import LocalSubprocessRunner
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _PROVIDER_LIMIT_MARKERS = (
@@ -70,6 +71,21 @@ def _provider_auth_failure_detected(logs: str) -> bool:
     return any(marker in lowered for marker in _PROVIDER_AUTH_MARKERS)
 
 
+def _cancel_provider(
+    adapter: LifecycleAdapter, runner: LocalSubprocessRunner, session_id: str
+) -> dict[str, Any]:
+    """Request native cleanup and return bounded, truthful evidence."""
+    try:
+        confirmed = bool(adapter.cancel(runner, session_id))
+        return {"adapter_cancel_requested": True, "adapter_cancel_confirmed": confirmed}
+    except Exception as exc:
+        return {
+            "adapter_cancel_requested": True,
+            "adapter_cancel_confirmed": False,
+            "adapter_cancel_error": type(exc).__name__,
+        }
+
+
 def _count_lifecycle_events(store: Any, job_id: str) -> int:
     """Count events in a job's events.jsonl — cheap derivation from disk."""
     job = store.get_job(job_id)
@@ -113,6 +129,7 @@ def _run_adapter_job(
     try:
         while True:
             if deadline and time.monotonic() > deadline:
+                cleanup = _cancel_provider(adapter, runner, session_id)
                 finished_at = datetime.now(timezone.utc).isoformat()
                 store.send_event(
                     job_id,
@@ -152,12 +169,14 @@ def _run_adapter_job(
                         "diagnostics": {
                             "layer": "timeout",
                             "max_runtime_sec": effective_max_runtime,
+                            "provider_cleanup": cleanup,
                         },
                     },
                     technical={
                         "lifecycle_events": _count_lifecycle_events(store, job_id),
                         "native_session_id": session_id,
                         "native_full_session_id": meta.get("native_full_session_id"),
+                        "provider_cleanup": cleanup,
                     },
                 )
                 store.set_result(
@@ -165,6 +184,7 @@ def _run_adapter_job(
                     ok=False,
                     summary=f"max_runtime_sec ({effective_max_runtime}s) exceeded",
                     envelope=envelope,
+                    release_writer_lease=bool(cleanup.get("adapter_cancel_confirmed")),
                 )
                 return
 
@@ -282,6 +302,22 @@ def _run_adapter_job(
                     clean_logs = _clean_provider_logs(logs)
                     provider_limited = _provider_limit_detected(logs)
                     provider_auth_failed = _provider_auth_failure_detected(logs)
+                    waiting_for = status.get("waiting_for")
+                    if not waiting_for and not provider_auth_failed and not provider_limited:
+                        # A provider can briefly report ``blocked`` while its
+                        # TUI/session is still starting. Without a concrete
+                        # waiting prompt or auth/quota evidence, terminating
+                        # it would turn harmless startup noise into a false
+                        # blocked failure.
+                        store.send_event(
+                            job_id,
+                            level="info",
+                            type="blocked_unconfirmed",
+                            message="Provider reported blocked without a prompt or failure evidence",
+                            data={"native_state": native_state},
+                        )
+                        time.sleep(poll_interval_sec)
+                        continue
                     if provider_auth_failed:
                         public_summary = "Claude is not authenticated. Start Claude and run /login."
                         failure_code = "provider_needs_auth"
@@ -322,6 +358,7 @@ def _run_adapter_job(
                             "native_state": native_state,
                         },
                     )
+                    blocked_cleanup = _cancel_provider(adapter, runner, session_id)
                     envelope = build_result_envelope(
                         status="failed",
                         stop_reason=stop_reason,
@@ -355,12 +392,14 @@ def _run_adapter_job(
                                 "waiting_for": status.get("waiting_for"),
                                 "native_state": native_state,
                                 "provider_output": provider_diagnostic,
+                                "provider_cleanup": blocked_cleanup,
                             },
                         },
                         technical={
                             "lifecycle_events": _count_lifecycle_events(store, job_id),
                             "native_session_id": session_id,
                             "native_full_session_id": meta_blocked.get("native_full_session_id"),
+                            "provider_cleanup": blocked_cleanup,
                         },
                     )
                     store.set_result(
@@ -368,6 +407,7 @@ def _run_adapter_job(
                         ok=False,
                         summary=public_summary,
                         envelope=envelope,
+                        release_writer_lease=bool(blocked_cleanup.get("adapter_cancel_confirmed")),
                     )
                     return
                 else:
@@ -499,6 +539,7 @@ def _run_adapter_job(
             )
 
     except Exception as exc:
+        cleanup = _cancel_provider(adapter, runner, session_id)
         finished_at = datetime.now(timezone.utc).isoformat()
         store.send_event(
             job_id,
@@ -538,15 +579,23 @@ def _run_adapter_job(
                 "next_action": "inspect_monitor_logs",
                 "diagnostics": {
                     "exception_type": type(exc).__name__,
+                    "provider_cleanup": cleanup,
                 },
             },
             technical={
                 "lifecycle_events": _count_lifecycle_events(store, job_id),
                 "native_session_id": session_id,
                 "native_full_session_id": meta_exc.get("native_full_session_id"),
+                "provider_cleanup": cleanup,
             },
         )
-        store.set_result(job_id, ok=False, summary=str(exc), envelope=envelope)
+        store.set_result(
+            job_id,
+            ok=False,
+            summary=str(exc),
+            envelope=envelope,
+            release_writer_lease=bool(cleanup.get("adapter_cancel_confirmed")),
+        )
 
 
 def start_agent_job(
@@ -559,16 +608,29 @@ def start_agent_job(
     max_runtime_sec: int | None = None,
 ) -> threading.Thread:
     """Start background monitoring for an adapter-launched job."""
+
+    def on_cancel() -> dict[str, Any]:
+        return _cancel_provider(adapter, LocalSubprocessRunner(), session_id)
+
+    # Make native adapter cleanup available to provider-neutral job_stop and
+    # deadline reaping. The callback is bounded and returns evidence only.
+    run_handles.register(job_id, on_cancel=on_cancel)
+
+    def run_and_release() -> None:
+        try:
+            _run_adapter_job(
+                store=store,
+                job_id=job_id,
+                adapter=adapter,
+                session_id=session_id,
+                poll_interval_sec=poll_interval_sec,
+                max_runtime_sec=max_runtime_sec,
+            )
+        finally:
+            run_handles.release(job_id)
+
     thread = threading.Thread(
-        target=_run_adapter_job,
-        kwargs={
-            "store": store,
-            "job_id": job_id,
-            "adapter": adapter,
-            "session_id": session_id,
-            "poll_interval_sec": poll_interval_sec,
-            "max_runtime_sec": max_runtime_sec,
-        },
+        target=run_and_release,
         name=f"agents-adapter-{job_id}",
         daemon=True,
     )

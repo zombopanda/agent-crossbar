@@ -124,6 +124,16 @@ def test_total_budget_stops_inclusion(tmp_path):
     )
 
 
+def test_total_budget_is_an_actual_envelope_cap(tmp_path):
+    (tmp_path / "huge.md").write_text("z" * 2_000_000, encoding="utf-8")
+
+    packed = pack_context(tmp_path, {"paths": ["huge.md"], "max_chars": 100})
+
+    assert packed["ok"] is True
+    assert len(packed["text"]) <= 100
+    assert packed["summary"]["chars_used"] <= 100
+
+
 def test_secrets_in_context_are_redacted(tmp_path):
     (tmp_path / ".env.sample").write_text("API_KEY=supersecretvalue\n", encoding="utf-8")
     (tmp_path / "conf.toml").write_text('token = "supersecretvalue"\n', encoding="utf-8")

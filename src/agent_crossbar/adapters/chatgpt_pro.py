@@ -6,6 +6,12 @@ from ..profiles.chatgpt_pro import SUPPORT_TIER
 from .base import StaticAdapter
 
 
+def _readiness_probe(runner=None):
+    from ..readiness import check_chatgpt_pro_readiness
+
+    return check_chatgpt_pro_readiness(runner)
+
+
 class ChatgptProAdapter(StaticAdapter):
     def __init__(self) -> None:
         super().__init__(
@@ -14,6 +20,8 @@ class ChatgptProAdapter(StaticAdapter):
             backend="gui",
             supports_interactive=False,
             effort_map={},
+            default_transport="gui",
+            readiness_probe=_readiness_probe,
         )
 
 

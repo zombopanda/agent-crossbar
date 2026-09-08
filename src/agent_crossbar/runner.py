@@ -97,13 +97,8 @@ def _candidate_home_dirs() -> list[Path]:
         getenv("AGENT_CROSSBAR_PROVIDER_HOME"),
         getenv("AGENT_CROSSBAR_USER_HOME"),
         os.environ.get("REAL_HOME"),
-        f"/Users/{os.environ.get('USER')}"
-        if sys.platform == "darwin" and os.environ.get("USER")
-        else None,
+        str(Path.home()) if sys.platform == "darwin" else None,
         str(Path.home()),
-        str(Path.home() / "bo")
-        if sys.platform == "darwin" and os.environ.get("USER") == "bo"
-        else None,
     ):
         if not raw:
             continue
@@ -2802,6 +2797,10 @@ def _candidates(req: dict[str, Any], prompt: str) -> list[CommandCandidate]:
     if profile == "opencode":
         model_id = _opencode_model_id(str(req.get("model") or ""))
         argv = ["opencode", "run", "-m", model_id]
+        if req.get("effort"):
+            # Explicit-effort fallback must preserve the requested provider
+            # setting in the actual CLI invocation.
+            argv += ["--effort", str(req["effort"])]
         if operation == "dev":
             argv.append("--dangerously-skip-permissions")
             if req.get("cwd"):
@@ -2940,7 +2939,11 @@ def run_print_job(
             # Drop capture_output / text — we handle those ourselves.
             kwargs.pop("capture_output", None)
             kwargs.pop("text", None)
-            kwargs.setdefault("stdin", subprocess.DEVNULL)
+            input_text = kwargs.pop("input", None)
+            if input_text is not None:
+                kwargs["stdin"] = subprocess.PIPE
+            else:
+                kwargs.setdefault("stdin", subprocess.DEVNULL)
             with open(output_path, "wb") as out_f:
                 timeout = kwargs.pop("timeout", None)
                 process = subprocess.Popen(
@@ -2958,7 +2961,11 @@ def run_print_job(
                     },
                 )
                 try:
-                    returncode = process.wait(timeout=timeout)
+                    if input_text is not None:
+                        process.communicate(input=input_text, timeout=timeout)
+                        returncode = process.returncode
+                    else:
+                        returncode = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()

@@ -1,7 +1,12 @@
 """ACP runtime: direct official-SDK integration via acp_client."""
 
 import asyncio
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from agent_crossbar.acp_client import (
@@ -16,6 +21,7 @@ from agent_crossbar.acp_client import (
 )
 from agent_crossbar.envelope import build_result_envelope, sanitize_diagnostic_text
 from agent_crossbar.models import Autonomy
+from agent_crossbar.run_handles import run_handles
 
 DEFAULT_MAX_RUNTIME_SEC: int = 1800
 
@@ -27,6 +33,13 @@ def build_acp_agent_command(provider: str) -> list[str]:
     if provider == "codex":
         return ["pnpm", "dlx", "@agentclientprotocol/codex-acp@1.1.7"]
     raise ValueError(f"Unknown ACP provider: {provider!r}")
+
+
+def _owned_acp_command(command: list[str]) -> list[str]:
+    """Run ACP through a repository-owned process-group wrapper."""
+    if os.name != "posix":
+        return command
+    return [sys.executable, "-m", "agent_crossbar.acp_process_wrapper", *command]
 
 
 def _safe_error(exc: Exception, prompt: str) -> str:
@@ -92,8 +105,17 @@ async def run_acp_job(
     """Execute an ACP job via the official SDK and persist the result."""
     job = store.get_job(job_id)
 
+    # A stop may win after the durable job is created but before the
+    # fire-and-forget coroutine starts. Never launch a provider for a terminal
+    # job; its result must remain owned by the caller that stopped it.
+    if job is None:
+        return
+    initial_meta = store._read_job_meta(job.path)
+    if initial_meta.get("status", "running") not in {"running", ""}:
+        return
+
     # -- creation timestamp --------------------------------------------------------
-    meta = store._read_job_meta(job.path) if job else {}
+    meta = initial_meta
     created_at = meta.get("created")
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -125,7 +147,8 @@ async def run_acp_job(
             return
 
     # -- build command & timeout ---------------------------------------------------
-    command = build_acp_agent_command(provider)
+    provider_command = build_acp_agent_command(provider)
+    command = _owned_acp_command(provider_command)
     effective_timeout: int = max_runtime_sec or DEFAULT_MAX_RUNTIME_SEC
 
     # -- persist job meta (never prompt) -------------------------------------------
@@ -133,7 +156,6 @@ async def run_acp_job(
     store.update_job_meta(
         job_id,
         {
-            **meta,
             "started_at": started_at,
             "backend": "acp",
             "acp_transport": "sdk_stdio",
@@ -146,6 +168,30 @@ async def run_acp_job(
             "max_runtime_sec": effective_timeout,
         },
     )
+
+    # Register before the final startup fence.  RunHandleRegistry preserves a
+    # stop that arrived before registration as a cancelled tombstone; the
+    # worker-owned startup lock never blocks the synchronous stop path.
+    def _acp_stop_evidence() -> dict[str, Any]:
+        current = store._read_job_meta(job.path)
+        return {"acp_stop": safe_acp_termination(current)}
+
+    handle = run_handles.register(job_id, on_cancel=_acp_stop_evidence)
+
+    def _before_process_start() -> None:
+        current = store._read_job_meta(job.path)
+        if handle.cancelled or current.get("status", "running") not in {"running", ""}:
+            raise AcpProtocolError(
+                "ACP job was stopped before provider process startup",
+                stage="prompt_delivery",
+            )
+
+    if handle.cancelled or store._read_job_meta(job.path).get("status", "running") not in {
+        "running",
+        "",
+    }:
+        run_handles.release(job_id)
+        return
 
     # -- acp_command event (no prompt content) -------------------------------------
     store.send_event(
@@ -161,34 +207,88 @@ async def run_acp_job(
         },
     )
 
-    # -- run -----------------------------------------------------------------------
+    # Persist launch intent before entering the SDK.  A controller crash
+    # between provider spawn and the PID callback must remain recoverable as an
+    # unknown cleanup, rather than looking like a proven no-launch job.
+    store.update_job_meta(
+        job_id,
+        {
+            "acp_launch_pending": True,
+            "acp_launch_started_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    spawn_observed = False
+    captured_pid: int | None = None
+    captured_identity: dict[str, Any] = {}
+
+    def _record_acp_pid(pid: int) -> None:
+        nonlocal captured_identity, captured_pid, spawn_observed
+
+        # The SDK callback runs after the OS process exists.  Keep an
+        # in-memory receipt before any durable operation so a metadata write
+        # failure cannot turn a post-spawn error into a pre-spawn result.
+        spawn_observed = True
+        captured_pid = pid
+        captured_identity = {}
+        # Capture and persist the immutable launch identity before checking
+        # cancellation.  A stop can arrive after the child exists but before
+        # this callback runs; rejecting first would lose the PID/PGID and
+        # falsely turn an unverified cleanup into a confirmed pre-spawn stop.
+        identity = _capture_process_identity(pid)
+        captured_identity = dict(identity)
+        store.update_job_meta(
+            job_id,
+            {
+                "acp_pid": pid,
+                "acp_pgid": identity.get("pgid"),
+                "acp_process_start": identity.get("start"),
+                "acp_process_command": identity.get("command"),
+                "acp_launch_pending": False,
+            },
+        )
+        current = store._read_job_meta(job.path)
+        # ``stop_job`` requests cancellation before it publishes the
+        # durable terminal status.  The in-memory fence therefore has to
+        # participate in this callback too; otherwise a stop that lands
+        # during the awaited spawn can pass the status check and reach the
+        # provider prompt.
+        if handle.cancelled or current.get("status", "running") not in {"running", ""}:
+            raise AcpProtocolError(
+                "ACP job was stopped before provider startup completed",
+                stage="prompt_delivery",
+            )
+
+    def _before_prompt() -> None:
+        current = store._read_job_meta(job.path)
+        if handle.cancelled or current.get("status", "running") not in {"running", ""}:
+            raise AcpProtocolError(
+                "ACP job was stopped before prompt delivery",
+                stage="prompt_delivery",
+            )
+
+    def _record_acp_text_delta(text: str) -> None:
+        store.send_event(
+            job_id,
+            level="info",
+            type="log_delta",
+            message="ACP output received",
+            data={"text": text},
+        )
+
+    def _record_acp_execution_heartbeat(data: dict[str, Any]) -> None:
+        # This is deliberately transport/liveness evidence only.  ACP
+        # does not expose a provider-native working state here.
+        store.heartbeat_writer_lease(job_id)
+        store.send_event(
+            job_id,
+            level="info",
+            type="execution_heartbeat",
+            message="ACP execution coroutine is still active",
+            data=data,
+        )
+
     try:
-
-        def _record_acp_pid(pid: int) -> None:
-            current = store._read_job_meta(job.path)
-            store.update_job_meta(job_id, {**current, "acp_pid": pid})
-
-        def _record_acp_text_delta(text: str) -> None:
-            store.send_event(
-                job_id,
-                level="info",
-                type="log_delta",
-                message="ACP output received",
-                data={"text": text},
-            )
-
-        def _record_acp_execution_heartbeat(data: dict[str, Any]) -> None:
-            # This is deliberately transport/liveness evidence only.  ACP
-            # does not expose a provider-native working state here.
-            store.heartbeat_writer_lease(job_id)
-            store.send_event(
-                job_id,
-                level="info",
-                type="execution_heartbeat",
-                message="ACP execution coroutine is still active",
-                data=data,
-            )
-
         result: AcpResult = await run_acp_prompt(
             command,
             prompt,
@@ -198,7 +298,10 @@ async def run_acp_job(
             model=model,
             effort=effort,
             mode=_resolve_dev_session_mode(provider, task),
+            startup_lock=handle.startup_lock,
+            before_process_start=_before_process_start,
             on_process_start=_record_acp_pid,
+            before_prompt=_before_prompt,
             on_text_delta=_record_acp_text_delta,
             on_execution_heartbeat=_record_acp_execution_heartbeat,
         )
@@ -262,6 +365,12 @@ async def run_acp_job(
         return
     except AcpLaunchError as exc:
         safe = _safe_error(exc, prompt)
+        try:
+            store.update_job_meta(job_id, {"acp_launch_pending": False})
+            meta["acp_launch_pending"] = False
+        except Exception:
+            # If the marker cannot be cleared, _fail retains the lease.
+            pass
         _fail(
             store=store,
             job_id=job_id,
@@ -283,6 +392,56 @@ async def run_acp_job(
         return
     except AcpProtocolError as exc:
         safe = _safe_error(exc, prompt)
+        startup_cancel_cleanup = None
+        current_meta = store._read_job_meta(job.path)
+        stop_observed = handle.cancelled or current_meta.get("status", "running") not in {
+            "running",
+            "",
+        }
+        if spawn_observed:
+            cleanup_meta = dict(current_meta)
+            if captured_pid is not None:
+                cleanup_meta["acp_pid"] = captured_pid
+            for key in ("acp_pgid", "acp_process_start", "acp_process_command"):
+                if key in captured_identity:
+                    cleanup_meta[key] = captured_identity[key]
+            try:
+                startup_cancel_cleanup = safe_acp_termination(cleanup_meta)
+            except Exception as cleanup_exc:  # pragma: no cover - defensive cleanup
+                startup_cancel_cleanup = {
+                    "terminated": False,
+                    "reason": "termination_error",
+                    "error": type(cleanup_exc).__name__,
+                    "pid": captured_pid,
+                }
+            meta = cleanup_meta
+        elif stop_observed:
+            try:
+                store.update_job_meta(job_id, {"acp_launch_pending": False})
+                meta["acp_launch_pending"] = False
+            except Exception:
+                pass
+            if current_meta.get("acp_pid"):
+                # The process identity is persisted before the startup fence
+                # rejects a raced stop.  Reap it through the same fenced
+                # helper and retain the lease whenever disappearance is not
+                # positively confirmed.
+                try:
+                    startup_cancel_cleanup = safe_acp_termination(current_meta)
+                except Exception as cleanup_exc:  # pragma: no cover - defensive cleanup
+                    startup_cancel_cleanup = {
+                        "terminated": False,
+                        "reason": "termination_error",
+                        "error": type(cleanup_exc).__name__,
+                        "pid": current_meta.get("acp_pid"),
+                    }
+                meta = current_meta
+            else:
+                startup_cancel_cleanup = {
+                    "terminated": True,
+                    "reason": "startup_cancelled_before_spawn",
+                    "pid": None,
+                }
         _fail(
             store=store,
             job_id=job_id,
@@ -300,6 +459,7 @@ async def run_acp_job(
             task=task,
             cwd=cwd,
             diagnostics={"error": safe},
+            cleanup=startup_cancel_cleanup,
         )
         return
     except AcpError as exc:
@@ -357,7 +517,7 @@ async def run_acp_job(
             code="acp_interrupted",
             retryable=True,
             next_action="retry",
-            meta=meta,
+            meta=current_meta,
             started_at=started_at,
             provider=provider,
             model=model,
@@ -365,6 +525,7 @@ async def run_acp_job(
             task=task,
             cwd=cwd,
             diagnostics={"interrupted": True, "acp_stop": termination},
+            cleanup=termination,
         )
         raise
     except Exception as exc:
@@ -389,13 +550,14 @@ async def run_acp_job(
         )
         return
 
-    # -- fail closed: a "dev" job that produced no observable work ------------------
-    # A successful dev turn may legitimately have concise nonempty text and an
-    # externally empty `changes` field (Agents MCP does not inventory the
-    # workspace) — that alone is not a failure signal. But whitespace-only or
-    # entirely absent output from a dev task means nothing observable happened
-    # at all, so it must never be reported as "completed".
-    if task == "dev" and _is_empty_acp_output(result.output):
+    # -- fail closed: a job that produced no observable assistant output -----------
+    # ACP uses a sentinel when the provider emits no session_update chunks.  An
+    # empty ask/review result is just as unusable as an empty dev turn: callers
+    # would otherwise receive a successful completion with no evidence that the
+    # requested operation happened.  A dev turn may still have an externally
+    # empty `changes` field (Agents MCP does not inventory the workspace), so the
+    # output check is deliberately independent of the changes envelope.
+    if _is_empty_acp_output(result.output):
         safe = (
             "ACP dev task returned no observable output or changes. "
             "This is treated as a failure rather than a silent no-op completion."
@@ -464,6 +626,7 @@ async def run_acp_job(
     )
 
     store.set_result(job_id, ok=True, summary=result.output, envelope=envelope)
+    run_handles.release(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -489,12 +652,30 @@ def _fail(
     task: str,
     cwd: str,
     diagnostics: dict[str, Any],
+    cleanup: dict[str, Any] | None = None,
 ) -> None:
     """Persist a failure result.  Prompt is absent from all persisted data.
 
     Failure event data is kept minimal on the event (code, stop_reason,
     stage); diagnostics are only stored in the envelope for privacy.
     """
+    # The caller's startup snapshot predates the durable launch-intent marker
+    # and may also predate a PID identity write. Refresh it before deciding
+    # whether the writer lease can be released. If the state cannot be read,
+    # retain the lease conservatively: a failed read is not proof that launch
+    # never happened.
+    try:
+        current_job = store.get_job(job_id)
+        current_meta = store._read_job_meta(current_job.path) if current_job else {}
+    except Exception:
+        current_meta = {}
+    if current_meta:
+        refreshed_meta = dict(meta)
+        refreshed_meta.update(current_meta)
+        meta = refreshed_meta
+    elif "acp_launch_pending" not in meta or not meta.get("acp_launch_pending"):
+        meta = {**meta, "acp_launch_pending": True}
+
     finished_at = datetime.now(timezone.utc).isoformat()
 
     # Minimal event data — no diagnostics in the event log
@@ -523,6 +704,14 @@ def _fail(
     }
     resolved: dict[str, Any] = {**requested, "backend": "acp"}
 
+    technical: dict[str, Any] = {
+        "lifecycle_events": _count_events(store, job_id),
+        "native_session_id": meta.get("acp_pid"),
+    }
+    if cleanup is not None:
+        technical["provider_cleanup"] = cleanup
+        technical["cleanup_confirmed"] = bool(cleanup.get("terminated"))
+
     envelope = build_result_envelope(
         status="failed",
         stop_reason=stop_reason,
@@ -539,13 +728,104 @@ def _fail(
             "next_action": next_action,
             "diagnostics": diagnostics,
         },
-        technical={
-            "lifecycle_events": _count_events(store, job_id),
-            "native_session_id": None,
-        },
+        technical=technical,
     )
 
-    store.set_result(job_id, ok=False, summary=safe_output, envelope=envelope)
+    release_writer_lease = cleanup is None or bool(cleanup.get("terminated"))
+    if meta.get("acp_launch_pending"):
+        # A crash/error after launch intent was durable but before the
+        # identity was durably cleared is not proof that no provider exists.
+        # Keep the lease until a later cleanup attempt confirms disappearance.
+        release_writer_lease = bool(cleanup and cleanup.get("terminated"))
+    store.set_result(
+        job_id,
+        ok=False,
+        summary=safe_output,
+        envelope=envelope,
+        release_writer_lease=release_writer_lease,
+    )
+    run_handles.release(job_id)
+
+
+def _capture_process_identity(pid: int) -> dict[str, Any]:
+    """Capture start identity and process group for safe later cleanup."""
+    identity: dict[str, Any] = {}
+    try:
+        identity["pgid"] = os.getpgid(pid)
+    except OSError:
+        identity["pgid"] = None
+    proc_stat = f"/proc/{pid}/stat"
+    try:
+        fields = Path(proc_stat).read_text(encoding="utf-8").split()
+        if len(fields) > 21:
+            identity["start"] = fields[21]
+    except OSError:
+        pass
+    if "start" not in identity:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                identity["start"] = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            identity["command"] = result.stdout.strip()[:500]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return identity
+
+
+def _process_is_zombie(pid: int) -> bool:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return len(fields) > 2 and fields[2] == "Z"
+    except OSError:
+        return False
+
+
+def _process_exit_confirmed(pid: int, pgid: int | None, timeout: float = 2.0) -> bool:
+    """Return only after the recorded leader and owned group are gone."""
+    deadline = time.monotonic() + timeout
+    while True:
+        leader_alive = False
+        try:
+            os.kill(pid, 0)
+            leader_alive = not _process_is_zombie(pid)
+        except ProcessLookupError:
+            leader_alive = False
+        except OSError:
+            # Permission or another probe failure is not proof of death.
+            leader_alive = True
+
+        group_alive = False
+        if pgid is not None and pgid > 1 and pgid != os.getpgrp():
+            try:
+                os.killpg(pgid, 0)
+                group_alive = True
+            except ProcessLookupError:
+                group_alive = False
+            except OSError:
+                group_alive = True
+
+        if not leader_alive and not group_alive:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def safe_acp_termination(meta: dict) -> dict:
@@ -565,9 +845,7 @@ def safe_acp_termination(meta: dict) -> dict:
     if pid is None:
         return {"terminated": False, "reason": "no_acp_pid_in_meta", "pid": None}
 
-    import os
     import signal
-    import time
 
     try:
         pid_int = int(pid)
@@ -576,24 +854,115 @@ def safe_acp_termination(meta: dict) -> dict:
     if pid_int <= 1:
         return {"terminated": False, "reason": "unsafe_acp_pid", "pid": pid_int}
 
-    # Check if process exists
+    # Check process existence and prove that the PID still refers to the
+    # process captured at launch. A recycled PID must never receive a signal.
     try:
         os.kill(pid_int, 0)
-    except OSError:
+    except ProcessLookupError:
         return {"terminated": True, "reason": "process_already_gone", "pid": pid_int}
+    except PermissionError:
+        return {"terminated": False, "reason": "process_identity_unverifiable", "pid": pid_int}
+    except OSError as exc:
+        return {
+            "terminated": False,
+            "reason": "process_probe_error",
+            "error": type(exc).__name__,
+            "pid": pid_int,
+        }
+
+    expected_start = meta.get("acp_process_start")
+    expected_pgid = meta.get("acp_pgid")
+    try:
+        expected_pgid_int = int(expected_pgid)
+    except (TypeError, ValueError):
+        expected_pgid_int = None
+    # A PID without the launch-time identity is not safely ownable.  A
+    # ProcessLookupError above is still authoritative proof that it is gone,
+    # but a live/unverifiable PID must never receive a signal.
+    if not isinstance(expected_start, str) or not expected_start or expected_pgid_int is None:
+        return {"terminated": False, "reason": "process_identity_unverifiable", "pid": pid_int}
+    actual = _capture_process_identity(pid_int)
+    if not actual.get("start") or actual.get("pgid") is None:
+        return {"terminated": False, "reason": "process_identity_unverifiable", "pid": pid_int}
+    if str(expected_start) != str(actual["start"]):
+        return {"terminated": False, "reason": "pid_reused", "pid": pid_int}
+    actual_pgid = actual.get("pgid")
+    if expected_pgid_int != actual_pgid:
+        # The repository-owned ACP wrapper calls setsid() immediately after
+        # spawn.  The SDK callback can observe the pre-exec group, while the
+        # same launch identity is already running in its final owned group by
+        # stop time.  The verified start identity proves this is the original
+        # process, so fence the current group rather than treating that normal
+        # handoff as PID/group reuse.
+        if actual_pgid is None:
+            return {"terminated": False, "reason": "process_identity_unverifiable", "pid": pid_int}
+        if actual_pgid != pid_int:
+            return {"terminated": False, "reason": "process_group_reused", "pid": pid_int}
+        expected_pgid_int = int(actual_pgid)
+
+    # Only a group whose id is the recorded leader PID is owned by the
+    # repository wrapper. A verified leader in a shared legacy group may be
+    # signalled directly, but that foreign group must never be killed or
+    # included in death confirmation.
+    owned_pgid = expected_pgid_int if expected_pgid_int == pid_int else None
 
     # Try SIGTERM first
     try:
-        os.kill(pid_int, signal.SIGTERM)
-    except OSError:
+        if owned_pgid and owned_pgid > 1 and owned_pgid != os.getpgrp():
+            os.killpg(owned_pgid, signal.SIGTERM)
+        else:
+            os.kill(pid_int, signal.SIGTERM)
+    except ProcessLookupError:
         return {"terminated": True, "reason": "process_gone_during_terminate", "pid": pid_int}
+    except OSError as exc:
+        return {
+            "terminated": False,
+            "reason": "terminate_error",
+            "error": type(exc).__name__,
+            "pid": pid_int,
+        }
 
     # Grace period, then SIGKILL
     time.sleep(1.0)
     try:
         os.kill(pid_int, 0)
         # Still alive — force kill
-        os.kill(pid_int, signal.SIGKILL)
-        return {"terminated": True, "reason": "force_killed_after_sigterm", "pid": pid_int}
-    except OSError:
+        if owned_pgid and owned_pgid > 1 and owned_pgid != os.getpgrp():
+            os.killpg(owned_pgid, signal.SIGKILL)
+        else:
+            os.kill(pid_int, signal.SIGKILL)
+        confirmed = _process_exit_confirmed(pid_int, owned_pgid)
+        return {
+            "terminated": confirmed,
+            "reason": "force_killed_after_sigterm" if confirmed else "death_unconfirmed",
+            "pid": pid_int,
+        }
+    except ProcessLookupError:
         return {"terminated": True, "reason": "terminated_via_sigterm", "pid": pid_int}
+    except OSError as exc:
+        try:
+            waited_pid, _status = os.waitpid(pid_int, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            waited_pid = 0
+        if waited_pid == pid_int and _process_exit_confirmed(pid_int, owned_pgid):
+            return {
+                "terminated": True,
+                "reason": "terminated_and_reaped",
+                "pid": pid_int,
+            }
+        if (
+            isinstance(exc, PermissionError)
+            and _process_is_zombie(pid_int)
+            and _process_exit_confirmed(pid_int, owned_pgid)
+        ):
+            return {
+                "terminated": True,
+                "reason": "terminated_zombie_pending_reap",
+                "pid": pid_int,
+            }
+        return {
+            "terminated": False,
+            "reason": "death_probe_error",
+            "error": type(exc).__name__,
+            "pid": pid_int,
+        }

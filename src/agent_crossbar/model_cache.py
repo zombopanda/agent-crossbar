@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -33,9 +34,13 @@ def _cache_path(state_root: Path, profile: str) -> Path:
 
 
 def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(data, indent=2, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     finally:

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol
 
 PUBLIC_EFFORTS = ("low", "medium", "high", "max")
 
@@ -52,8 +52,23 @@ class ProviderAdapter(Protocol):
     backend: str
     supports_interactive: bool
     effort_map: Mapping[str, str]
+    default_transport: str
+    native_lifecycle: bool
+    live_model_discovery: bool
+    review_warning: str | None
 
     def map_effort(self, effort: str) -> str: ...
+
+    def resolve_model_id(
+        self, requested: str, catalog: ModelCatalog
+    ) -> tuple[str | None, tuple[str, str] | None]: ...
+
+    def validate_effort(
+        self,
+        effort: str | None,
+        catalog: ModelCatalog | None,
+        model_id: str | None,
+    ) -> tuple[str | None, str | None, tuple[str, str] | None]: ...
 
 
 class LifecycleAdapter(Protocol):
@@ -84,6 +99,11 @@ class StaticAdapter:
     backend: str
     supports_interactive: bool
     effort_map: Mapping[str, str]
+    # Public-request transport defaults are adapter metadata.  Core routing
+    # uses this value without identifying a provider by name.
+    default_transport: str = "print"
+    native_lifecycle: bool = False
+    readiness_probe: Callable[[Any], Any] | None = None
     # Whether this ACP agent advertises an effort/thought-level selector that
     # can be set through session/set_config_option.
     supports_acp_effort: bool = False
@@ -92,6 +112,71 @@ class StaticAdapter:
     # provider-specific mode requirement. The generic ACP client requires
     # live advertisement and acceptance whenever this is non-None.
     dev_acp_mode: str | None = None
+    # Optional adapter-owned ACP readiness probe. Core lifecycle code invokes
+    # this hook without branching on provider names.
+    acp_readiness: Callable[[Any], dict[str, Any]] | None = None
+    live_model_discovery: bool = False
+    default_effort: str | None = None
+    # Whether live-discovered model ids are provider-qualified
+    # (``<provider>/<model>``) and a unique unqualified suffix should also
+    # resolve, e.g. OpenCode Go and Reasonix. Exact-id-only adapters
+    # (Codex, Claude) leave this False.
+    fuzzy_model_suffix_match: bool = False
+    # Public effort value aliases accepted in addition to PUBLIC_EFFORTS,
+    # e.g. Codex's "light" -> "low".
+    effort_aliases: Mapping[str, str] = field(default_factory=dict)
+    # Optional warning emitted by the adapter for a validated operation.  The
+    # core records this metadata without knowing which provider needs it.
+    review_warning: str | None = None
 
     def map_effort(self, effort: str) -> str:
         return normalize_effort(effort, self.effort_map)
+
+    def resolve_model_id(
+        self, requested: str, catalog: "ModelCatalog"
+    ) -> tuple[str | None, tuple[str, str] | None]:
+        """Resolve *requested* against a live-discovered catalog.
+
+        Returns ``(model_id, None)`` on success or ``(None, (error, message))``
+        on failure. The base behavior requires an exact match; adapters with
+        provider-qualified ids (``fuzzy_model_suffix_match``) also accept a
+        unique unqualified suffix.
+        """
+        if requested in catalog.models:
+            return requested, None
+        if self.fuzzy_model_suffix_match:
+            matches = [
+                candidate
+                for candidate in catalog.models
+                if "/" in candidate and candidate.split("/", 1)[1] == requested
+            ]
+            if len(matches) > 1:
+                return None, (
+                    "ambiguous_model",
+                    f"Model '{requested}' matches multiple {self.name} providers "
+                    f"({', '.join(sorted(matches))}); pass a fully qualified id.",
+                )
+            if matches:
+                return matches[0], None
+        return None, (
+            "invalid_model",
+            f"Model '{requested}' is not available in {self.name} "
+            f"(discovered: {', '.join(catalog.models)})",
+        )
+
+    def validate_effort(
+        self,
+        effort: str | None,
+        catalog: "ModelCatalog | None",
+        model_id: str | None,
+    ) -> tuple[str | None, str | None, tuple[str, str] | None]:
+        """Resolve/validate a public *effort* against live discovery data.
+
+        Returns ``(normalized_effort, resolved_effort, None)`` on success or
+        ``(None, None, (error, message))`` on failure. The base behavior
+        performs no effort handling at all — adapters without a native
+        effort/model-capability relationship (Claude, Reasonix) leave the
+        public effort field untouched. Adapters with per-model effort
+        discovery (Codex, OpenCode) override this.
+        """
+        return None, None, None

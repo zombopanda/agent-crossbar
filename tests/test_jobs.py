@@ -2,6 +2,7 @@ import json
 import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import agent_crossbar.jobs as jobs_module
 from agent_crossbar.jobs import JobStore
@@ -557,6 +558,33 @@ def test_acp_stop_can_persist_after_stop_event_failure_without_early_release(tmp
     assert persisted["ok"] is True
     assert persisted["warnings"]
     assert leases.acquire(str(workspace), owner_id="next").ok is True
+
+
+def test_stop_keeps_writer_lease_when_provider_cleanup_is_unconfirmed(tmp_path):
+    from agent_crossbar.run_handles import run_handles
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    pending = leases.acquire(str(workspace), owner_id="pending", owner_kind="pending_dev")
+    assert pending.ok and pending.token
+    store = JobStore(state)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(pending.token, job_id=job.job_id)
+    store.update_job_meta(job.job_id, {"writer_lease_token": pending.token})
+    run_handles.register(
+        job.job_id,
+        on_cancel=lambda: {"adapter_cancel_confirmed": False},
+    )
+    try:
+        stopped = store.stop_job(job.job_id, reason="user_cancelled")
+        assert stopped["ok"] is True
+        assert leases.acquire(str(workspace), owner_id="replacement").error == "writer_busy"
+        assert store._read_job_meta(job.path)["cleanup_pending"] is True
+    finally:
+        run_handles.release(job.job_id)
 
 
 def test_stop_cannot_overwrite_already_published_provider_completion(tmp_path, monkeypatch):
@@ -1413,7 +1441,7 @@ def test_reaper_skips_job_without_declared_deadline(tmp_path):
     assert store.job_status(job.job_id) == "running"
 
 
-def test_reaper_skips_awaiting_input_and_terminal_jobs(tmp_path):
+def test_reaper_terminalizes_expired_awaiting_input_and_skips_terminal_jobs(tmp_path):
     store = JobStore(tmp_path)
     awaiting = store.create_job("reasonix", "dev", transport="print", cwd=str(tmp_path))
     store.update_job_meta(
@@ -1424,8 +1452,8 @@ def test_reaper_skips_awaiting_input_and_terminal_jobs(tmp_path):
             "status": "awaiting_input",
         },
     )
-    assert store._reap_deadline_expired_job(awaiting) is False
-    assert store.job_status(awaiting.job_id) == "awaiting_input"
+    assert store._reap_deadline_expired_job(awaiting) is True
+    assert store.job_status(awaiting.job_id) == "failed"
 
     done = store.create_job("opencode", "dev", transport="print", cwd=str(tmp_path))
     store.update_job_meta(
@@ -1445,6 +1473,68 @@ def test_get_result_lazily_reaps_expired_orphan(tmp_path):
     assert result["status"] == "failed"
     assert result["failure"]["code"] == "max_runtime_exceeded"
     assert store.job_status(job.job_id) == "failed"
+
+
+def test_reaper_keeps_writer_lease_when_restart_cannot_prove_provider_exit(tmp_path):
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    pending = leases.acquire(workspace, owner_id="pending", owner_kind="pending_dev")
+    assert pending.ok and pending.token
+    store = JobStore(state)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(pending.token, job_id=job.job_id)
+    store.update_job_meta(
+        job.job_id,
+        {
+            "writer_lease_token": pending.token,
+            "backend": "print",
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "max_runtime_sec": 1,
+        },
+    )
+    assert store._reap_deadline_expired_job(job) is True
+    assert leases.acquire(workspace, owner_id="replacement").error == "writer_busy"
+
+
+def test_reaper_keeps_pending_acp_launch_without_pid_fail_closed(tmp_path):
+    """A crash after launch intent retains the lease and never signals a PID."""
+    from agent_crossbar.writer_lease import WriterLeaseStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    leases = WriterLeaseStore(state)
+    pending = leases.acquire(workspace, owner_id="pending", owner_kind="pending_dev")
+    assert pending.ok and pending.token
+    store = JobStore(state)
+    job = store.create_job("opencode", "dev", transport="print", cwd=str(workspace))
+    assert leases.attach(pending.token, job_id=job.job_id)
+    store.update_job_meta(
+        job.job_id,
+        {
+            "writer_lease_token": pending.token,
+            "backend": "acp",
+            "acp_launch_pending": True,
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "max_runtime_sec": 1,
+        },
+    )
+
+    try:
+        with patch("agent_crossbar.acp_runtime.os.kill") as kill:
+            assert store._reap_deadline_expired_job(job) is True
+        kill.assert_not_called()
+    finally:
+        jobs_module.run_handles.release(job.job_id)
+
+    result = store.get_result(job.job_id)
+    assert result["technical"]["cleanup_confirmed"] is False
+    assert result["technical"]["acp_stop"]["acp_stop"]["reason"] == ("no_acp_pid_in_meta")
+    assert leases.acquire(workspace, owner_id="replacement").error == "writer_busy"
 
 
 def test_job_tail_lazily_reaps_expired_orphan(tmp_path):

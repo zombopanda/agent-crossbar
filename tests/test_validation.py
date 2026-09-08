@@ -16,7 +16,7 @@ from agent_crossbar.validation import validate_start_request
 
 @pytest.fixture(autouse=True)
 def _stable_codex_model_catalog(monkeypatch):
-    """Keep Codex validation tests independent of the installed CLI catalog."""
+    """Keep Codex/Reasonix validation tests independent of the installed CLI catalog."""
     import agent_crossbar.discovery as discovery
 
     original_discover = discovery.discover_profile_models
@@ -26,10 +26,18 @@ def _stable_codex_model_catalog(monkeypatch):
         native_efforts=("low", "medium", "high", "max"),
         source="test",
     )
+    reasonix_catalog = ModelCatalog(
+        models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"),
+        default_model="deepseek-flash/deepseek-v4-flash",
+        native_efforts=(),
+        source="reasonix doctor --json",
+    )
 
     def discover(state_root, profile, *, refresh=False):
         if profile == "codex":
             return catalog
+        if profile == "reasonix":
+            return reasonix_catalog
         return original_discover(state_root, profile, refresh=refresh)
 
     monkeypatch.setattr(discovery, "discover_profile_models", discover)
@@ -460,18 +468,26 @@ def test_model_is_explicitly_passed_for_all_profiles(tmp_path):
         native_efforts=("low", "medium", "high", "max"),
         source="test",
     )
+    reasonix_catalog = ModelCatalog(
+        models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"),
+        default_model="deepseek-flash/deepseek-v4-flash",
+        native_efforts=(),
+        source="test",
+    )
 
     def discover(state_root, profile, *, refresh=False):
         if profile == "claude":
             return claude_catalog
         if profile == "codex":
             return codex_catalog
+        if profile == "reasonix":
+            return reasonix_catalog
         return catalog
 
     with patch.object(_disc, "discover_profile_models", side_effect=discover):
         # All profiles with explicit model should work
         tests = [
-            {"profile": "reasonix", "model": "deepseek-v4-flash"},
+            {"profile": "reasonix", "model": "deepseek-flash/deepseek-v4-flash"},
             {"profile": "codex", "model": "gpt-5.6-sol"},
             {"profile": "claude", "model": "claude-sonnet-5"},
             {"profile": "opencode", "model": "kimi-k2.7-code"},
@@ -481,3 +497,105 @@ def test_model_is_explicitly_passed_for_all_profiles(tmp_path):
             result = validate_start_request(req, state_root=tmp_path)
             assert result["ok"] is True, f"Failed for {t}: {result}"
             assert result["model"] is not None, f"Model not set for {t}"
+
+
+# ── Reasonix live qualified-id validation (Milestone 1) ─────────────────────
+
+
+def test_reasonix_accepts_qualified_live_ids(tmp_path):
+    """Canonical live discovery ids (<provider>/<model>) must pass validation.
+
+    The static REASONIX_MODELS allowlist (bare short names) must never reject
+    the qualified ids surfaced by ``reasonix doctor --json``.
+    """
+    for qid in ("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-pro"):
+        result = validate_start_request(
+            _make_base_req(profile="reasonix", transport="print", model=qid),
+            state_root=tmp_path,
+        )
+        assert result["ok"] is True, f"qualified id {qid} rejected: {result}"
+        assert result["model"] == qid
+        assert result["profile"] == "reasonix"
+
+
+def test_reasonix_unique_short_name_normalizes_to_qualified_id(tmp_path):
+    """A bare short name that maps to exactly one live provider normalizes."""
+    result = validate_start_request(
+        _make_base_req(profile="reasonix", transport="print", model="deepseek-v4-flash"),
+        state_root=tmp_path,
+    )
+    assert result["ok"] is True
+    assert result["model"] == "deepseek-flash/deepseek-v4-flash"
+
+
+def test_reasonix_ambiguous_short_name_rejected(tmp_path):
+    """A short name shared by two providers must not be silently resolved."""
+    import agent_crossbar.discovery as _disc
+
+    catalog = ModelCatalog(
+        models=("deepseek-flash/deepseek-v4-flash", "deepseek-pro/deepseek-v4-flash"),
+        default_model="deepseek-flash/deepseek-v4-flash",
+        native_efforts=(),
+        source="test",
+    )
+    with patch.object(_disc, "discover_profile_models", return_value=catalog):
+        result = validate_start_request(
+            _make_base_req(profile="reasonix", transport="print", model="deepseek-v4-flash"),
+            state_root=tmp_path,
+        )
+    assert result["ok"] is False
+    assert result["error"] == "ambiguous_model"
+    assert result["job_created"] is False
+
+
+def test_reasonix_unknown_model_rejected(tmp_path):
+    """A model absent from the live catalog is rejected — never static fallback."""
+    result = validate_start_request(
+        _make_base_req(profile="reasonix", transport="print", model="not-a-real-model"),
+        state_root=tmp_path,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_model"
+    assert result["job_created"] is False
+
+
+def test_reasonix_discovery_failure_fails_closed_no_static_fallback(tmp_path):
+    """Malformed/missing/failed discovery fails closed with discovery_error.
+
+    A static REASONIX_MODELS short name must NOT be accepted when live
+    discovery errors — there is no static model fallback at validation time.
+    """
+    import agent_crossbar.discovery as _disc
+
+    failed = ModelCatalog(
+        models=(),
+        default_model=None,
+        native_efforts=(),
+        source="reasonix doctor --json",
+        error="reasonix doctor --json did not report any providers with models",
+    )
+
+    with patch.object(_disc, "discover_profile_models", return_value=failed):
+        result = validate_start_request(
+            _make_base_req(
+                profile="reasonix", transport="print", model="deepseek-flash/deepseek-v4-flash"
+            ),
+            state_root=tmp_path,
+        )
+    assert result["ok"] is False
+    assert result["error"] == "discovery_error"
+    assert "discovery" in result["message"].lower()
+    assert result["job_created"] is False
+
+
+def test_reasonix_missing_state_root_fails_closed(tmp_path):
+    """Reasonix validation requires state_root — no static allowlist bypass."""
+    result = validate_start_request(
+        _make_base_req(
+            profile="reasonix", transport="print", model="deepseek-flash/deepseek-v4-flash"
+        ),
+        state_root=None,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "discovery_error"
+    assert result["job_created"] is False

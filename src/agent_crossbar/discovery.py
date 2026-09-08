@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -200,7 +201,12 @@ class _BoundedSubprocessRunner:
 def _get_cli_version(profile: str) -> str:
     """Try to determine the CLI version for cache-key purposes."""
     runner = _BoundedSubprocessRunner()
-    binary_map = {"codex": "codex", "opencode": "opencode", "claude": "claude"}
+    binary_map = {
+        "codex": "codex",
+        "opencode": "opencode",
+        "claude": "claude",
+        "reasonix": "reasonix",
+    }
     binary = binary_map.get(profile)
     if binary is None:
         return "unknown"
@@ -213,7 +219,138 @@ def _get_cli_version(profile: str) -> str:
     return "unknown"
 
 
-_PROFILES_WITH_DISCOVERY = frozenset({"codex", "opencode", "claude"})
+_PROFILES_WITH_DISCOVERY = frozenset({"codex", "opencode", "claude", "reasonix"})
+
+
+def _parse_reasonix_doctor_providers(payload: dict[str, Any]) -> list[str]:
+    """Extract validated, deduplicated qualified model ids from a doctor payload.
+
+    ``reasonix doctor --json`` reports live providers as a top-level
+    ``providers`` array: ``[{"name": str, "models": [str, ...],
+    "key_present": bool}, ...]``. Qualified ids are built as
+    ``<provider name>/<model>`` — preserving the provider namespace so two
+    providers can never collide on a bare model name (e.g.
+    ``deepseek-flash/deepseek-v4-flash``, ``deepseek-pro/deepseek-v4-pro``).
+
+    ``key_present`` is intentionally never consulted here: it proves only
+    that a credential is configured, never that the provider (or any of
+    its models) is actually reachable. Readiness's own doctor-based
+    ``api-key``/``api-reach`` checks are the sole source of truth for
+    reachability — discovery must not upgrade that claim from
+    ``key_present`` alone.
+
+    Malformed entries — a non-dict provider, a missing/blank ``name``, a
+    ``models`` field that isn't a list, or a non-string/blank model — are
+    skipped rather than raised, so a doctor schema drift degrades to fewer
+    models instead of crashing discovery. If the top-level ``providers``
+    field itself is missing or not a list, this yields no models.
+    """
+    providers = payload.get("providers")
+    if not isinstance(providers, list):
+        return []
+
+    qualified: list[str] = []
+    seen: set[str] = set()
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        name = provider.get("name")
+        models = provider.get("models")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, str) or not model.strip():
+                continue
+            qid = f"{name}/{model}"
+            if qid not in seen:
+                seen.add(qid)
+                qualified.append(qid)
+    return qualified
+
+
+def _fetch_reasonix(runner: DiscoveryProcess) -> dict[str, Any]:
+    """Discover Reasonix models via ``reasonix doctor --json`` — no static fallback.
+
+    Reads the doctor payload's top-level ``providers`` array and builds a
+    qualified, deduplicated catalog (``<provider name>/<model>``) — never a
+    single hardcoded ``reasonix/`` prefix, since Reasonix fans out to
+    multiple named providers (e.g. ``deepseek-flash``, ``deepseek-pro``).
+    This is fully independent of ``check_reasonix_readiness``'s own doctor
+    invocation: it never inspects ``key_present`` and never reports
+    authentication — a configured key is not proof of live reachability.
+    When ``providers`` is missing, malformed, or empty after validation,
+    this returns an honest ``error`` — never a guess.
+    """
+    import json
+
+    source = "reasonix doctor --json"
+    try:
+        result = runner.run(["reasonix", "doctor", "--json"], timeout=20)
+    except Exception as exc:
+        return _catalog_to_dict(
+            ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source=source,
+                error=f"reasonix doctor probe failed: {exc}",
+            )
+        )
+    if result.returncode != 0:
+        return _catalog_to_dict(
+            ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source=source,
+                error=f"reasonix doctor exited {result.returncode}",
+            )
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return _catalog_to_dict(
+            ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source=source,
+                error="reasonix doctor returned non-JSON output",
+            )
+        )
+    if not isinstance(payload, dict):
+        return _catalog_to_dict(
+            ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source=source,
+                error="reasonix doctor returned a non-object JSON payload",
+            )
+        )
+    qualified_ids = _parse_reasonix_doctor_providers(payload)
+    if not qualified_ids:
+        return _catalog_to_dict(
+            ModelCatalog(
+                models=(),
+                default_model=None,
+                native_efforts=(),
+                source=source,
+                error="reasonix doctor --json did not report any providers with models "
+                "(providers missing, malformed, or empty)",
+            )
+        )
+    qualified = tuple(qualified_ids)
+    return _catalog_to_dict(
+        ModelCatalog(
+            models=qualified,
+            default_model=qualified[0],
+            native_efforts=(),
+            source=source,
+        )
+    )
 
 
 def _fetch_codex(runner: DiscoveryProcess) -> dict[str, Any]:
@@ -248,8 +385,8 @@ def discover_profile_models(
 ) -> ModelCatalog:
     """Discover models for *profile* with caching.
 
-    Profiles without live discovery (reasonix, chatgpt_pro) return
-    an honest ``ModelCatalog`` with ``error`` set.
+    Profiles without live discovery (chatgpt_pro) return an honest
+    ``ModelCatalog`` with ``error`` set.
     """
     if profile not in _PROFILES_WITH_DISCOVERY:
         return ModelCatalog(
@@ -269,6 +406,10 @@ def discover_profile_models(
             return _fetch_codex(runner)
     elif profile == "claude":
         fetcher = _fetch_claude  # probe manages its own process, no runner
+    elif profile == "reasonix":
+
+        def fetcher():
+            return _fetch_reasonix(runner)
     else:
 
         def fetcher():
@@ -310,7 +451,6 @@ def build_profile_health_entry(
             "status": "registered",
             "runtime_checked": True,
             "discovery_available": True,
-            "default_model": catalog.default_model,
             "native_efforts": list(catalog.native_efforts),
             "model_info": _group_model_info_by_provider(
                 _compact_model_info_with_fallback(catalog.model_info, catalog.models)
@@ -347,13 +487,15 @@ def cached_models_for_listing(
     Attempts bounded live discovery via ``discover_profile_models`` — which
     itself reads a fresh on-disk cache first, so a subsequent call after a
     successful discovery stays cache-only (no subprocess spawn) as long as
-    the cache remains fresh and version-matched.  Falls back to
-    (*fallback_models*, *fallback_default*) when the profile has no live
-    discovery, the probe fails outright, or the discovered catalog itself
-    carries a discovery error or empty model list — never surfaces an
-    empty/unusable model list silently. The actual failure reason is not
-    discarded: it is preserved (sanitized, bounded) in ``discovery_diagnostics``
-    for ``profile_health`` to surface, and cleared on the next success.
+    the cache remains fresh and version-matched. Falls back to
+    (*fallback_models*, *fallback_default*) only when *profile* has no live
+    discovery at all (e.g. ``chatgpt_pro``). For a discovery-capable profile
+    (codex, claude, opencode, reasonix) a crashed probe, or a discovered
+    catalog carrying a discovery error or empty model list, yields an empty
+    list instead — a static allowlist is never surfaced as if it were a
+    live-verified catalog. The actual failure reason is not discarded: it
+    is preserved (sanitized, bounded) in ``discovery_diagnostics`` for
+    ``profile_health`` to surface, and cleared on the next success.
     """
     if profile not in _PROFILES_WITH_DISCOVERY:
         return fallback_models, fallback_default
@@ -362,36 +504,46 @@ def cached_models_for_listing(
         catalog = discover_profile_models(state_root, profile)
     except Exception as exc:
         discovery_diagnostics.record(profile, f"{profile} live discovery crashed: {exc}")
-        return fallback_models, fallback_default
+        return [], None
 
     if not catalog.models or catalog.error:
         discovery_diagnostics.record(
             profile, catalog.error or f"{profile} discovery returned no models"
         )
-        return fallback_models, fallback_default
+        return [], None
 
     discovery_diagnostics.clear_profile(profile)
     return list(catalog.models), catalog.default_model or fallback_default
 
 
 def live_profile_registry(state_root: Path) -> dict[str, Any]:
-    """``profile_registry()`` with codex/claude/opencode models overlaid by a
-    bounded live-discovery attempt (see ``cached_models_for_listing``).
+    """``profile_registry()`` with codex/claude/opencode/reasonix models
+    overlaid by a bounded live-discovery attempt (see
+    ``cached_models_for_listing``).
 
-    The three discovery-capable profiles are probed in parallel so
+    The four discovery-capable profiles are probed in parallel so
     aggregate latency is bounded by the slowest single probe rather than
     their sum — each probe already enforces its own subprocess timeout.
-    A failed probe falls back to the static registry entry for that
-    profile; a fresh, version-matched cache short-circuits back to a
-    cache read with no subprocess spawn. Entry schema stays identical to
-    ``profile_registry()`` (no keys added or removed), only
-    ``models``/``default_model`` values may change.
+    A failed probe yields an empty model list for that profile — never the
+    static registry entry, which would otherwise advertise hardcoded
+    models no live probe actually proved; a fresh, version-matched cache
+    short-circuits back to a cache read with no subprocess spawn. Entry
+    schema stays identical to ``profile_registry()`` (no keys added or
+    removed), only the ``models`` value may change.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     from .profiles import profile_registry
 
     registry = profile_registry()
+    disabled = {
+        value.strip()
+        for value in os.environ.get("AGENT_CROSSBAR_SKIP_PROFILES", "").split(",")
+        if value.strip()
+    }
+    for profile in disabled:
+        if profile in registry:
+            registry[profile]["models"] = []
 
     with ThreadPoolExecutor(max_workers=max(len(registry), 1)) as pool:
         futures = {
@@ -403,6 +555,7 @@ def live_profile_registry(state_root: Path) -> dict[str, Any]:
                 entry.get("default_model"),
             )
             for profile, entry in registry.items()
+            if profile not in disabled
         }
         for profile, future in futures.items():
             models, _default_model = future.result()
@@ -448,7 +601,6 @@ def cached_profile_health_entry(state_root: Path, profile: str) -> dict[str, Any
             "status": "registered",
             "runtime_checked": False,
             "discovery_available": True,
-            "default_model": None,
             "native_efforts": [],
             "model_info": {},
             "source": None,
@@ -470,7 +622,6 @@ def cached_profile_health_entry(state_root: Path, profile: str) -> dict[str, Any
         "status": "registered",
         "runtime_checked": True,
         "discovery_available": True,
-        "default_model": data.get("default_model"),
         "native_efforts": list(data.get("native_efforts", [])),
         "model_info": _group_model_info_by_provider(
             _compact_model_info_with_fallback(data.get("model_info", []), data.get("models", []))

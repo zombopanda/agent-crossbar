@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
-import re
 import threading
 import time
 import uuid
@@ -18,8 +17,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from agent_crossbar.acp_runtime import run_acp_job as _run_acp_job
-from agent_crossbar.adapters.claude import LocalSubprocessRunner, start_claude_interactive_tmux
 from agent_crossbar.adapters.registry import get_adapter
+from agent_crossbar.admission import admit_request
 from agent_crossbar.agent_runner import start_agent_job
 from agent_crossbar.discovery import (
     EFFORT_LEGEND,
@@ -37,6 +36,7 @@ from agent_crossbar.runner import (
     start_print_job,
     start_tmux_job,
 )
+from agent_crossbar.subprocess_runner import LocalSubprocessRunner
 from agent_crossbar.telemetry import TelemetryStore
 from agent_crossbar.validation import validate_start_request
 from agent_crossbar.writer_lease import WriterLeaseResult, WriterLeaseStore
@@ -149,15 +149,14 @@ def _tool_error(error: str, message: str) -> dict[str, Any]:
 
 def _normalize_profile_transport(profile: str, transport: str) -> str:
     """Apply profile-implied transport defaults for convenience tools."""
-    if profile == "chatgpt_pro":
-        return "gui"
-    return transport
+    adapter_transport = getattr(get_adapter(profile), "default_transport", None)
+    return adapter_transport or transport
 
 
 def _advice_timeout_sec(profile: str, timeout_sec: int | None) -> int:
     if timeout_sec is not None:
         return timeout_sec
-    if profile == "chatgpt_pro":
+    if getattr(get_adapter(profile), "default_transport", None) == "gui":
         return CHATGPT_PRO_DEFAULT_TIMEOUT_SEC
     return 1800
 
@@ -246,9 +245,20 @@ def _validate_and_create_job(
     result = validate_start_request(req, state_root=_state_root())
     if not result["ok"]:
         return result
+    admission = admit_request(
+        {
+            **req,
+            "profile": result.get("profile"),
+            "operation": result.get("operation"),
+            "model": result.get("model"),
+        }
+    )
+    if not admission.allowed:
+        return _tool_error(admission.error or "admission_denied", admission.message)
 
     profile = result["profile"]
     operation = result["operation"]
+    adapter = get_adapter(profile)
     req["profile"] = profile
     req["operation"] = operation
     store = _job_store()
@@ -272,8 +282,8 @@ def _validate_and_create_job(
         },
     )
     warnings = list(result.get("warnings", []))
-    if profile == "codex" and operation == "review" and req["transport"] == "print":
-        warning = "context bypass risk accepted for native Codex review"
+    warning = getattr(adapter, "review_warning", None)
+    if warning and operation == "review" and req["transport"] == "print":
         warnings.append(warning)
         job.events.write(
             level="warn",
@@ -449,13 +459,6 @@ def agent_start(
         except ValueError:
             return _tool_error("invalid_profile", f"Unknown profile '{profile}'")
         if not adapter.supports_interactive:
-            if resolved == "claude":
-                return _tool_error(
-                    "interactive_not_supported",
-                    "claude --bg is the supported subscription mode; claude -p is disabled due "
-                    "to ambiguous separate-credit or metered billing. Omit interactive or "
-                    "choose another supported provider.",
-                )
             return _tool_error(
                 "interactive_not_supported",
                 f"Profile '{resolved}' does not support interactive mode. "
@@ -489,16 +492,11 @@ def agent_start(
         if operation not in _prof_ops(resolved):
             operation = "text"
 
-    if resolved == "reasonix" and interactive:
+    adapter = get_adapter(resolved)
+    if interactive and adapter.supports_interactive:
         transport = "tmux"  # real interactive TUI lifecycle
-    elif resolved == "chatgpt_pro":
-        transport = "gui"
-    elif resolved == "claude":
-        transport = (
-            "print"  # claude_bg adapter lifecycle; "print" is internal routing label, not claude -p
-        )
     else:
-        transport = "print"
+        transport = getattr(adapter, "default_transport", None) or "print"
 
     autonomy = "edit_local" if task == "dev" else "read_only"
 
@@ -548,190 +546,83 @@ def agent_start(
         )
         writer_lease_holder[0] = None
 
-    def _handle_impl(prevalidated: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _handle_impl(
+        prevalidated: dict[str, Any] | None = None,
+        *,
+        admission_checked: bool = False,
+    ) -> dict[str, Any]:
         result = prevalidated or validate_start_request(req, state_root=_state_root())
         if not result["ok"]:
             return result
+        if not admission_checked:
+            admission = admit_request(
+                {
+                    **req,
+                    "profile": result.get("profile"),
+                    "operation": result.get("operation"),
+                    "model": result.get("model"),
+                    "task": task,
+                }
+            )
+            if not admission.allowed:
+                return _tool_error(admission.error or "admission_denied", admission.message)
 
         run_req = dict(req)
         run_req["profile"] = result["profile"]
         run_req["operation"] = result["operation"]
+        # Normal validation always returns canonical model/effort values. The
+        # fallback preserves compatibility with narrow test/in-process callers
+        # that inject an older validation result without those keys.
+        canonical_model = result.get("model") or model
+        canonical_effort = result["effort"] if "effort" in result else effort
         effective_cwd = run_req.get("cwd") or os.getcwd()
+        adapter = get_adapter(result["profile"])
 
-        # ── Claude: adapter-native lifecycle ──
-        if result["profile"] == "claude":
-            adapter = get_adapter(result["profile"])
-            runner = LocalSubprocessRunner()
-
-            # Check readiness before any state mutation
-            readiness = adapter.check_readiness(runner)
-            if not readiness.authenticated:
+        if callable(getattr(adapter, "check_readiness", None)) and callable(
+            getattr(adapter, "launch", None)
+        ):
+            start_lifecycle = getattr(adapter, "start_lifecycle", None)
+            if not callable(start_lifecycle):
                 return _tool_error(
-                    readiness.error_code or "not_ready",
-                    readiness.remediation or "Claude is not ready",
+                    "lifecycle_dispatch_unsupported",
+                    f"Adapter '{adapter.name}' exposes no lifecycle dispatch",
                 )
 
-            # Launch via adapter — use original user params, not validation defaults
-            resolved_model = model  # may be None if user didn't request one
-            resolved_effort = effort or "medium"
-            launch_result = adapter.launch(
-                runner,
-                model=resolved_model,
+            return start_lifecycle(
+                result=result,
+                interactive=interactive,
+                client=client,
+                client_session_id=client_session_id,
+                client_name=client_name,
+                model=canonical_model,
+                effort=canonical_effort,
                 task=task,
                 prompt=prompt,
-                cwd=effective_cwd,
-                effort=resolved_effort,
-                interactive=interactive,
-            )
-            if launch_result.error:
-                return _tool_error(
-                    launch_result.error,
-                    launch_result.message or "Launch failed",
-                )
-
-            session_id = launch_result.session_id
-            if session_id is None:
-                return _tool_error(
-                    "session_id_missing",
-                    "Claude launched but no session ID was returned",
-                )
-
-            # Create durable job
-            store = _job_store()
-            effective_transport = "tmux" if interactive else launch_result.backend
-
-            job = store.create_job(
-                profile=result["profile"],
-                operation=result["operation"],
-                transport=effective_transport,
-                sensitivity=run_req["sensitivity"],
-                client_session_id=_effective_client_session_id(client, client_session_id),
-                client_name=_client_metadata(client, client_name)["name"],
-                cwd=effective_cwd,
-            )
-            _attach_writer_lease(store, job.job_id)
-
-            # ── Interactive: launch tmux claude attach session ──
-            tmux_session_name: str | None = None
-            if interactive:
-                safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", job.job_id).strip("-")
-                tmux_session_name = f"agents-{safe_id}"
-                output_path = job.path / "tmux-output.log"
-                tmux_result = start_claude_interactive_tmux(
-                    session_id=session_id,
-                    job_id=job.job_id,
-                    cwd=effective_cwd,
-                    tmux_session_name=tmux_session_name,
-                    output_path=output_path,
-                )
-                if tmux_result.returncode != 0:
-                    # The native background session already exists. Roll it
-                    # back before exposing a failed start so a retry cannot
-                    # duplicate a still-running provider turn.
-                    try:
-                        cancelled = adapter.cancel(runner, session_id)
-                    except Exception as exc:
-                        cancelled = False
-                        store.send_event(
-                            job.job_id,
-                            level="error",
-                            type="cancel_error",
-                            message=f"Rollback cancel threw: {exc}",
-                            data={"session_id": session_id},
-                        )
-                    if not cancelled:
-                        store.send_event(
-                            job.job_id,
-                            level="warn",
-                            type="cancel_warning",
-                            message="Rollback cancel failed; native session may still be running",
-                            data={"session_id": session_id},
-                        )
-                    store.set_result(
-                        job.job_id,
-                        ok=False,
-                        summary=f"tmux session creation failed: {tmux_result.stderr[:500]}",
-                    )
-                    return {
-                        "ok": False,
-                        "error": "tmux_launch_failed",
-                        "message": tmux_result.stderr[:500],
-                        "job_id": job.job_id,
-                    }
-
-            store.update_job_meta(
-                job.job_id,
-                {
-                    "backend": launch_result.backend,
-                    "native_session_id": session_id,
-                    "model": resolved_model,
-                    "effort": resolved_effort,
-                    "task": task,
-                    "interactive": interactive,
-                    "cwd": effective_cwd,
-                    "adapter_name": adapter.name,
-                    "max_runtime_sec": max_runtime_sec,
-                    **(
-                        {
-                            "tmux_session": tmux_session_name,
-                            "tmux_output_path": str(output_path),
-                            "transport": "tmux",
-                        }
-                        if interactive
-                        else {}
-                    ),
-                },
-            )
-            job.events.write(
-                level="info",
-                type="job_created",
-                message="Job created",
-                data={
-                    "profile": result["profile"],
-                    "operation": result["operation"],
-                    "transport": run_req["transport"],
-                    "backend": launch_result.backend,
-                    "native_session_id": session_id,
-                    **({"tmux_session": tmux_session_name} if interactive else {}),
-                },
-            )
-
-            start_agent_job(
-                store,
-                job.job_id,
-                adapter,
-                session_id=session_id,
-                poll_interval_sec=2.0,
+                effective_cwd=effective_cwd,
                 max_runtime_sec=max_runtime_sec,
+                run_req=run_req,
+                store=_job_store(),
+                attach_writer_lease=_attach_writer_lease,
+                session_id_for=_effective_client_session_id,
+                metadata_for=_client_metadata,
+                agent_starter=start_agent_job,
+                tool_error=_tool_error,
             )
-
-            return {
-                "ok": True,
-                "job_id": job.job_id,
-                "profile": result["profile"],
-                "operation": result["operation"],
-                "backend": launch_result.backend,
-                "warnings": list(result.get("warnings", [])),
-            }
 
         # ── ACP path: Codex/OpenCode adapters ──
-        adapter = get_adapter(result["profile"])
-        _acp_profiles = frozenset({"codex", "opencode"})
-        if result["profile"] in _acp_profiles and getattr(adapter, "backend", None) == "acp":
+        if getattr(adapter, "backend", None) == "acp":
             # ── Preflight: provider-specific readiness before any state mutation ──
             # Explicit effort may fall back to print when the installed ACP
             # agent cannot prove support for the session config selector. This
             # preserves the legacy path for an older/unavailable ACP bridge.
-            from agent_crossbar.acp_lifecycle import (
-                check_codex_acp_readiness,
-                check_opencode_acp_readiness,
-            )
-
             preflight_runner = LocalSubprocessRunner()
-            if result["profile"] == "codex":
-                readiness = check_codex_acp_readiness(preflight_runner)
-            else:
-                readiness = check_opencode_acp_readiness(preflight_runner)
+            acp_readiness = getattr(adapter, "acp_readiness", None)
+            if not callable(acp_readiness):
+                return _tool_error(
+                    "acp_profile_unsupported",
+                    f"No ACP readiness probe is registered for '{result['profile']}'",
+                )
+            readiness = acp_readiness(preflight_runner)
 
             # ── Effort routing ──
             # Some ACP agents do not advertise a session config selector for
@@ -758,8 +649,8 @@ def agent_start(
                     {
                         "backend": "print",
                         "effort_routing": "explicit_effort_print_fallback",
-                        "model": model,
-                        "effort": effort,
+                        "model": canonical_model,
+                        "effort": result.get("resolved_effort") or canonical_effort,
                         "task": task,
                         "interactive": interactive,
                         "cwd": effective_cwd,
@@ -776,10 +667,14 @@ def agent_start(
                         "operation": result["operation"],
                         "backend": "print",
                         "effort_routing": "explicit_effort_print_fallback",
-                        "effort": effort,
+                        "effort": result.get("resolved_effort") or canonical_effort,
                     },
                 )
-                start_print_job(store, job.job_id, run_req, timeout_sec=timeout_sec)
+                canonical_req = dict(run_req)
+                canonical_req["model"] = canonical_model
+                if canonical_effort is not None:
+                    canonical_req["effort"] = canonical_effort
+                start_print_job(store, job.job_id, canonical_req, timeout_sec=timeout_sec)
                 warnings = list(result.get("warnings", []))
                 warnings.append(
                     {
@@ -812,7 +707,9 @@ def agent_start(
             store = _job_store()
             resolved_model = result["model"]
             resolved_effort = (
-                result["effort"] if getattr(adapter, "supports_acp_effort", False) else None
+                result.get("resolved_effort") or result["effort"]
+                if getattr(adapter, "supports_acp_effort", False)
+                else None
             )
 
             job = store.create_job(
@@ -947,6 +844,17 @@ def agent_start(
         prevalidated = validate_start_request(req, state_root=_state_root())
         if not prevalidated["ok"]:
             return prevalidated
+        admission = admit_request(
+            {
+                **req,
+                "profile": prevalidated.get("profile"),
+                "operation": prevalidated.get("operation"),
+                "model": prevalidated.get("model"),
+                "task": task,
+            }
+        )
+        if not admission.allowed:
+            return _tool_error(admission.error or "admission_denied", admission.message)
         effective_cwd = req.get("cwd") or os.getcwd()
         # A deadline-expired orphaned predecessor must not block a replacement
         # dev writer past its declared runtime. Reap before acquiring the lease
@@ -957,12 +865,13 @@ def agent_start(
             effective_cwd,
             owner_id=f"pending:{uuid.uuid4().hex}",
             owner_kind="pending_dev",
+            session_id=_effective_client_session_id(client, client_session_id),
         )
         if not pending.ok:
             return _tool_error("writer_busy", pending.message or "development writer is busy")
         writer_lease_holder = [pending]
         try:
-            return _handle_impl(prevalidated)
+            return _handle_impl(prevalidated, admission_checked=True)
         finally:
             lease = writer_lease_holder[0] if writer_lease_holder is not None else None
             if lease is not None and lease.token is not None:
@@ -1183,13 +1092,14 @@ def job_stop(
 
         # Native lifecycle: cancel via adapter before marking stopped
         backend = meta.get("backend")
-        if backend in ("claude_bg", "claude_bg_pty"):
+        try:
+            adapter = get_adapter(meta.get("adapter_name") or meta.get("profile") or "")
+        except ValueError:
+            adapter = None
+        if getattr(adapter, "native_lifecycle", False):
             session_id = meta.get("native_session_id")
             if session_id:
                 try:
-                    adapter = get_adapter(
-                        meta.get("adapter_name") or meta.get("profile") or "claude"
-                    )
                     runner = LocalSubprocessRunner()
                     cancelled = adapter.cancel(runner, session_id)
                     if not cancelled:
@@ -1209,9 +1119,13 @@ def job_stop(
                         data={"session_id": session_id},
                     )
 
-        # ACP backend: mark stopped first (prevents background set_result race),
-        # then safely terminate the recorded ACP child process.
-        acp_stop_data: dict | None = None
+            # ACP backend: mark stopped first (prevents background set_result race),
+            # then terminate the recorded ACP child process. Termination evidence is
+            # collected through the generic run-handle cancellation the worker
+            # registered; only when no handle exists (worker never started) is a
+            # direct safe_acp_termination fallback used, so the envelope still
+            # carries an honest acp_stop receipt.
+            cleanup_data: dict | None = None
         if backend == "acp":
             # Mark stopped BEFORE termination so background completion cannot
             # resurrect the job via set_result.
@@ -1224,16 +1138,19 @@ def job_stop(
             )
             if not stopped.get("ok"):
                 return stopped
-            from agent_crossbar.acp_runtime import safe_acp_termination
+            stop_data = stopped.get("stop_data") or {}
+            cleanup_data = stop_data.get("acp_stop")
+            if not isinstance(cleanup_data, dict):
+                meta = store._read_job_meta(job.path)  # re-read after stop_job
+                from agent_crossbar.acp_runtime import safe_acp_termination
 
-            meta = store._read_job_meta(job.path)  # re-read after stop_job
-            acp_stop_data = safe_acp_termination(meta)
+                cleanup_data = safe_acp_termination(meta)
             store.send_event(
                 job_id,
-                level="info" if acp_stop_data.get("terminated") else "warn",
-                type="acp_stop",
-                message=f"ACP termination: {acp_stop_data.get('reason', 'unknown')}",
-                data=acp_stop_data,
+                level="info" if cleanup_data.get("terminated") else "warn",
+                type="provider_cleanup",
+                message=f"Provider cleanup: {cleanup_data.get('reason', 'unknown')}",
+                data=cleanup_data,
             )
             summary = f"Job stopped: {reason}"
             envelope = build_result_envelope(
@@ -1260,15 +1177,22 @@ def job_stop(
                     "backend": "acp",
                     "cwd": meta.get("cwd"),
                 },
-                technical={"acp_stop": acp_stop_data},
+                technical={"provider_cleanup": cleanup_data},
             )
-            persisted = store.set_stopped_result(job_id, summary=summary, envelope=envelope)
+            cleanup_confirmed = bool(cleanup_data.get("terminated"))
+            envelope["technical"]["cleanup_confirmed"] = cleanup_confirmed
+            persisted = store.set_stopped_result(
+                job_id,
+                summary=summary,
+                envelope=envelope,
+                release_writer_lease=cleanup_confirmed,
+            )
             if not persisted.get("ok"):
                 return persisted
             return {
                 "ok": True,
                 "job_id": job_id,
-                "acp_stop": acp_stop_data,
+                "cleanup": cleanup_data,
             }
 
         return store.stop_job(

@@ -14,6 +14,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import subprocess
@@ -885,7 +886,11 @@ def check_chatgpt_pro_readiness(runner: Any = None) -> ProbeResult:
 
 
 def _cache_key(profile: str) -> str:
-    return f"readiness:{profile}"
+    # A process can serve tests/controllers that point at different durable
+    # state roots. Keep their readiness evidence isolated while retaining the
+    # one-minute cache for repeated calls within the same configured root.
+    state_root = os.environ.get("AGENT_CROSSBAR_STATE_DIR", "")
+    return f"readiness:{state_root}:{profile}"
 
 
 class _ReadinessCache:
@@ -920,7 +925,6 @@ class _ReadinessCache:
 # Module-level cache instance
 readiness_cache = _ReadinessCache()
 
-
 # ── Public API ──────────────────────────────────────────────────────────────
 
 
@@ -952,19 +956,10 @@ def probe_profile(
         if cached is not None:
             return cached
 
-    # Run the provider-specific probe
-    if profile == "claude":
-        pr = check_claude_readiness(_runner)
-    elif profile == "codex":
-        pr = check_codex_readiness(_runner)
-    elif profile == "opencode":
-        pr = check_opencode_readiness(_runner)
-    elif profile == "reasonix":
-        pr = check_reasonix_readiness(_runner)
-    elif profile == "chatgpt_pro":
-        pr = check_chatgpt_pro_readiness(_runner)
-    else:
-        raise ValueError(f"No probe for profile: {profile!r}")
+    probe = getattr(adapter, "readiness_probe", None)
+    if not callable(probe):
+        raise ValueError(f"Adapter has no readiness probe: {profile!r}")
+    pr = probe(_runner)
 
     result = pr.to_readiness(profile, support_tier)
 
@@ -995,7 +990,14 @@ def probe_all_profiles(
     from agent_crossbar.profiles import list_profiles
 
     results: dict[str, ReadinessResult] = {}
+    disabled = {
+        value.strip()
+        for value in os.environ.get("AGENT_CROSSBAR_SKIP_PROFILES", "").split(",")
+        if value.strip()
+    }
     for profile in list_profiles():
+        if profile in disabled:
+            continue
         try:
             results[profile] = probe_profile(profile, _runner=_runner, use_cache=use_cache)
         except Exception as exc:

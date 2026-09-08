@@ -41,8 +41,7 @@ class LaunchPlan:
     message: str = ""
 
 
-# Reasonix model allowlist.
-REASONIX_ALLOWED_MODELS: frozenset[str] = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+_REASONIX_MODEL_RE = re.compile(r"^[^/\s]+(?:/[^/\s]+)?$")
 
 
 def reasonix_shell_mcp_spec() -> str:
@@ -132,10 +131,18 @@ def _reasonix_plan(
             error="missing_model",
             message="Model is required for Reasonix",
         )
-    if model not in REASONIX_ALLOWED_MODELS:
+    # The live Reasonix catalog supplies qualified provider/model IDs. This
+    # plan builder deliberately validates only the shape; server preflight
+    # proves membership in the current doctor catalog before it reaches here.
+    # A bare value remains accepted for internal callers that already performed
+    # their own validation; it is never a discovery or profile fallback.
+    if not _REASONIX_MODEL_RE.fullmatch(model):
         return LaunchPlan(
             error="invalid_model",
-            message=f"Model '{model}' not allowed for Reasonix. Allowed: {sorted(REASONIX_ALLOWED_MODELS)}",
+            message=(
+                f"Model '{model}' is not a qualified Reasonix model ID; "
+                "expected '<provider>/<model>' from live discovery"
+            ),
         )
     if operation == "dev":
         prompt = reasonix_dev_prompt(prompt)

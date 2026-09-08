@@ -430,6 +430,11 @@ def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeyp
         def launch(self, _runner, **_kwargs):
             return LaunchResult(session_id=None, backend="claude_bg")
 
+        def start_lifecycle(self, **kwargs):
+            from agent_crossbar.adapters.claude_lifecycle import start_claude_job
+
+            return start_claude_job(adapter=self, **kwargs)
+
     monkeypatch.setattr(server, "get_adapter", lambda _profile: FakeClaudeAdapter())
     result = server.agent_start(
         profile="claude",
@@ -492,6 +497,11 @@ def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
                 args=["claude", "--bg", "hello"],
                 cwd="/tmp",
             )
+
+        def start_lifecycle(self, **kwargs):
+            from agent_crossbar.adapters.claude_lifecycle import start_claude_job
+
+            return start_claude_job(adapter=self, **kwargs)
 
     monkeypatch.setattr(server, "get_adapter", lambda _profile: FakeClaudeAdapter())
 

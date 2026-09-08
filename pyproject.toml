@@ -1,6 +1,6 @@
 [project]
 name = "agent-crossbar"
-version = "0.3.8"
+version = "0.4.0"
 description = "Agent Crossbar — delegate review, advice, text, and dev work to local coding agents through MCP"
 requires-python = ">=3.11"
 dependencies = [
@@ -31,19 +31,45 @@ packages = ["src/agent_crossbar", "src/agent_harness_mcp"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [
+    ".beads/**",
+    "**/.beads/**",
+    "AGENTS.md",
+    "**/AGENTS.md",
+    "CLAUDE.md",
+    "**/CLAUDE.md",
+    ".codex/**",
+    "**/.codex/**",
     ".reasonix/",
+    "**/.reasonix/**",
     ".memsearch/",
+    "**/.memsearch/**",
+    ".memsearch.toml",
+    "**/.memsearch.toml",
+    ".delta/",
+    ".delta/**",
+    "**/.delta/**",
     ".pytest_cache/",
     ".ruff_cache/",
     ".DS_Store",
     "*.tgz",
     "results/",
+    "**/results/**",
+    "**/*.db",
+    "**/*.db-*",
+    "**/*.sqlite",
+    "**/*.sqlite-*",
     "scripts/",
     "bin/agent-harness-mcp.mjs",
     "workspace_test_output.txt",
     ".claude/",
     ".idea/",
     "openspec/",
+    "tests/",
+    "**/tests/**",
+    ".github/",
+    ".github/**",
+    "demo/",
+    "**/demo/**",
 ]
 
 [tool.ruff]

@@ -4,6 +4,16 @@ All notable changes to Agent Crossbar.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-07
+
+### Changed
+- Admission is an optional local, provider-neutral callback. Strict mode
+  admits only the exact profile/model/task candidate returned by the external
+  quota policy; it never rewrites requests or selects fallbacks.
+- Maintainer live gates run locally with authenticated provider CLIs. The
+  GitHub-hosted workflow was removed because stock runners do not provide
+  those CLIs or credentials.
+
 ## [0.3.7] — 2026-07-29
 
 ### Added
@@ -110,9 +120,9 @@ All notable changes to Agent Crossbar.
 - Distribution name: `agent-harness-mcp` → `agent-crossbar`.
 - State directory default: `~/.local/state/agent-crossbar`.
 - All env vars use `AGENT_CROSSBAR_` prefix.
-- npm package: `@pandenko/agent-harness-mcp` → `agent-crossbar` (no scope).
+- npm package: the formerly scoped package → `agent-crossbar` (no scope).
 - Removed private registry metadata from public package/docs.
-- Removed `@pandenko` branding from public-facing files.
+- Removed personal branding from public-facing files.
 
 ### Fixed
 - `requires-python` lowered from `>=3.13` to `>=3.11` after compatibility verification.

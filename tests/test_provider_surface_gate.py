@@ -58,6 +58,28 @@ def test_reverse_words_verification_uses_current_python_runtime(tmp_path, monkey
     assert captured["argv"] == [gate.sys.executable, "-m", "pytest", "test_reverse_words.py"]
 
 
+def test_dev_gate_retains_generated_fixture_and_receipts(tmp_path):
+    (tmp_path / "reverse_words.py").write_text("def reverse_words(text): return text\n")
+    (tmp_path / "test_reverse_words.py").write_text("def test_ok(): assert True\n")
+    artifact_dir = tmp_path / "artifacts"
+    case = gate.GateCase("opencode", "opencode-go/deepseek-v4-flash", None, "dev", False)
+
+    retained = gate._retain_dev_artifact(
+        tmp_path,
+        artifact_dir,
+        case,
+        "job-123",
+        {"ok": True, "summary": "tests passed"},
+        {"events": []},
+    )
+
+    assert retained is not None
+    assert (retained / "reverse_words.py").read_text().startswith("def reverse_words")
+    assert (retained / "test_reverse_words.py").exists()
+    assert (retained / "job-result.json").exists()
+    assert (retained / "job-tail.json").exists()
+
+
 def test_workspace_tempdir_lives_inside_trusted_package_repo():
     with gate._workspace_tempdir() as work_dir:
         assert Path(work_dir).parent == gate.PACKAGE_DIR
@@ -146,6 +168,19 @@ def test_agent_start_args_for_review_task():
     assert args["task"] == "review"
     assert args["prompt"] == "Reply with exactly GPT_PRO_PROVIDER_GATE_OK"
     assert args["interactive"] is False
+
+
+def test_claude_gate_uses_neutral_identifier_prompt():
+    case = gate.GateCase(
+        profile="claude",
+        model="claude-sonnet-5",
+        effort=None,
+        task="ask",
+        interactive=False,
+    )
+    assert gate._agent_start_args(case)["prompt"] == (
+        "Output this identifier as a standalone line: GPT_PRO_PROVIDER_GATE_OK"
+    )
 
 
 def test_agent_start_args_for_dev_task_includes_cwd_and_dev_prompt(tmp_path):
@@ -253,9 +288,9 @@ def test_main_allows_ask_task(monkeypatch):
     result = gate.main(
         [
             "--profile",
-            "reasonix",
+            "opencode",
             "--model",
-            "deepseek-v4-pro",
+            "opencode-go/deepseek-v4-flash",
             "--task",
             "ask",
         ]
@@ -278,9 +313,9 @@ def test_main_allows_review_task(monkeypatch):
     gate.main(
         [
             "--profile",
-            "reasonix",
+            "opencode",
             "--model",
-            "deepseek-v4-pro",
+            "opencode-go/deepseek-v4-flash",
             "--task",
             "review",
         ]

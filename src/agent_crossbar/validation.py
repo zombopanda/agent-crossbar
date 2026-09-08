@@ -5,11 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from agent_crossbar.adapters.registry import get_adapter
 from agent_crossbar.models import Autonomy, Operation, Sensitivity, Transport
 from agent_crossbar.profiles import (
-    CODEX_DEFAULT_EFFORT,
-    CODEX_EFFORT_ALIASES,
-    CODEX_EFFORTS,
     allowed_models,
     profile_interactive,
     profile_operations,
@@ -122,135 +120,55 @@ def validate_start_request(
 
     normalized_model: str | None = None
     normalized_effort: str | None = None
+    resolved_effort: str | None = None
     model = req["model"]
     models = allowed_models(resolved)
+    adapter = get_adapter(resolved)
 
-    # Validate model against the profile's known allowlist.
-    # Profiles with no model allowlist (e.g. chatgpt_pro) skip this check —
-    # model is still required but the value is accepted as-is.
-    if resolved not in {"codex", "opencode", "claude"} and models and model not in models:
-        return fail("invalid_model", f"Model '{model}' is not supported for profile '{resolved}'")
-    normalized_model = model
-
-    if resolved == "codex":
-        if state_root is None:
-            return fail("discovery_error", "state_root is required for Codex model discovery")
-
-        from agent_crossbar.adapters.codex import adapter as codex_adapter
-        from agent_crossbar.discovery import discover_profile_models
-
-        sr = Path(state_root) if not isinstance(state_root, Path) else state_root
-        try:
-            catalog = discover_profile_models(sr, "codex")
-        except Exception as exc:
-            return fail("discovery_error", f"Codex model discovery failed: {exc}")
-
-        if catalog.error:
-            return fail("discovery_error", f"Codex model discovery failed: {catalog.error}")
-        if not catalog.models:
-            return fail("discovery_error", "No Codex models discovered")
-        if model not in catalog.models:
+    if not adapter.live_model_discovery:
+        # Profiles with no live model discovery (e.g. chatgpt_pro) validate
+        # against a static allowlist when one is declared; model is still
+        # required but is otherwise accepted as-is.
+        if models and model not in models:
             return fail(
-                "invalid_model",
-                f"Model '{model}' is not available in Codex "
-                f"(discovered: {', '.join(catalog.models)})",
+                "invalid_model", f"Model '{model}' is not supported for profile '{resolved}'"
             )
-
-        effort = req.get("effort") or CODEX_DEFAULT_EFFORT
-        effort = CODEX_EFFORT_ALIASES.get(effort, effort)
-        if effort not in CODEX_EFFORTS:
-            return fail(
-                "invalid_effort", f"Effort '{effort}' is not supported for profile '{resolved}'"
-            )
-        req["effort"] = effort
-        normalized_effort = effort
-
-        # Rule: Codex effort must be supported by the selected model's discovered capabilities.
-        err = codex_adapter.validate_effort_for_model(effort, catalog, model)
-        if err is not None:
-            return fail("unsupported_effort_for_model", err)
-
-    # Rule: OpenCode validates against the live model catalog obtained via
-    # discover_profile_models — which uses the cache when fresh and performs
-    # a bounded live refresh only when missing or stale.  There is no static
-    # allowlist fallback; a missing/error/empty catalog fails preflight.
-    if resolved == "opencode":
+        normalized_model = model
+    else:
+        # Live-discovery profiles (Claude, Codex, OpenCode, Reasonix) never
+        # fall back to a static allowlist — a missing/error/empty catalog
+        # fails preflight closed. Model resolution (exact or qualified-suffix)
+        # and effort resolution/validation are adapter-owned.
         if state_root is None:
-            return fail("discovery_error", "state_root is required for OpenCode model discovery")
-
-        from agent_crossbar.adapters.opencode import adapter as opencode_adapter
-        from agent_crossbar.discovery import discover_profile_models
-
-        sr = Path(state_root) if not isinstance(state_root, Path) else state_root
-
-        try:
-            catalog = discover_profile_models(sr, "opencode")
-        except Exception as exc:
-            return fail("discovery_error", f"OpenCode model discovery failed: {exc}")
-
-        if catalog.error:
-            return fail("discovery_error", f"OpenCode model discovery failed: {catalog.error}")
-
-        if not catalog.models:
-            return fail("discovery_error", "No OpenCode models discovered")
-
-        # Match the required model against the live catalog. OpenCode's model
-        # list is dynamic, so no static allowlist may reject it first.
-        catalog_model_ids = set(catalog.models)
-        if model in catalog_model_ids:
-            # Model already matches a catalog entry — use as-is
-            pass
-        else:
-            # Try suffix match: short name matches the part after
-            # the last slash in a catalog model ID.
-            matched = None
-            for cid in catalog.models:
-                if "/" in cid and cid.split("/", 1)[1] == model:
-                    matched = cid
-                    break
-            if matched is not None:
-                model = matched
-                normalized_model = model
-                req["model"] = model
-            else:
-                return fail(
-                    "invalid_model",
-                    f"Model '{model}' is not available in OpenCode "
-                    f"(discovered: {', '.join(catalog.models)})",
-                )
-
-        # Validate effort against per-model discovery data
-        effort = req.get("effort")
-        if effort is not None:
-            err = opencode_adapter.validate_effort_for_model(effort, catalog, model)
-            if err is not None:
-                return fail("unsupported_effort_for_model", err)
-            normalized_effort = effort
-
-    # Claude's public model values are live, versioned CLI IDs parsed from the
-    # /model picker. Do not accept mutable family aliases or static fallbacks.
-    if resolved == "claude":
-        if state_root is None:
-            return fail("discovery_error", "state_root is required for Claude model discovery")
+            return fail("discovery_error", f"state_root is required for {resolved} model discovery")
 
         from agent_crossbar.discovery import discover_profile_models
 
         sr = Path(state_root) if not isinstance(state_root, Path) else state_root
         try:
-            catalog = discover_profile_models(sr, "claude")
+            catalog = discover_profile_models(sr, resolved)
         except Exception as exc:
-            return fail("discovery_error", f"Claude model discovery failed: {exc}")
+            return fail("discovery_error", f"{resolved} model discovery failed: {exc}")
 
         if catalog.error:
-            return fail("discovery_error", f"Claude model discovery failed: {catalog.error}")
+            return fail("discovery_error", f"{resolved} model discovery failed: {catalog.error}")
         if not catalog.models:
-            return fail("discovery_error", "No Claude models discovered")
-        if model not in catalog.models:
-            return fail(
-                "invalid_model",
-                f"Model '{model}' is not available in Claude "
-                f"(discovered: {', '.join(catalog.models)})",
-            )
+            return fail("discovery_error", f"No {resolved} models discovered")
+
+        resolved_model, model_error = adapter.resolve_model_id(model, catalog)
+        if model_error is not None:
+            return fail(*model_error)
+        model = resolved_model
+        normalized_model = model
+        req["model"] = model
+
+        normalized_effort, resolved_effort, effort_error = adapter.validate_effort(
+            req.get("effort"), catalog, model
+        )
+        if effort_error is not None:
+            return fail(*effort_error)
+        if normalized_effort is not None:
+            req["effort"] = normalized_effort
 
     return {
         "ok": True,
@@ -262,4 +180,5 @@ def validate_start_request(
         "operation": req["operation"],
         "model": normalized_model,
         "effort": normalized_effort,
+        "resolved_effort": resolved_effort,
     }

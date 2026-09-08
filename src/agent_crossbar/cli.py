@@ -308,6 +308,7 @@ def writer_lease_cmd(
     cwd: str | None = None,
     owner_id: str | None = None,
     owner_kind: str = "local",
+    session_id: str | None = None,
     token: str | None = None,
     acknowledgement: str | None = None,
     state_dir: str | None = None,
@@ -321,7 +322,7 @@ def writer_lease_cmd(
         if not cwd or not owner_id:
             print(json.dumps({"ok": False, "error": "cwd_and_owner_required"}))
             return 1
-        result = store.acquire(cwd, owner_id=owner_id, owner_kind=owner_kind)
+        result = store.acquire(cwd, owner_id=owner_id, owner_kind=owner_kind, session_id=session_id)
         print(json.dumps(result.to_dict()))
         return 0 if result.ok else 1
     if command == "release":
@@ -416,6 +417,7 @@ def _build_parser() -> argparse.ArgumentParser:
     writer_lease.add_argument("--cwd", metavar="PATH")
     writer_lease.add_argument("--owner-id", metavar="ID")
     writer_lease.add_argument("--owner-kind", default="local", metavar="KIND")
+    writer_lease.add_argument("--session-id", metavar="ID")
     writer_lease.add_argument("--token", metavar="TOKEN")
     writer_lease.add_argument("--acknowledgement", metavar="TEXT")
     return parser
@@ -449,6 +451,7 @@ def main() -> None:
                 cwd=args.cwd,
                 owner_id=args.owner_id,
                 owner_kind=args.owner_kind,
+                session_id=args.session_id,
                 token=args.token,
                 acknowledgement=args.acknowledgement,
                 state_dir=args.state_dir,

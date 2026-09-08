@@ -223,7 +223,7 @@ root, pass that exact root explicitly; a job ID alone is not enough to locate a
 job across MCP processes:
 
 ```bash
-uv run --directory /Users/bo/dev/tools/agent-crossbar \
+uv run --directory <agent-crossbar-repo> \
   python -m agent_crossbar.cli wait-job \
   --job-id "<job-id>" \
   --state-dir "<the-state-root-used-by-Agents-MCP>" \
@@ -241,10 +241,10 @@ prompt is visible in `job_tail`, or the declared runtime deadline has elapsed,
 use the explicit stop-then-collect wrapper (never for silence alone):
 
 ```bash
-python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/terminalize_job.py \
+python3 ${CODEX_HOME}/skills/quota-aware-delegation/scripts/terminalize_job.py \
   "<job-id>" blocking_prompt
 # or, after the runtime deadline:
-python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/terminalize_job.py \
+python3 ${CODEX_HOME}/skills/quota-aware-delegation/scripts/terminalize_job.py \
   "<job-id>" runtime_deadline
 ```
 
@@ -265,10 +265,10 @@ same configured state through the quota-aware wrapper, which avoids guessing
 the Agents MCP state root:
 
 ```bash
-python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+python3 ${CODEX_HOME}/skills/quota-aware-delegation/scripts/writer_lease.py \
   acquire --cwd "<cwd>" --owner-id "<controller-id>" --owner-kind local
 # hold the returned token for the full edit/test window, then:
-python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+python3 ${CODEX_HOME}/skills/quota-aware-delegation/scripts/writer_lease.py \
   release --token "<token>"
 ```
 
@@ -280,7 +280,7 @@ missing, or corrupt. If a job record is truly missing or corrupt, an operator
 may use the explicit recovery path after preserving the state directory:
 
 ```bash
-python3 ${CODEX_HOME:-/Users/bo/.codex}/skills/quota-aware-delegation/scripts/writer_lease.py \
+python3 ${CODEX_HOME}/skills/quota-aware-delegation/scripts/writer_lease.py \
   recover --cwd "<cwd>" --acknowledgement recover-missing-or-corrupt-job
 ```
 
@@ -293,22 +293,62 @@ regression harness, not a provider E2E. Maintainers can run the real provider
 surface gate separately:
 
 ```bash
-uv run --directory /Users/bo/dev/tools/agent-crossbar \
+uv run --directory <agent-crossbar-repo> \
   python scripts/provider_surface_gate.py \
   --profile opencode \
   --model opencode-go/deepseek-v4-flash \
   --task dev \
-  --max-runtime-sec 1800
+  --max-runtime-sec 1800 \
+  --artifact-dir /tmp/agent-crossbar-live-opencode-<timestamp>
 ```
 
 For the full real chain, Codex root runs `gpt-5.6-sol` at `low`, starts the
 native Luna coder with `gpt-5.6-luna` at `xhigh`, and that coder captures route
 output from
-`uv run --directory /Users/bo/dev/tools/mcp/packages/codexbar-mcp delegation-route --lane implementation`, then start the exact routed profile/model/effort
+`uv run --directory <codexbar-mcp-repo> delegation-route --lane implementation`, then start the exact routed profile/model/effort
 through Agents MCP and run the source-path waiter above with the same Agents
 MCP state root. This covers Codex root -> native coder -> `delegation_router`
 -> Agents MCP -> OpenCode. It is a maintainer-only live gate and is not run in
 provider-credential-free CI.
+
+Reasonix is retained for credential-free compatibility tests but is excluded
+from live gates because its paid quota is exhausted. Use the OpenCode Go
+`opencode-go/*` namespace for DeepSeek live verification.
+
+### Maintainer live gate prerequisites
+
+The provider gate is a maintainer-local check. Run it from a checkout with a
+fresh `uv` environment and authenticated provider CLIs already installed:
+
+- Codex: `codex login` and a discovered model from `profiles_list`.
+- Claude: Claude Code authenticated through its supported subscription login.
+- OpenCode Go: an authenticated OpenCode Go account and a live
+  `opencode-go/*` model from `profiles_list`.
+
+The repository does not install provider CLIs, handle credentials, or claim a
+GitHub-hosted runner can execute these gates. The removed workflow was
+unusable on stock `ubuntu-latest` runners. For a semantic dev gate, use a
+fixture that creates a file and runs its tests, then retain the job directory
+and `job_result` evidence for review.
+
+### Optional local admission policy
+
+Admission is disabled by default. A configured local Agents process can enable
+the private callback protocol through its `mcp_servers.agents.env` settings:
+
+```toml
+[mcp_servers.agents.env]
+AGENT_CROSSBAR_ADMISSION_MODE = "strict"
+AGENT_CROSSBAR_ADMISSION_COMMAND = '["uv", "run", "--directory", "/path/to/codexbar-mcp", "python", "-m", "codexbar_mcp.admission"]'
+AGENT_CROSSBAR_ADMISSION_TIMEOUT_SEC = "5"
+```
+
+Strict mode fails closed when the command, timeout, response schema, or exact
+profile/model/task candidate is missing or malformed. The callback receives
+canonical request data on stdin and returns a versioned allow/deny decision.
+It runs in a fixed inherited working directory; the requested workspace is
+data, not callback process authority. This policy applies to every client in
+the configured Agents process and does not trust client or session metadata.
 
 ## Troubleshooting by Error Code
 
@@ -372,6 +412,9 @@ Stable error codes are guaranteed across patch versions. The `next_action` field
 | `AGENT_CROSSBAR_CLIENT_NAME` | `agent-crossbar` | Client name in telemetry |
 | `AGENT_CROSSBAR_CLIENT_VERSION` | `unknown` | Optional client version recorded in local audit logs |
 | `AGENT_CROSSBAR_DEFAULT_CWD` | `PWD` | Default working directory for dev jobs |
+| `AGENT_CROSSBAR_ADMISSION_MODE` | `off` | `strict` enables the configured local exact-candidate admission callback |
+| `AGENT_CROSSBAR_ADMISSION_COMMAND` | unset | JSON argv array for the private admission callback |
+| `AGENT_CROSSBAR_ADMISSION_TIMEOUT_SEC` | `5` | Bounded callback timeout in strict mode |
 
 **Migration note**: The old `AGENT_HARNESS_*` env var names still work but emit a `FutureWarning`. Rename them to `AGENT_CROSSBAR_*`. The compat shim will be removed in v0.4.0.
 

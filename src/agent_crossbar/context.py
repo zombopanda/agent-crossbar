@@ -18,6 +18,7 @@ DEFAULT_TOTAL_CHARS = 60_000
 DEFAULT_FILE_CHARS = 8_000
 DEFAULT_CHUNK_CHARS = 2_000
 MAX_FILES = 200
+MAX_ENUMERATED_ENTRIES = 2_000
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
 SKIP_DIR_NAMES = frozenset(
@@ -131,9 +132,15 @@ def _collect_files(root: Path, requested: list[Path]) -> tuple[list[Path], list[
     files: list[Path] = []
     omissions: list[dict[str, str]] = []
     seen: set[Path] = set()
+    enumerated = 0
 
     def add_dir(directory: Path) -> None:
+        nonlocal enumerated
         for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            enumerated += 1
+            if enumerated > MAX_ENUMERATED_ENTRIES:
+                omissions.append({"path": directory.as_posix(), "reason": "enumeration_budget"})
+                return
             if entry.is_symlink():
                 omissions.append({"path": entry.as_posix(), "reason": "symlink"})
                 continue
@@ -167,11 +174,18 @@ def _collect_files(root: Path, requested: list[Path]) -> tuple[list[Path], list[
 def _read_bounded(path: Path, file_chars: int, chunk_chars: int) -> tuple[str, str | None]:
     """Return bounded, redacted text for *path* plus an omission reason."""
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        # A character budget is not an I/O budget. Read only a bounded UTF-8
+        # window (with a small multiplier for multibyte text) so a huge file
+        # cannot be slurped into memory before truncation.
+        read_limit = max(1, (max(file_chars, chunk_chars) + 128) * 4)
+        with path.open("rb") as stream:
+            raw_bytes = stream.read(read_limit)
+            truncated_read = stream.read(1) != b""
+        raw = raw_bytes.decode("utf-8", errors="replace")
     except OSError:
         return "", "unreadable"
     text, _ = redact_secrets(raw)
-    if len(text) <= file_chars:
+    if len(text) <= file_chars and not truncated_read:
         return text, None
     head = text[: max(chunk_chars, 0)]
     tail_budget = max(file_chars - len(head), 0)
@@ -293,7 +307,7 @@ def pack_context(cwd: str | Path | None, scope: dict[str, Any] | None) -> dict[s
         return resolution
 
     root: Path = resolution["root"]
-    total_chars = int(scope.get("max_chars") or DEFAULT_TOTAL_CHARS)
+    total_chars = max(0, int(scope.get("max_chars") or DEFAULT_TOTAL_CHARS))
     file_chars = int(scope.get("max_file_chars") or DEFAULT_FILE_CHARS)
     chunk_chars = int(scope.get("max_chunk_chars") or DEFAULT_CHUNK_CHARS)
 
@@ -302,9 +316,13 @@ def pack_context(cwd: str | Path | None, scope: dict[str, Any] | None) -> dict[s
     chars_used = 0
     files_included = 0
 
+    envelope_prefix = f"{CONTEXT_ENVELOPE_BEGIN}\n"
+    envelope_suffix = f"{CONTEXT_ENVELOPE_END}\n"
+    body_budget = max(0, total_chars - len(envelope_prefix) - len(envelope_suffix))
+
     for path in files:
         relative = path.relative_to(root).as_posix()
-        remaining = total_chars - chars_used
+        remaining = body_budget - chars_used
         if remaining <= 0:
             omissions.append({"path": relative, "reason": "total_budget_exhausted"})
             continue
@@ -320,7 +338,11 @@ def pack_context(cwd: str | Path | None, scope: dict[str, Any] | None) -> dict[s
         files_included += 1
 
     body = "".join(included)
-    envelope = f"{CONTEXT_ENVELOPE_BEGIN}\n{body}{CONTEXT_ENVELOPE_END}\n" if files_included else ""
+    envelope = f"{envelope_prefix}{body}{envelope_suffix}" if files_included else ""
+    # Headers and delimiters count toward max_chars too. Keep the final
+    # envelope bounded even when a caller requests a budget smaller than the
+    # framing itself.
+    envelope = envelope[:total_chars]
     return {
         "ok": True,
         "text": envelope,
@@ -330,7 +352,7 @@ def pack_context(cwd: str | Path | None, scope: dict[str, Any] | None) -> dict[s
             "files_scanned": len(files),
             "files_included": files_included,
             "files_omitted": len(omissions),
-            "chars_used": chars_used,
+            "chars_used": len(envelope),
             "omissions": omissions[:50],
         },
     }
