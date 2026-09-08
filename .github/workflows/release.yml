@@ -33,7 +33,7 @@ jobs:
             "${GITHUB_WORKSPACE}/.github/allowed_signers"
           git verify-tag "${GITHUB_REF_NAME}"
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.13"
           cache-suffix: release-build
@@ -118,7 +118,7 @@ jobs:
     needs: pypi-publish
     runs-on: ubuntu-latest
     steps:
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           cache-suffix: release-runtime
 
