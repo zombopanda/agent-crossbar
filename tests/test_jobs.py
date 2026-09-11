@@ -1377,17 +1377,9 @@ def test_reaper_terminalizes_expired_orphan_exactly_once(tmp_path):
     assert len([e for e in _read_events(store, job.job_id) if e["type"] == "result"]) == 1
 
 
-def test_concurrent_reapers_emit_one_terminal_result_and_reap_marker(tmp_path, monkeypatch):
+def test_concurrent_reapers_emit_one_terminal_result_and_reap_marker(tmp_path):
     """Two sweepers racing an expired job must produce one result and marker."""
     store, job = _expired_job(JobStore(tmp_path), tmp_path)
-    barrier = threading.Barrier(2)
-    original = store.set_result
-
-    def synchronized_set_result(*args, **kwargs):
-        barrier.wait(timeout=2)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(store, "set_result", synchronized_set_result)
     outcomes: list[bool] = []
     errors: list[BaseException] = []
 

@@ -54,8 +54,9 @@ _SCREEN_READER_UI_LINE_RE = re.compile(
     r"[\d,]+\s+tokens\b.*|"
     r"effort:\s.*|"
     r"plan mode on\b.*|"
+    r"Envisioning…|"
     r".*…\s+\(\s*\d.*\)|"
-    r"Worked for\b.*"
+    r"(?-i:[A-Z])[^\W\d_]{2,15}ed for\b.*"
     r")$",
     re.IGNORECASE,
 )
@@ -185,17 +186,25 @@ def parse_agents_json(raw: str) -> list[dict[str, Any]]:
     for item in payload:
         if not isinstance(item, dict):
             continue
-        sessions.append(
-            {
-                "id": item.get("id"),
-                "session_id": item.get("sessionId"),
-                "state": item.get("state"),
-                "process_status": item.get("status"),
-                "waiting_for": item.get("waitingFor"),
-                "cwd": item.get("cwd"),
-                "started_at_ms": item.get("startedAt"),
-            }
-        )
+        session = {
+            "id": item.get("id"),
+            "session_id": item.get("sessionId"),
+            "state": item.get("state"),
+            "process_status": item.get("status"),
+            "waiting_for": item.get("waitingFor"),
+            "cwd": item.get("cwd"),
+            "started_at_ms": item.get("startedAt"),
+        }
+        # Newer CLI builds may expose a per-turn/update identity. Preserve
+        # optional fields only when the CLI actually supplies them so the
+        # established parser shape remains backwards compatible.
+        optional = {
+            "turn_generation": item.get("turnGeneration"),
+            "turn_id": item.get("turnId"),
+            "updated_at_ms": item.get("updatedAt", item.get("lastActivityAt")),
+        }
+        session.update({key: value for key, value in optional.items() if value is not None})
+        sessions.append(session)
     return sessions
 
 
@@ -230,12 +239,28 @@ def _screen_reader_final_response(clean_logs: str) -> str:
 
     for raw_line in candidate.splitlines():
         line = raw_line.strip()
+        is_prompt_boundary = line == "$"
         if line.startswith("$"):
             line = line[1:].lstrip()
         if not line:
+            # A bare ``$`` is the screen-reader prompt between redraws.  It
+            # must terminate the current segment; otherwise a longer partial
+            # redraw can absorb the later complete response.
+            if is_prompt_boundary:
+                finish_segment()
             continue
         if _SCREEN_READER_UI_LINE_RE.match(line):
             finish_segment()
+            # Everything after the final lifecycle footer belongs to the
+            # shell/tmux teardown (for example, a restored prompt), not to
+            # Claude's answer.  Stop before that noise can become the latest
+            # candidate.
+            if re.match(
+                r"^(?-i:[A-Z])[^\W\d_]{2,15}ed for\b",
+                line,
+                re.IGNORECASE,
+            ):
+                break
             continue
         current.append(line)
     finish_segment()
@@ -245,7 +270,11 @@ def _screen_reader_final_response(clean_logs: str) -> str:
         for lines in segments
         if any(line.casefold() != "summary" for line in lines)
     ]
-    return max(meaningful, key=len, default="")
+    # Claude emits screen-reader redraws incrementally.  The longest segment
+    # is not necessarily the final one: a longer early redraw may end in a
+    # partial token while a later, shorter segment contains the complete
+    # answer.  Preserve chronology and return the latest meaningful segment.
+    return meaningful[-1] if meaningful else ""
 
 
 def build_claude_launch(
@@ -326,7 +355,7 @@ def build_claude_launch(
 
 
 def normalize_claude_result(entry: dict[str, Any], logs: str) -> NormalizedResult:
-    from agent_crossbar.tmux_output import normalize_tmux_output
+    from agent_crossbar.tmux_output import normalize_tmux_output, reconstruct_tmux_output
 
     native_state = str(entry.get("state") or "")
     try:
@@ -336,6 +365,13 @@ def normalize_claude_result(entry: dict[str, Any], logs: str) -> NormalizedResul
     short_id = str(entry.get("id") or entry.get("session_id") or "")
     clean = normalize_tmux_output(logs)
     if "[Screen Reader Mode:" in clean:
+        # ANSI cursor rewrites can split a single screen-reader answer into a
+        # partial marker and a continuation. Reconstruct the visible screen
+        # before extracting the final response so the returned output is not
+        # missing the prefix written before the cursor moved.
+        reconstructed = reconstruct_tmux_output(logs)
+        if reconstructed != clean:
+            clean = reconstructed
         clean = _screen_reader_final_response(clean)
         if native_state == "done" and not clean:
             message = "Claude completed without a recoverable final response."
@@ -428,6 +464,7 @@ class ClaudeAdapter(StaticAdapter):
             support_tier=SUPPORT_TIER,
             backend="claude_bg",
             supports_interactive=True,
+            requires_interactive=True,
             effort_map=CLAUDE_EFFORT_MAP,
             native_lifecycle=True,
             live_model_discovery=True,

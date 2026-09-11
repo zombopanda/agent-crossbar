@@ -270,6 +270,20 @@ def test_adapter_supports_interactive():
     assert ClaudeAdapter().supports_interactive is True
 
 
+def test_only_claude_requires_interactive():
+    """``requires_interactive`` is a Claude-only launch capability: other
+    adapters keep the field defaulted to False so core routing never rejects
+    a non-interactive launch for them."""
+    from agent_crossbar.adapters.codex import CodexAdapter
+    from agent_crossbar.adapters.opencode import OpencodeAdapter
+    from agent_crossbar.adapters.reasonix import ReasonixAdapter
+
+    assert ClaudeAdapter().requires_interactive is True
+    assert CodexAdapter().requires_interactive is False
+    assert OpencodeAdapter().requires_interactive is False
+    assert ReasonixAdapter().requires_interactive is False
+
+
 def test_interactive_launch_uses_claude_bg_pty_backend():
     """Interactive launch must set backend=claude_bg_pty."""
     plan = build_claude_launch(
@@ -469,6 +483,57 @@ $Worked for 2m 49s
     assert "4. Vague language" in result.output
     assert "don't ask on" not in result.output
     assert "86436 tokens" not in result.output
+
+
+def test_normalize_claude_screen_reader_logs_uses_latest_complete_redraw():
+    """A shorter final redraw must beat a longer partial redraw before it."""
+    logs = """[Screen Reader Mode: on via flag]
+$claude: Обидві відповіді влас
+auto mode on (shift+tab to cycle)  ·  esc to interrupt
+36387 tokens
+$claude: Обидві відповіді власника отримано.
+LIVE_CLAUDE_TW
+auto mode on (shift+tab to cycle)  ·  esc to interrupt
+36387 tokens
+$
+LIVE_CLAUDE_TWO_AWAITS_OK
+Envisioning…
+auto mode on (shift+tab to cycle)  ·  esc to interrupt
+36552 tokens
+$Brewed for 11s
+auto mode on (shift+tab to cycle)
+36586 tokens
+$ live gate owner input
+$ live gate owner input
+"""
+
+    result = normalize_claude_result(
+        {"id": "abc123", "state": "done"},
+        logs,
+    )
+
+    assert result.status == "completed"
+    assert result.output == "LIVE_CLAUDE_TWO_AWAITS_OK"
+
+
+def test_normalize_claude_cursor_rewrite_returns_full_final_output():
+    logs = (
+        "[Screen Reader Mode: on via flag]\n"
+        "\x1b[Gclaude: L\r\r\n"
+        "Contemplating…\r\r\n"
+        "auto mode on (shift+tab to cycle)  ·  esc to interrupt\r\r\n"
+        "37349 tokens\r\r\n"
+        "effort: high · /effort\r\r\n"
+        "$\x1b[2G\x1b[5A\x1b[10GIVE_CLAUDE_TWO_AWAITS_OK"
+        "\x1b[2G\x1b[5B\x1b[2K\x1b[1A\x1b[2K"
+        "\x1b[G37509 tokens\r\r\n"
+        "\x1b[GChurned for 6s\r\r\n"
+    )
+
+    result = normalize_claude_result({"id": "abc123", "state": "done"}, logs)
+
+    assert result.status == "completed"
+    assert result.output == "LIVE_CLAUDE_TWO_AWAITS_OK"
 
 
 def test_normalize_claude_done_with_only_tui_chrome_is_not_a_false_success():

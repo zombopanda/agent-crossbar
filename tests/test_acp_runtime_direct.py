@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch
 
@@ -218,6 +219,7 @@ class TestRunAcpJobSuccess:
             before_prompt=ANY,
             on_text_delta=ANY,
             on_execution_heartbeat=ANY,
+            permission_handler=ANY,
         )
 
         # ── assert store result ──
@@ -732,6 +734,64 @@ class TestRunAcpJobTimeout:
             assert SECRET not in json.dumps(stored["error"])
         if "failure" in stored:
             assert SECRET not in json.dumps(stored["failure"])
+
+    def test_pending_owner_decision_timeout_is_truthful_and_bounded(self, tmp_path):
+        store, job_id = _create_job_store(tmp_path)
+        created_at = (datetime.now(timezone.utc) - timedelta(seconds=7)).isoformat()
+
+        async def timeout_with_pending(*_args, **_kwargs):
+            store.update_job_meta(
+                job_id,
+                {
+                    "status": "awaiting_input",
+                    "pending_request": {
+                        "request_id": "perm-timeout-1",
+                        "kind": "other",
+                        "decisions": ["reject"],
+                        "state": "pending",
+                        "created_at": created_at,
+                        "path": "/outside/secret.py",
+                        "command": "rm -rf /outside",
+                    },
+                },
+            )
+            raise AcpTimeoutError("ACP prompt timed out after 12.0s")
+
+        with patch(
+            "agent_crossbar.acp_runtime.run_acp_prompt",
+            new=AsyncMock(side_effect=timeout_with_pending),
+        ):
+            asyncio.run(
+                run_acp_job(
+                    store,
+                    job_id,
+                    provider="opencode",
+                    prompt=SECRET,
+                    cwd=str(tmp_path),
+                    task="dev",
+                    model="glm",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    max_runtime_sec=12,
+                )
+            )
+
+        stored = store.get_result(job_id)
+        assert stored["status"] == "failed"
+        assert stored["stop_reason"] == "timeout"
+        assert stored["failure"]["code"] == "owner_input_timeout"
+        assert "owner decision" in stored["output"].lower()
+        assert "deadline" in stored["output"].lower()
+        assert stored["failure"]["next_action"] == "retry_and_answer_via_job_send"
+
+        pending = stored["failure"]["diagnostics"]["pending_request"]
+        assert pending["request_id"] == "perm-timeout-1"
+        assert pending["kind"] == "other"
+        assert pending["decisions"] == ["reject"]
+        assert pending["state"] == "pending"
+        assert pending["age_sec"] >= 6
+        assert "path" not in pending
+        assert "command" not in pending
+        assert SECRET not in json.dumps(stored)
 
 
 class TestRunAcpJobPromptDeliveryTimeout:

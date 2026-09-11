@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,13 +18,24 @@ from agent_crossbar.acp_client import (
     AcpProviderUnavailableError,
     AcpResult,
     AcpTimeoutError,
+    permission_decision_options,
+    permission_request_detail,
+    permission_response_for_decision,
     run_acp_prompt,
 )
 from agent_crossbar.envelope import build_result_envelope, sanitize_diagnostic_text
 from agent_crossbar.models import Autonomy
+from agent_crossbar.pending_permissions import PendingRequestLimitError, pending_permissions
 from agent_crossbar.run_handles import run_handles
 
 DEFAULT_MAX_RUNTIME_SEC: int = 1800
+
+# Native ACP ``stop_reason`` values that prove the turn did NOT genuinely
+# complete.  A non-empty output stream is not completion evidence on its own:
+# a refused/truncated/cancelled turn can narrate progress and still stop here.
+_ACP_INCOMPLETE_STOP_REASONS = frozenset(
+    {"refusal", "max_turn_requests", "cancelled", "max_tokens"}
+)
 
 
 def build_acp_agent_command(provider: str) -> list[str]:
@@ -87,6 +99,45 @@ def _resolve_dev_session_mode(provider: str, task: str) -> str | None:
 def _is_empty_acp_output(output: str) -> bool:
     """Return True when *output* carries no observable assistant text."""
     return output == NO_OUTPUT_SENTINEL or not output.strip()
+
+
+def _pending_owner_input_diagnostics(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return bounded, provider-neutral evidence for an unanswered request.
+
+    The durable pending record may contain a command and file targets.  Those
+    fields are intentionally excluded here: timeout diagnostics only need the
+    request identity and generic decision state, never the unsafe action
+    details that were shown in the original owner prompt.
+    """
+    pending = meta.get("pending_request")
+    if not isinstance(pending, dict) or pending.get("state") != "pending":
+        return None
+
+    diagnostic: dict[str, Any] = {
+        "request_id": str(pending.get("request_id") or "")[:128],
+        "kind": str(pending.get("kind") or "other")[:64],
+        "decisions": [
+            str(decision)[:32]
+            for decision in pending.get("decisions", [])[:8]
+            if isinstance(decision, str)
+        ]
+        if isinstance(pending.get("decisions"), list)
+        else [],
+        "state": "pending",
+        "age_sec": None,
+    }
+    created_at = pending.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            created = datetime.fromisoformat(created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            diagnostic["age_sec"] = max(
+                0.0, round((datetime.now(timezone.utc) - created).total_seconds(), 3)
+            )
+        except ValueError:
+            pass
+    return diagnostic
 
 
 async def run_acp_job(
@@ -210,13 +261,19 @@ async def run_acp_job(
     # Persist launch intent before entering the SDK.  A controller crash
     # between provider spawn and the PID callback must remain recoverable as an
     # unknown cleanup, rather than looking like a proven no-launch job.
-    store.update_job_meta(
-        job_id,
-        {
-            "acp_launch_pending": True,
-            "acp_launch_started_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    launch_intent: dict[str, Any] = {
+        "acp_launch_pending": True,
+        "acp_launch_started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # The SDK callback can observe the child before the repository wrapper's
+    # setsid() handoff is reflected in a later process-table probe.  Persist
+    # the controller's group as the only trusted reference for that narrow
+    # handoff case; an arbitrary mismatched group remains fail-closed.
+    try:
+        launch_intent["acp_parent_pgid"] = os.getpgrp()
+    except OSError:
+        pass
+    store.update_job_meta(job_id, launch_intent)
 
     spawn_observed = False
     captured_pid: int | None = None
@@ -288,6 +345,157 @@ async def run_acp_job(
             data=data,
         )
 
+    permission_callback_lock = asyncio.Lock()
+
+    async def _handle_permission_inner(tool_call: Any, options: list[Any]) -> Any:
+        """Hold a permission request pending for an owner decision.
+
+        The durable record is written in the same transition that pauses the
+        job; the live wait is registered here and resolved by ``job_send``.
+        The ACP coroutine/connection stays alive while pending — this await
+        sits inside the single per-job ``asyncio.wait_for`` budget.
+        """
+        request_id = f"perm-{uuid.uuid4().hex[:12]}"
+        detail = permission_request_detail(tool_call)
+        decisions = permission_decision_options(options)
+        if detail.get("details_truncated") or detail.get("details_incomplete"):
+            decisions = ["reject"]
+        record: dict[str, Any] = {
+            "request_id": request_id,
+            "kind": detail["kind"],
+            "decisions": decisions,
+            "state": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        for key in (
+            "tool",
+            "command",
+            "path",
+            "paths",
+            "args",
+            "arguments",
+            "argv",
+            "details_truncated",
+            "details_incomplete",
+        ):
+            # Presence, rather than truthiness, matters for empty argument
+            # forms: ``args=[]`` must remain visible beside a non-empty
+            # ``argv``/``arguments`` form instead of looking omitted.
+            if key in detail:
+                record[key] = detail[key]
+        transitioned = store.transition_job_status(
+            job_id,
+            "awaiting_input",
+            allowed_from={"running"},
+            updates={"waiting_for": "permission", "pending_request": record},
+        )
+        if not transitioned.get("ok"):
+            # The job went terminal (stopped/raced) before the request could
+            # be held; reject rather than dangling a pending record.
+            return permission_response_for_decision(options, "reject")
+        loop = asyncio.get_running_loop()
+        try:
+            pending = pending_permissions.register(job_id, request_id, loop=loop)
+        except PendingRequestLimitError:
+            # Never drop an outstanding future when the bounded registry is
+            # full. Settle the durable record and fail closed for this ACP
+            # request instead of leaving the provider suspended forever.
+            store.settle_pending_request(job_id, outcome="expired")
+            # The status transition above already moved the job to
+            # awaiting_input; settling only marks the pending record itself
+            # expired, so revert status too. Otherwise the job is left
+            # showing awaiting_input with no concrete pending request — a
+            # vague waiting state the waiter/CLI contract must never surface.
+            store.transition_job_status(
+                job_id,
+                "running",
+                allowed_from={"awaiting_input"},
+                remove=("pending_request", "waiting_for"),
+            )
+            store.send_event(
+                job_id,
+                level="error",
+                type="permission_rejected",
+                message="ACP pending permission limit reached",
+                data={"request_id": request_id},
+            )
+            return permission_response_for_decision(options, "reject")
+        store.send_event(
+            job_id,
+            level="info",
+            type="awaiting_input",
+            message="ACP permission request awaiting owner decision",
+            data={"waiting_for": "permission", "pending_request": record},
+        )
+        try:
+            while True:
+                if not pending.future.done():
+                    # ``job_send`` may run in another process. The durable
+                    # pending record is the IPC inbox; the in-process Future
+                    # is only a low-latency wake-up path.
+                    current = store._read_job_meta(job.path)
+                    current_pending = current.get("pending_request")
+                    if (
+                        isinstance(current_pending, dict)
+                        and current_pending.get("request_id") == request_id
+                        and current_pending.get("state") == "resolved"
+                        and current_pending.get("decision") in {"allow", "reject"}
+                    ):
+                        pending_permissions.resolve(
+                            job_id, request_id, str(current_pending["decision"])
+                        )
+                    elif current.get("status") not in {"running", "awaiting_input", ""}:
+                        # A terminal transition wins over a late owner reply.
+                        pending_permissions.settle_job(job_id, outcome="cancelled")
+                        raise asyncio.CancelledError
+                try:
+                    decision = await asyncio.wait_for(asyncio.shield(pending.future), timeout=0.1)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            # Any exit from this loop — normal completion, cancellation, or
+            # an unexpected exception from the durable-inbox read — must
+            # release this request's slot in the bounded per-job registry.
+            # Leaving it registered on a non-cancellation exception would
+            # leak a slot toward MAX_PENDING_PER_JOB with no owner ever able
+            # to resolve it.
+            pending_permissions.discard(job_id, request_id)
+        # Recheck the terminal fence before handing the answer to ACP. A
+        # stop/deadline can win immediately after the Future wakes; in that
+        # case return a provider rejection and let the terminal result remain
+        # authoritative.
+        current = store._read_job_meta(job.path)
+        if current.get("status") not in {"running", "awaiting_input", ""}:
+            return permission_response_for_decision(options, "reject")
+        resumed = store.transition_job_status(
+            job_id,
+            "running",
+            allowed_from={"awaiting_input"},
+            remove=("pending_request", "waiting_for"),
+        )
+        if not resumed.get("ok"):
+            # stop/deadline may have won after the Future was resolved but
+            # before this callback consumed it.  Never release an ACP allow
+            # into a terminal job; the terminal result owns the race.
+            return permission_response_for_decision(options, "reject")
+        store.send_event(
+            job_id,
+            level="info",
+            type="permission_resolved",
+            message=f"ACP permission request resolved: {decision}",
+            data={"request_id": request_id, "decision": decision},
+        )
+        return permission_response_for_decision(options, decision)
+
+    async def _handle_permission(tool_call: Any, options: list[Any]) -> Any:
+        # ACP may issue more than one permission callback concurrently.  The
+        # durable protocol has one pending slot per job, so serialize the
+        # callbacks: the next request is surfaced only after the first owner
+        # decision has been consumed, never silently auto-rejected.
+        async with permission_callback_lock:
+            return await _handle_permission_inner(tool_call, options)
+
     try:
         result: AcpResult = await run_acp_prompt(
             command,
@@ -304,6 +512,7 @@ async def run_acp_job(
             before_prompt=_before_prompt,
             on_text_delta=_record_acp_text_delta,
             on_execution_heartbeat=_record_acp_execution_heartbeat,
+            permission_handler=_handle_permission,
         )
     except AcpProviderUnavailableError as exc:
         safe = _safe_error(exc, prompt)
@@ -332,18 +541,39 @@ async def run_acp_job(
             safe = f"ACP prompt was not delivered before the {effective_timeout}s timeout"
             code = "acp_prompt_delivery_timeout"
             next_action = "inspect_provider_launch_and_retry"
+            diagnostics = {"max_runtime_sec": effective_timeout}
         else:
-            if provider == "opencode":
+            timeout_meta = dict(meta)
+            try:
+                timeout_meta.update(store._read_job_meta(job.path))
+            except (OSError, TypeError, ValueError):
+                pass
+            pending_diagnostics = _pending_owner_input_diagnostics(timeout_meta)
+            if pending_diagnostics is not None:
+                safe = (
+                    f"Owner decision was not received before the {effective_timeout}s "
+                    "deadline; the pending permission request expired."
+                )
+                code = "owner_input_timeout"
+                next_action = "retry_and_answer_via_job_send"
+                diagnostics = {
+                    "max_runtime_sec": effective_timeout,
+                    "pending_request": pending_diagnostics,
+                }
+            elif provider == "opencode":
                 safe = (
                     f"OpenCode did not complete within {effective_timeout}s. "
                     "The selected provider may be out of quota, rate-limited, "
                     "or temporarily unavailable; retry or choose an available free model."
                 )
+                code = "acp_timeout"
                 next_action = "check_provider_limits_or_retry_with_free_model"
             else:
                 safe = f"ACP job timed out after {effective_timeout}s"
+                code = "acp_timeout"
                 next_action = "retry_with_higher_timeout"
-            code = "acp_timeout"
+            if pending_diagnostics is None:
+                diagnostics = {"max_runtime_sec": effective_timeout}
         _fail(
             store=store,
             job_id=job_id,
@@ -360,7 +590,7 @@ async def run_acp_job(
             effort=effort,
             task=task,
             cwd=cwd,
-            diagnostics={"max_runtime_sec": effective_timeout},
+            diagnostics=diagnostics,
         )
         return
     except AcpLaunchError as exc:
@@ -550,6 +780,37 @@ async def run_acp_job(
         )
         return
 
+    # A rejected owner permission is an incomplete execution outcome even if
+    # the provider emits progress text and then claims ``end_turn``.  Latch
+    # this protocol fact before native stop-reason handling so narration can
+    # never turn a denied operation into a false completed result.
+    if getattr(result, "permission_rejected", False):
+        safe = "ACP turn did not complete: an owner rejected a permission request"
+        _fail(
+            store=store,
+            job_id=job_id,
+            safe_output=safe,
+            stop_reason="permission_rejected",
+            stage="execution",
+            code="acp_incomplete",
+            retryable=True,
+            next_action="retry_or_adjust_prompt",
+            meta=meta,
+            started_at=started_at,
+            provider=provider,
+            model=model,
+            effort=effort,
+            task=task,
+            cwd=cwd,
+            diagnostics={
+                "stop_reason": result.stop_reason,
+                "native_session_id": getattr(result, "session_id", None),
+                "output_len": len(result.output),
+                "permission_rejected": True,
+            },
+        )
+        return
+
     # -- fail closed: a job that produced no observable assistant output -----------
     # ACP uses a sentinel when the provider emits no session_update chunks.  An
     # empty ask/review result is just as unusable as an empty dev turn: callers
@@ -571,6 +832,38 @@ async def run_acp_job(
             code="acp_empty_result",
             retryable=True,
             next_action="retry_or_inspect_session_mode_and_prompt",
+            meta=meta,
+            started_at=started_at,
+            provider=provider,
+            model=model,
+            effort=effort,
+            task=task,
+            cwd=cwd,
+            diagnostics={
+                "stop_reason": result.stop_reason,
+                "native_session_id": getattr(result, "session_id", None),
+                "output_len": len(result.output),
+            },
+        )
+        return
+
+    # -- native completion evidence ------------------------------------------------
+    # Non-empty output is not completion evidence: a refused, truncated, or
+    # cancelled turn can narrate progress and still stop on an incomplete
+    # native ``stop_reason``.  Latch that honestly instead of reporting
+    # ``ok=True, status="completed"``.
+    if result.stop_reason in _ACP_INCOMPLETE_STOP_REASONS:
+        refused = result.stop_reason == "refusal"
+        safe = f"ACP turn did not complete: native stop_reason={result.stop_reason!r}"
+        _fail(
+            store=store,
+            job_id=job_id,
+            safe_output=safe,
+            stop_reason=result.stop_reason,
+            stage="execution",
+            code="acp_incomplete",
+            retryable=not refused,
+            next_action="retry_or_adjust_prompt" if not refused else "adjust_prompt",
             meta=meta,
             started_at=started_at,
             provider=provider,
@@ -627,6 +920,7 @@ async def run_acp_job(
 
     store.set_result(job_id, ok=True, summary=result.output, envelope=envelope)
     run_handles.release(job_id)
+    pending_permissions.release(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +953,14 @@ def _fail(
     Failure event data is kept minimal on the event (code, stop_reason,
     stage); diagnostics are only stored in the envelope for privacy.
     """
+    # Any pending owner-mediated request is settled in the same terminal
+    # operation, so a late structured decision cannot resurrect this job.
+    settle = getattr(store, "settle_pending_request", None)
+    if callable(settle):
+        try:
+            settle(job_id, outcome="expired")
+        except Exception:
+            pending_permissions.settle_job(job_id, outcome="expired")
     # The caller's startup snapshot predates the durable launch-intent marker
     # and may also predate a PID identity write. Refresh it before deciding
     # whether the writer lease can be released. If the state cannot be read,
@@ -933,12 +1235,18 @@ def safe_acp_termination(meta: dict) -> dict:
         # The repository-owned ACP wrapper calls setsid() immediately after
         # spawn.  The SDK callback can observe the pre-exec group, while the
         # same launch identity is already running in its final owned group by
-        # stop time.  The verified start identity proves this is the original
-        # process, so fence the current group rather than treating that normal
-        # handoff as PID/group reuse.
+        # stop time.  Accept that handoff only when the expected group matches
+        # the controller group captured before launch; a random mismatch is
+        # process-group reuse and must fail closed.
         if actual_pgid is None:
             return {"terminated": False, "reason": "process_identity_unverifiable", "pid": pid_int}
         if actual_pgid != pid_int:
+            return {"terminated": False, "reason": "process_group_reused", "pid": pid_int}
+        try:
+            parent_pgid = int(meta.get("acp_parent_pgid"))
+        except (TypeError, ValueError):
+            return {"terminated": False, "reason": "process_group_reused", "pid": pid_int}
+        if expected_pgid_int != parent_pgid:
             return {"terminated": False, "reason": "process_group_reused", "pid": pid_int}
         expected_pgid_int = int(actual_pgid)
 

@@ -300,14 +300,30 @@ def test_claude_matrix_job_send_supported():
     )
 
 
+def test_opencode_matrix_owner_permission_decisions():
+    """OpenCode has no free-text interactive transport, but it truthfully
+    advertises owner-mediated permission decisions and never claims a
+    noninteractive mode it cannot honor."""
+    from agent_crossbar.profiles import PROVIDER_SUPPORT_MATRIX
+
+    opencode = PROVIDER_SUPPORT_MATRIX["opencode"]
+    assert opencode.get("owner_permission_decisions") is True, (
+        "OpenCode must advertise owner_permission_decisions"
+    )
+    assert "interactive" not in opencode.get("interaction_modes", []), (
+        "OpenCode must not claim a free-text interactive transport"
+    )
+
+
 def test_claude_matrix_no_print_capability():
     """Claude matrix must not include 'print' in interaction_modes."""
     from agent_crossbar.profiles import PROVIDER_SUPPORT_MATRIX
 
     modes = PROVIDER_SUPPORT_MATRIX["claude"].get("interaction_modes", [])
     assert "print" not in modes, "Claude must not claim print as an interaction mode"
-    check_all = frozenset(modes)
-    assert "noninteractive" in check_all, "Claude must declare noninteractive interaction mode"
+    # Claude's launch path is interactive-only; it no longer truthfully
+    # offers a noninteractive mode.
+    assert set(modes) == {"interactive"}, "Claude must declare interactive-only interaction mode"
 
 
 def test_reasonix_matrix_is_experimental():

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_crossbar.envelope import build_result_envelope
+from agent_crossbar.pending_permissions import pending_permissions
 from agent_crossbar.run_handles import run_handles
 from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete,
@@ -28,6 +29,7 @@ _JOB_ID_RE = re.compile(r"^[0-9]{8,}-[a-zA-Z0-9_-]+$")
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 _OUTPUT_TAIL_FALLBACK_BYTES = 12000
+_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "stopped", "cancelled"})
 _EVENT_PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _EVENT_PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -36,6 +38,133 @@ _EVENT_PROCESS_LOCKS_GUARD = threading.Lock()
 # the declared deadline, so a job still nonterminal past the grace window
 # proves its worker is gone — reaping it never races a healthy execution.
 DEADLINE_REAP_GRACE_SEC = 15.0
+
+
+def _parse_decision_attempt(text: str) -> tuple[str, str] | None:
+    """Return ``(request_id, decision)`` when *text* is a structured decision.
+
+    Syntax-first by contract: any JSON object carrying string ``request_id``
+    and ``decision`` fields is a decision *attempt*.  A syntactically valid
+    attempt that does not match a live pending request is reported as
+    ``request_not_pending`` by the caller — it is never reinterpreted as plain
+    interactive text.  Anything that is not such an object (including
+    malformed JSON or a JSON array) returns ``None`` and keeps today's
+    plain-text meaning.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    request_id = parsed.get("request_id")
+    decision = parsed.get("decision")
+    if not isinstance(request_id, str) or not isinstance(decision, str):
+        return None
+    return request_id, decision
+
+
+def _provider_process_is_alive(meta: dict[str, Any]) -> bool:
+    """Return whether the recorded ACP provider process is still alive.
+
+    A missing in-process callback does not prove that the provider is gone:
+    ``job_send`` commonly runs in a separate CLI/controller process.  The
+    durable decision inbox may therefore be used when the provider PID is
+    live.  An unidentifiable or dead PID fails closed.
+    """
+    raw_pid = meta.get("acp_pid")
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+    # A live PID is not an authorization fence: it may have been recycled
+    # after the ACP child exited.  Match the immutable process-start token
+    # captured alongside the PID at launch.  Without it, a restart fails
+    # closed and cannot persist an allow decision into an unrelated process.
+    expected_start = meta.get("acp_process_start")
+    if expected_start is None or not str(expected_start):
+        return False
+    actual_start = _process_start_identity(pid)
+    if actual_start is None or actual_start != str(expected_start):
+        return False
+    # ``lstart`` has only one-second wall-clock resolution on macOS (no
+    # ``/proc`` ticks-based start time is available there), so start-time
+    # alone can collide for a short-lived process reusing the same PID
+    # within the same second.  Cross-checking the recorded process group is
+    # a second, independent identity signal that must also match; a
+    # mismatch fails closed exactly like a start-time mismatch.
+    #
+    # The repository-owned ACP wrapper calls setsid() immediately after
+    # spawn, so the group recorded at launch can be the pre-exec group while
+    # the live process has since become its own group leader (pgid == pid).
+    # Accept that expected handoff instead of treating it as reuse — mirrors
+    # the same tolerance ``acp_runtime.safe_acp_termination`` already applies.
+    expected_pgid = meta.get("acp_pgid")
+    try:
+        expected_pgid_int = int(expected_pgid)
+    except (TypeError, ValueError):
+        return False
+    actual_pgid = _process_group_id(pid)
+    if actual_pgid is None:
+        return False
+    if actual_pgid == expected_pgid_int:
+        return True
+    # The repository-owned ACP wrapper calls setsid() before exec.  A
+    # callback may durably capture the controller's pre-handoff group while a
+    # later probe sees the child as its own group leader.  Accept that case
+    # only when the expected group is the launch-time parent group recorded by
+    # run_acp_job; never accept an arbitrary mismatched group.
+    if actual_pgid != pid:
+        return False
+    try:
+        parent_pgid = int(meta.get("acp_parent_pgid"))
+    except (TypeError, ValueError):
+        return False
+    return expected_pgid_int == parent_pgid
+
+
+def _process_group_id(pid: int) -> int | None:
+    """Return the process group id of *pid*, or None if unidentifiable."""
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _process_start_identity(pid: int) -> str | None:
+    """Read a stable start token for *pid* on Linux or macOS."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        if len(fields) > 21:
+            return fields[21]
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value or None
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -432,12 +561,24 @@ class JobStore:
         allowed_from: set[str] | frozenset[str],
         updates: dict[str, Any] | None = None,
         remove: tuple[str, ...] = (),
+        require_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically apply a nonterminal lifecycle transition.
 
         Terminal statuses are never overwritten.  Workers use this helper for
         ``running``/``awaiting_input`` transitions so a stop racing a native
         completion cannot resurrect a job by writing metadata directly.
+
+        *require_meta*, when given, is a compare-and-swap guard checked
+        against the durable meta under the same lock as the write: every key
+        must equal the recorded value, or the transition is rejected as
+        ``stale_transition`` rather than applied.  A caller whose decision to
+        transition was based on native provider evidence read separately
+        from (and therefore possibly staler than) this durable meta — e.g.
+        the Claude monitor's per-poll ``adapter.status()`` call versus the
+        job's ``input_generation`` — uses this to guarantee the transition
+        cannot silently overwrite a state change (such as an owner reply)
+        that has already landed since that evidence was gathered.
         """
         job = self.get_job(job_id)
         if job is None:
@@ -452,12 +593,68 @@ class JobStore:
                     "job_id": job_id,
                     "current_status": current_status,
                 }
+            if require_meta is not None:
+                for key, expected in require_meta.items():
+                    if meta.get(key) != expected:
+                        return {
+                            "ok": False,
+                            "error": "stale_transition",
+                            "job_id": job_id,
+                            "current_status": current_status,
+                        }
             meta.update(updates or {})
             for key in remove:
                 meta.pop(key, None)
             meta["status"] = status
             self._write_job_meta(job.path, meta)
         return {"ok": True, "job_id": job_id, "status": status}
+
+    def claim_terminalization(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        owner: str,
+    ) -> dict[str, Any]:
+        """Durably claim the one terminalization operation for a job.
+
+        Deadline watchdogs, monitors, and orphan reapers can all observe the
+        same expired job.  This compare-and-set happens under the metadata
+        lock *before* provider cleanup, so only the winner may cancel, emit a
+        timeout marker, or publish the terminal result.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            status = meta.get("status", "running")
+            if status not in {"running", "awaiting_input", None, ""}:
+                return {
+                    "ok": False,
+                    "error": "job_already_terminal",
+                    "job_id": job_id,
+                    "current_status": status,
+                }
+            if meta.get("terminalization_state") == "claimed":
+                return {
+                    "ok": False,
+                    "error": "terminalization_claimed",
+                    "job_id": job_id,
+                    "current_status": status,
+                    "terminalization_owner": meta.get("terminalization_owner"),
+                }
+            now = datetime.now(timezone.utc).isoformat()
+            meta.update(
+                {
+                    "terminalization_state": "claimed",
+                    "terminalization_reason": str(reason)[:128],
+                    "terminalization_owner": str(owner)[:128],
+                    "terminalization_claimed_at": now,
+                }
+            )
+            self._write_job_meta(job.path, meta)
+        return {"ok": True, "job_id": job_id, "status": status, "meta": meta}
 
     def _refresh_known_ids_locked(self) -> None:
         """Load existing job IDs so new JobStore instances avoid collisions."""
@@ -630,7 +827,7 @@ class JobStore:
             return result
 
         meta = self._read_job_meta(job.path)
-        if meta.get("status", "running") == "running":
+        if meta.get("status", "running") in {"running", "awaiting_input"}:
             self._reap_deadline_expired_job(job)
             self._finalize_completed_tmux_job(job)
 
@@ -668,6 +865,9 @@ class JobStore:
             next_seq = last_seq + 1
         meta = self._read_job_meta(job.path)
         transport = meta.get("transport", job.transport)
+        pending_request = meta.get("pending_request")
+        if not (isinstance(pending_request, dict) and pending_request.get("state") == "pending"):
+            pending_request = None
         output_tail = None
         output_next_bytes = output_since_bytes
         if transport in ("tmux", "print"):
@@ -700,6 +900,7 @@ class JobStore:
             "events": clipped,
             "output_tail": output_tail,
             "output_next_bytes": output_next_bytes,
+            "pending_request": pending_request,
         }
 
     # ── result ────────────────────────────────────────────────────────────
@@ -712,6 +913,7 @@ class JobStore:
         artifacts: list[str] | None = None,
         envelope: dict[str, Any] | None = None,
         release_writer_lease: bool = True,
+        terminalization_owner: str | None = None,
     ) -> dict[str, Any]:
         """Write result.json for a job and record a result event (internal/provider use).
 
@@ -733,6 +935,17 @@ class JobStore:
                     "error": "job_already_terminal",
                     "job_id": job_id,
                     "current_status": current_status,
+                }
+            claimed_owner = meta.get("terminalization_owner")
+            if (
+                meta.get("terminalization_state") == "claimed"
+                and claimed_owner != terminalization_owner
+            ):
+                return {
+                    "ok": False,
+                    "error": "terminalization_claimed",
+                    "job_id": job_id,
+                    "terminalization_owner": claimed_owner,
                 }
             result_data: dict[str, Any] = {
                 "ok": ok,
@@ -779,6 +992,33 @@ class JobStore:
             # temporarily unavailable; the next acquire reconciles it.
             return False
 
+    def _writer_lease_token_state(self, token: str) -> str:
+        """Return whether a token is present, absent, or unreadable.
+
+        Cleanup retry needs to distinguish an already-reconciled lease from a
+        real release failure.  An unreadable lease remains conservative and is
+        reported as a failure; only a clean scan with no matching token is
+        classified as ``already_absent``.
+        """
+        if not token:
+            return "absent"
+        from agent_crossbar.writer_lease import WriterLeaseStore
+
+        lease_store = WriterLeaseStore(self.state_root)
+        try:
+            paths = list(lease_store.leases_root.glob("*.json"))
+        except OSError:
+            return "unknown"
+        unreadable = False
+        for path in paths:
+            payload = WriterLeaseStore._read(path)
+            if payload is None:
+                unreadable = True
+                continue
+            if payload.get("token") == token:
+                return "present"
+        return "unknown" if unreadable else "absent"
+
     def heartbeat_writer_lease(self, job_id: str) -> bool:
         """Refresh a running dev lease so long jobs are not mistaken for stale ones."""
         job = self.get_job(job_id)
@@ -793,6 +1033,43 @@ class JobStore:
             return WriterLeaseStore(self.state_root).heartbeat(token)
         except OSError:
             return False
+
+    @staticmethod
+    def _mark_pending_settled(meta: dict[str, Any], outcome: str) -> str | None:
+        """Mark a still-pending request in *meta* settled. Returns its id.
+
+        Callers hold the job-meta lock; this mutates the in-memory dict only
+        so the durable write happens in the same critical section as the
+        terminal transition.
+        """
+        pending = meta.get("pending_request")
+        if not (isinstance(pending, dict) and pending.get("state") == "pending"):
+            return None
+        request_id = pending.get("request_id")
+        meta["pending_request"] = {
+            **pending,
+            "state": outcome,
+            "settled_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return str(request_id) if isinstance(request_id, str) else None
+
+    def settle_pending_request(self, job_id: str, outcome: str = "expired") -> dict[str, Any]:
+        """Settle any open pending request for *job_id* (durable + live).
+
+        Idempotent.  Marks the durable record expired/cancelled and cancels
+        the live wait, so a later structured decision is rejected instead of
+        resurrecting a terminal job.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            settled_id = self._mark_pending_settled(meta, outcome)
+            if settled_id is not None:
+                self._write_job_meta(job.path, meta)
+        settled_ids = pending_permissions.settle_job(job_id, outcome=outcome)
+        return {"ok": True, "job_id": job_id, "settled": settled_ids}
 
     def set_stopped_result(
         self,
@@ -839,6 +1116,189 @@ class JobStore:
         if event_error is not None:
             result["warnings"] = [{"code": "result_event_write_failed", "error": event_error}]
         return result
+
+    def record_terminal_cleanup_retry(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        prior_terminal_status: str,
+        cleanup_attempt: dict[str, Any],
+        cleanup_result: dict[str, Any],
+        cleanup_confirmed: bool,
+    ) -> dict[str, Any]:
+        """Persist a provider cleanup retry for an already-terminal job.
+
+        A terminal result is normally immutable, but a provider process can
+        outlive the worker that published it.  This narrow recovery path
+        updates only cleanup evidence and keeps the writer lease until the
+        provider reports confirmed cleanup.  Lease release happens after the
+        evidence is durable and is never attempted for an unconfirmed result.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return {"ok": False, "error": "job_not_found", "job_id": job_id}
+
+        now = datetime.now(timezone.utc).isoformat()
+        attempt = {
+            **cleanup_attempt,
+            "reason": reason,
+            "prior_terminal_status": prior_terminal_status,
+            "recorded_at": now,
+        }
+        safe_result = dict(cleanup_result)
+        diagnostic: dict[str, Any] = {
+            "job_id": job_id,
+            "reason": reason,
+            "prior_terminal_status": prior_terminal_status,
+            "cleanup_attempt": attempt,
+            "cleanup_result": safe_result,
+            "cleanup_confirmed": bool(cleanup_confirmed),
+        }
+
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            current_status = str(meta.get("status") or "")
+            if current_status not in _TERMINAL_STATUSES:
+                return {
+                    "ok": False,
+                    "error": "job_not_terminal",
+                    "job_id": job_id,
+                    "status": current_status,
+                }
+            result_path = job.path / "result.json"
+            try:
+                result_data = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                return {
+                    "ok": False,
+                    "error": "result_not_ready",
+                    "job_id": job_id,
+                    "status": current_status,
+                }
+            if not isinstance(result_data, dict):
+                return {
+                    "ok": False,
+                    "error": "result_not_ready",
+                    "job_id": job_id,
+                    "status": current_status,
+                }
+
+            envelope = result_data.get("envelope")
+            if not isinstance(envelope, dict):
+                envelope = {}
+            technical = envelope.get("technical")
+            if not isinstance(technical, dict):
+                technical = {}
+            previous_attempts = technical.get("cleanup_attempts")
+            attempts = list(previous_attempts) if isinstance(previous_attempts, list) else []
+            attempts.append(attempt)
+            # Keep repeated explicit recovery bounded while preserving the
+            # latest evidence and enough history to diagnose repeated leaks.
+            technical["cleanup_attempts"] = attempts[-8:]
+            technical["cleanup_attempt"] = attempt
+            technical["cleanup_result"] = safe_result
+            # Keep the established provider_cleanup field in sync with the
+            # retry receipt; leaving an earlier false receipt beside a later
+            # confirmed result would make the terminal envelope contradictory.
+            technical["provider_cleanup"] = safe_result
+            technical["cleanup_confirmed"] = bool(cleanup_confirmed)
+            technical["cleanup_pending"] = not bool(cleanup_confirmed)
+            technical["lease_disposition"] = (
+                "pending_release" if cleanup_confirmed else "retained_cleanup_unconfirmed"
+            )
+            envelope["technical"] = technical
+            failure = envelope.get("failure")
+            if isinstance(failure, dict):
+                failure = dict(failure)
+                failure_diagnostics = failure.get("diagnostics")
+                if not isinstance(failure_diagnostics, dict):
+                    failure_diagnostics = {}
+                failure["diagnostics"] = {**failure_diagnostics, **diagnostic}
+                envelope["failure"] = failure
+            result_data["envelope"] = envelope
+            result_data["cleanup_retry"] = diagnostic
+            _atomic_write_json(result_path, result_data)
+
+            meta["cleanup_pending"] = not bool(cleanup_confirmed)
+            meta["cleanup_confirmed"] = bool(cleanup_confirmed)
+            meta["cleanup_last_attempt"] = attempt
+            meta["cleanup_last_result"] = safe_result
+            self._write_job_meta(job.path, meta)
+
+        token = meta.get("writer_lease_token")
+        if cleanup_confirmed:
+            if isinstance(token, str) and token:
+                released = self._release_writer_lease(job_id, meta)
+                if released:
+                    lease_disposition = "released"
+                elif self._writer_lease_token_state(token) == "absent":
+                    # The provider cleanup is confirmed and the exact lease
+                    # token is already gone (for example, reconciliation won
+                    # the race). This is successful cleanup, not a release
+                    # failure and must not leave a false retained disposition.
+                    lease_disposition = "already_absent"
+                else:
+                    lease_disposition = "retained_release_failed"
+            else:
+                released = False
+                lease_disposition = "not_present"
+        else:
+            released = False
+            lease_disposition = "retained_cleanup_unconfirmed"
+
+        diagnostic["lease_disposition"] = lease_disposition
+        diagnostic["lease_released"] = bool(released)
+
+        # Publish the final lease disposition after the guarded release.  If
+        # the release itself failed, the durable evidence explicitly says the
+        # lease remains retained and a later retry can safely recover it.
+        with self._job_meta_lock(job.path):
+            result_path = job.path / "result.json"
+            try:
+                result_data = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                result_data = None
+            if isinstance(result_data, dict):
+                envelope = result_data.get("envelope")
+                if isinstance(envelope, dict):
+                    technical = envelope.get("technical")
+                    if isinstance(technical, dict):
+                        technical["lease_disposition"] = lease_disposition
+                        envelope["technical"] = technical
+                    failure = envelope.get("failure")
+                    if isinstance(failure, dict):
+                        failure = dict(failure)
+                        failure_diagnostics = failure.get("diagnostics")
+                        if not isinstance(failure_diagnostics, dict):
+                            failure_diagnostics = {}
+                        failure["diagnostics"] = {**failure_diagnostics, **diagnostic}
+                        envelope["failure"] = failure
+                    result_data["envelope"] = envelope
+                result_data["cleanup_retry"] = diagnostic
+                _atomic_write_json(result_path, result_data)
+            meta = self._read_job_meta(job.path)
+            meta["lease_disposition"] = lease_disposition
+            self._write_job_meta(job.path, meta)
+
+        try:
+            job.events.write(
+                level="info" if cleanup_confirmed else "warn",
+                type="provider_cleanup_retry",
+                message=(
+                    "Provider cleanup retry confirmed"
+                    if cleanup_confirmed
+                    else "Provider cleanup retry remains unconfirmed"
+                ),
+                data=diagnostic,
+            )
+        except Exception as exc:  # durable result remains authoritative
+            diagnostic["event_warning"] = {
+                "code": "cleanup_retry_event_write_failed",
+                "error": type(exc).__name__,
+            }
+
+        return {"ok": True, **diagnostic}
 
     @staticmethod
     def _build_stopped_envelope(
@@ -992,6 +1452,18 @@ class JobStore:
         except (TypeError, ValueError):
             return False
 
+        claim = self.claim_terminalization(
+            job.job_id,
+            reason="max_runtime_exceeded",
+            owner="deadline_reaper",
+        )
+        if not claim.get("ok"):
+            return False
+        # Use the compare-and-set snapshot for all evidence assembled below;
+        # another worker cannot mutate the lifecycle while this reaper owns
+        # the terminalization operation.
+        meta = claim.get("meta", meta)
+
         summary = f"max_runtime_sec ({max_runtime:g}s) exceeded and job was orphaned"
         finished_at = datetime.now(timezone.utc).isoformat()
         started_at = meta.get("started_at") or meta.get("created")
@@ -1084,12 +1556,16 @@ class JobStore:
             # process state is not proof of death, so retain the writer lease.
             cleanup_ok = False
         envelope["technical"]["cleanup_confirmed"] = cleanup_ok
+        # Settle any pending owner-mediated request in the same terminalization
+        # operation, so a late structured decision cannot resurrect the job.
+        self.settle_pending_request(job.job_id, outcome="expired")
         result = self.set_result(
             job.job_id,
             ok=False,
             summary=summary,
             envelope=envelope,
             release_writer_lease=cleanup_ok,
+            terminalization_owner="deadline_reaper",
         )
         if not result.get("ok", False):
             return False
@@ -1153,7 +1629,12 @@ class JobStore:
             if not entry.is_dir() or not _JOB_ID_RE.match(entry.name):
                 continue
             meta = self._read_job_meta(entry)
-            if meta.get("status", "running") not in ("running", None, ""):
+            if meta.get("status", "running") not in (
+                "running",
+                "awaiting_input",
+                None,
+                "",
+            ):
                 continue
             if target is not None:
                 raw_cwd = meta.get("cwd")
@@ -1329,6 +1810,14 @@ class JobStore:
             }
             self._inject_cross_session_note(result, cross_session_note)
             return result
+        # Ownership is checked above and again here; a structured decision
+        # attempt is resolved (or rejected) before any plain-text handling so
+        # a stale/unknown/terminal request_id is never reinterpreted as
+        # ordinary interactive input.
+        attempt = _parse_decision_attempt(text)
+        if attempt is not None:
+            request_id, decision = attempt
+            return self._resolve_pending_decision(job, request_id, decision)
         meta = self._read_job_meta(job.path)
         initial_status = meta.get("status", "running")
         if initial_status not in {"running", "awaiting_input"}:
@@ -1360,6 +1849,13 @@ class JobStore:
 
         # Deliver keystrokes to the tmux session if this is a tmux job.
         transport = job.transport
+        input_transcript_baseline: int | None = None
+        raw_output_path = meta.get("tmux_output_path")
+        if transport == "tmux" and raw_output_path:
+            try:
+                input_transcript_baseline = Path(str(raw_output_path)).stat().st_size
+            except OSError:
+                input_transcript_baseline = None
         if transport == "tmux":
             import re as _re
 
@@ -1392,6 +1888,31 @@ class JobStore:
                     "job_created": False,
                 }
 
+        # Persist a monotonic reply generation after the provider accepted
+        # the input.  The monitor can observe this even when a fast provider
+        # changes awaiting_input -> done between two polls; relying on an
+        # intermediate working state loses that valid completion.
+        with self._job_meta_lock(job.path):
+            current = self._read_job_meta(job.path)
+            if current.get("status", "running") not in {"running", "awaiting_input"}:
+                return {
+                    "ok": False,
+                    "error": "job_already_terminal",
+                    "job_id": job_id,
+                    "status": current.get("status"),
+                    "warnings": [],
+                    "job_created": True,
+                }
+            try:
+                generation = int(current.get("input_generation", 0)) + 1
+            except (TypeError, ValueError):
+                generation = 1
+            current["input_generation"] = generation
+            current["last_input_at"] = datetime.now(timezone.utc).isoformat()
+            if input_transcript_baseline is not None:
+                current["input_transcript_baseline"] = input_transcript_baseline
+            self._write_job_meta(job.path, current)
+
         # A successful reply starts another provider turn.  This matters for
         # adapters that previously surfaced a native `awaiting_input` state.
         if initial_status == "awaiting_input":
@@ -1399,12 +1920,115 @@ class JobStore:
                 job_id,
                 "running",
                 allowed_from={"awaiting_input"},
-                remove=("waiting_for",),
+                remove=("waiting_for", "question"),
             )
             if not resumed.get("ok"):
                 return resumed
 
         return {"ok": True, "job_id": job_id, "seq": seq}
+
+    def _resolve_pending_decision(self, job: Job, request_id: str, decision: str) -> dict[str, Any]:
+        """Resolve one structured decision against the job's pending request.
+
+        The live-registry CAS is authoritative for exactly-once delivery; the
+        durable record is checked first so unknown/stale/terminal requests are
+        rejected with ``request_not_pending`` without touching the registry.
+        """
+        live = pending_permissions.get(job.job_id, request_id)
+        durable_resolved = False
+        decisions: list[str] = []
+        with self._job_meta_lock(job.path):
+            meta = self._read_job_meta(job.path)
+            status = meta.get("status", "running")
+            pending = meta.get("pending_request")
+            if (
+                status not in {"running", "awaiting_input"}
+                or not isinstance(pending, dict)
+                or pending.get("request_id") != request_id
+                or pending.get("state") != "pending"
+            ):
+                return {
+                    "ok": False,
+                    "error": "request_not_pending",
+                    "job_id": job.job_id,
+                    "request_id": request_id,
+                    "warnings": [],
+                    "job_created": True,
+                }
+            raw_decisions = pending.get("decisions")
+            decisions = (
+                [item for item in raw_decisions if isinstance(item, str)]
+                if isinstance(raw_decisions, list)
+                else []
+            )
+            # The public wire representation is deliberately provider-neutral.
+            # Never accept an ACP option id or an escalating allow_always.
+            if decision not in {"allow", "reject"} or decision not in decisions:
+                return {
+                    "ok": False,
+                    "error": "invalid_decision",
+                    "job_id": job.job_id,
+                    "request_id": request_id,
+                    "decisions": decisions,
+                    "warnings": [],
+                    "job_created": True,
+                }
+            if live is None and not _provider_process_is_alive(meta):
+                # No callback and no live provider: this is a restart/death,
+                # so settle the durable inbox before returning.  A missing
+                # local registry alone is not sufficient evidence to do this.
+                meta["pending_request"] = {
+                    **pending,
+                    "state": "expired",
+                    "settled_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._write_job_meta(job.path, meta)
+                return {
+                    "ok": False,
+                    "error": "request_not_pending",
+                    "job_id": job.job_id,
+                    "request_id": request_id,
+                    "message": "Pending request has no live provider callback",
+                    "warnings": [],
+                    "job_created": True,
+                }
+            # This compare-and-set is the inter-process decision handoff.  It
+            # must happen before any live callback delivery, while the same
+            # metadata lock that stop/deadline settlement uses is held.
+            meta["pending_request"] = {
+                **pending,
+                "state": "resolved",
+                "decision": decision,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._write_job_meta(job.path, meta)
+            durable_resolved = True
+
+        if durable_resolved and live is not None:
+            # The callback is only an acceleration; the owner process can be
+            # separate and the ACP coroutine also polls the durable inbox.
+            pending_permissions.resolve(job.job_id, request_id, decision)
+            # A live same-process callback has already received the decision
+            # through the registry. Remove the inbox record so ordinary
+            # callers retain the historical post-resolution metadata shape.
+            # Cross-process owners leave the resolved record in place for the
+            # provider coroutine's durable poll to consume.
+            with self._job_meta_lock(job.path):
+                current = self._read_job_meta(job.path)
+                resolved_pending = current.get("pending_request")
+                if (
+                    isinstance(resolved_pending, dict)
+                    and resolved_pending.get("request_id") == request_id
+                    and resolved_pending.get("state") == "resolved"
+                ):
+                    current.pop("pending_request", None)
+                    self._write_job_meta(job.path, current)
+        return {
+            "ok": True,
+            "job_id": job.job_id,
+            "request_id": request_id,
+            "decision": decision,
+        }
 
     # ── stop / list ───────────────────────────────────────────────────────
 
@@ -1492,7 +2116,13 @@ class JobStore:
             # publish a late success over the caller's explicit stop request.
             meta["status"] = "stopped"
             meta["stop_reason"] = reason
+            # Settle any pending owner-mediated request in the same critical
+            # section that terminalizes the job, so a late structured decision
+            # can never resurrect it.
+            settled_request_id = self._mark_pending_settled(meta, "cancelled")
             self._write_job_meta(job.path, meta)
+        if settled_request_id is not None:
+            pending_permissions.settle_job(job_id, outcome="cancelled")
         data: dict[str, Any] = {"reason": reason}
         tmux_session = meta.get("tmux_session")
         if job.transport == "tmux" and tmux_session:
@@ -1641,7 +2271,7 @@ class JobStore:
                 and meta.get("client_session_id") != client_session_id
             ):
                 continue
-            if meta.get("status", "running") == "running":
+            if meta.get("status", "running") in {"running", "awaiting_input"}:
                 job = self.get_job(job_id)
                 if job is not None:
                     self._reap_deadline_expired_job(job)

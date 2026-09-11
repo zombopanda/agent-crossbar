@@ -453,17 +453,23 @@ def agent_start(
     if not ok:
         return _tool_error("invalid_profile", f"Unknown profile '{profile}'")
 
+    try:
+        adapter = get_adapter(resolved)
+    except ValueError:
+        return _tool_error("invalid_profile", f"Unknown profile '{profile}'")
+
     if interactive:
-        try:
-            adapter = get_adapter(resolved)
-        except ValueError:
-            return _tool_error("invalid_profile", f"Unknown profile '{profile}'")
         if not adapter.supports_interactive:
             return _tool_error(
                 "interactive_not_supported",
                 f"Profile '{resolved}' does not support interactive mode. "
                 "Interactive send/attach is not yet implemented for this backend.",
             )
+    elif getattr(adapter, "requires_interactive", False):
+        return _tool_error(
+            "interactive_required",
+            f"Profile '{resolved}' only supports interactive launch; pass interactive=true.",
+        )
 
     if scope is not None and not cwd:
         return _tool_error("cwd_required", "scope requires cwd")

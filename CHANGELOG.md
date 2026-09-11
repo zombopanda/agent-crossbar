@@ -4,6 +4,53 @@ All notable changes to Agent Crossbar.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-10
+
+### Added
+- Owner-mediated permissions and continuation over the existing `job_send`
+  tool. ACP (`session/request_permission`) requests outside the bounded
+  local-edit auto-allow policy are held genuinely pending, surfaced as a
+  durable `awaiting_input` `pending_request` (unique `request_id`, honest
+  `kind` including `other`, bounded/redacted tool/command/path, generic
+  `allow`/`reject` decisions) while the ACP coroutine and connection stay
+  alive under the single per-job deadline. `job_send`'s `text` may carry a
+  JSON object `{"request_id": ..., "decision": ...}` to resolve one request;
+  any other text keeps its exact plain-text meaning.
+- `rawInput` path extraction recognizes OpenCode's `filepath`/`parentDir`
+  (and snake_case) keys, so local targets are no longer missed.
+- `job_tail` exposes the concrete `pending_request` for an `awaiting_input`
+  job instead of only a bare `waiting_for` string.
+- Claude's `awaiting_input` detail carries the full, redacted question text
+  recovered from the tmux transcript, alongside the native `waiting_for`
+  label.
+
+### Changed
+- **Breaking:** Claude is now interactive-only. `agent_start(profile="claude")`
+  with `interactive=false` (explicit or defaulted) is rejected with the stable
+  `interactive_required` error before readiness, admission, lease, or job
+  creation. Pass `interactive=true`.
+- Claude's background monitor no longer exits when a job becomes
+  `awaiting_input`; it keeps polling under the one monotonic `max_runtime_sec`
+  deadline, so a `job_send` reply is observed without a restart or a reset
+  deadline.
+- ACP job completion is gated on native `stop_reason`: `refusal`,
+  `max_turn_requests`, `cancelled`, and `max_tokens` are reported as failed
+  (`acp_incomplete`) instead of `ok=true, status="completed"`, even when
+  output is non-empty.
+- A pending request is settled (expired/cancelled) in the same operation that
+  terminalizes its job by `job_stop` or deadline reaping; a structured
+  decision arriving afterward is rejected with `request_not_pending` and can
+  never resurrect the job.
+- Claude's profile capability metadata now reports `interaction_modes:
+  ["interactive"]`; it no longer claims a noninteractive mode.
+
+### Fixed
+- Interactive Claude `done` readings immediately after a `job_send` resume
+  are no longer mistaken for the new turn's completion. The monitor keeps
+  polling until a native turn/update identity changes or a provider completion
+  marker is appended after the reply boundary; repeated `done` and echoed
+  input are inconclusive.
+
 ## [0.4.0] — 2026-09-07
 
 ### Changed

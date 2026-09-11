@@ -77,6 +77,28 @@ def test_native_cleanup_failure_keeps_claude_lease_pending(tmp_path):
     assert meta["native_session_id"] == "deadbeef"
 
 
+class _RequiresInteractiveAdapter(_Adapter):
+    requires_interactive = True
+
+
+def test_direct_lifecycle_rejects_noninteractive_before_any_state_mutation(tmp_path):
+    """A caller that bypasses ``agent_start`` must get the same stable
+    ``interactive_required`` rejection before readiness, job, or lease."""
+    store = JobStore(tmp_path)
+    created: list[dict] = []
+    original_create = store.create_job
+    store.create_job = lambda **kwargs: created.append(kwargs) or original_create(**kwargs)
+    adapter = _RequiresInteractiveAdapter(cancel_result=True)
+
+    result = _start(store, adapter, interactive=False)
+
+    assert result["ok"] is False
+    assert result["error"] == "interactive_required"
+    assert created == [], "no job may be created for a rejected non-interactive launch"
+    assert adapter.cancel_calls == []
+    assert list((store.state_root / "jobs").glob("*")) == []
+
+
 def test_interactive_tmux_rollback_failure_keeps_claude_lease_pending(tmp_path, monkeypatch):
     store = JobStore(tmp_path)
     released: list[str] = []

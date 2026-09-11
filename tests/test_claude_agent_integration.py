@@ -142,6 +142,23 @@ def suppress_background_monitor(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_tmux(monkeypatch):
+    """Claude only supports interactive launch, which spawns a real tmux
+    session. Stub ``subprocess.run`` (used only for tmux commands in the
+    Claude adapter) so lifecycle/monitor tests never depend on a real tmux
+    binary. Tests that specifically exercise a tmux failure override this
+    with their own ``monkeypatch.setattr("subprocess.run", ...)`` later in
+    the test body.
+    """
+    success = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def _fake_run(*args, **kwargs):
+        return success
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+
 # ---------------------------------------------------------------------------
 # Test 1: agent_start(profile="claude") uses adapter registry, not legacy
 # ---------------------------------------------------------------------------
@@ -176,16 +193,17 @@ def test_agent_start_claude_uses_adapter_not_legacy_providers(
         profile="claude",
         prompt="hello world",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
     assert result.get("ok") is True, result
     assert result.get("job_id"), "agent_start must return a durable job_id"
     assert result.get("profile") == "claude"
-    # Must NOT use legacy transport annotation
-    assert result.get("transport") != "tmux", "must not use legacy tmux backend"
-    assert result.get("backend") == "claude_bg", "must use native claude_bg backend"
+    # Claude only supports interactive launch: the harness-owned tmux
+    # attach transport and the claude_bg_pty backend, never the legacy
+    # tmux runner.
+    assert result.get("backend") == "claude_bg_pty", "must use native claude_bg_pty backend"
 
     # Verify the adapter was called for readiness and launch
     assert len(runner.calls) >= 2
@@ -202,7 +220,8 @@ def test_agent_start_claude_uses_adapter_not_legacy_providers(
     job = store.get_job(result["job_id"])
     assert job is not None
     meta = store._read_job_meta(job.path)
-    assert meta.get("backend") == "claude_bg"
+    assert meta.get("backend") == "claude_bg_pty"
+    assert meta.get("transport") == "tmux", "harness-owned tmux transport, not the legacy runner"
     assert meta.get("native_session_id") == "abc12345"
 
 
@@ -230,7 +249,7 @@ def test_readiness_failure_creates_no_job_directory(
         profile="claude",
         prompt="hello",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
@@ -267,7 +286,7 @@ def test_launch_stores_native_session_ids_and_resolved_settings(
         model="claude-sonnet-5",
         effort="high",
         cwd="/tmp/test-repo",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
@@ -280,11 +299,11 @@ def test_launch_stores_native_session_ids_and_resolved_settings(
     meta = store._read_job_meta(job.path)
 
     assert meta.get("native_session_id") == "deadbeef"
-    assert meta.get("backend") == "claude_bg"
+    assert meta.get("backend") == "claude_bg_pty"
     assert meta.get("model") == "claude-sonnet-5"
     assert meta.get("effort") == "high"
     assert meta.get("task") == "dev"
-    assert meta.get("interactive") is False
+    assert meta.get("interactive") is True
     assert meta.get("cwd") == "/tmp/test-repo"
 
 
@@ -326,7 +345,7 @@ def test_monitor_polls_status_until_done_and_normalizes_result(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
@@ -375,7 +394,7 @@ def test_monitor_detects_blocked_as_failure_for_non_interactive_jobs(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
@@ -386,6 +405,11 @@ def test_monitor_detects_blocked_as_failure_for_non_interactive_jobs(
     import agent_crossbar.adapters.registry as reg
 
     adapter = reg.get_adapter("claude")
+
+    # Claude only launches interactively now; the non-interactive blocked
+    # branch is still internal monitor behavior, exercised directly here
+    # since agent_start can no longer produce a non-interactive job.
+    store.update_job_meta(job_id, {"interactive": False})
 
     monitor_agent_job(store, job_id, adapter, poll_interval_sec=0.01)
 
@@ -425,7 +449,7 @@ def test_job_stop_calls_adapter_cancel_for_claude_bg_jobs(
         profile="claude",
         prompt="long task",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
 
@@ -532,11 +556,13 @@ def test_interactive_claude_job_send_routes_to_tmux(
     )
 
 
-def test_noninteractive_claude_job_send_still_rejected(
+def test_noninteractive_claude_agent_start_rejected_before_job_creation(
     claude_state_root: Path, monkeypatch, suppress_background_monitor
 ):
-    """Non-interactive Claude bg jobs must still reject job_send."""
-    runner = FakeRunner([_auth_ok(), _launch_ok("feedface")])
+    """Claude only supports interactive launch: interactive=false must be
+    rejected before any job/lease/provider state mutation, not merely at
+    job_send time."""
+    runner = FakeRunner([])
     monkeypatch.setattr(
         "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
         runner.run,
@@ -550,19 +576,34 @@ def test_noninteractive_claude_job_send_still_rejected(
         client_name="test",
     )
 
-    assert result.get("ok") is True
-    job_id = result["job_id"]
+    assert result.get("ok") is False
+    assert result.get("error") == "interactive_required"
+    assert "job_id" not in result
+    # No provider process was ever launched.
+    assert runner.calls == []
 
-    # job_send should reject non-interactive Claude bg
-    send_result = job_send(
-        job_id=job_id,
-        text="more input",
+
+def test_noninteractive_claude_agent_start_default_also_rejected(
+    claude_state_root: Path, monkeypatch, suppress_background_monitor
+):
+    """Omitting interactive (defaulting to false) is rejected the same way
+    as an explicit interactive=false — there is no implicit non-interactive
+    Claude launch."""
+    runner = FakeRunner([])
+    monkeypatch.setattr(
+        "agent_crossbar.adapters.claude.LocalSubprocessRunner.run",
+        runner.run,
+    )
+
+    result = agent_start(
+        profile="claude",
+        prompt="do thing",
+        task="ask",
         client_name="test",
     )
 
-    assert send_result.get("ok") is False, (
-        f"Expected job_send to fail for non-interactive Claude, got {send_result}"
-    )
+    assert result.get("ok") is False
+    assert result.get("error") == "interactive_required"
 
 
 def test_interactive_claude_launch_tmux_failure_propagates(
@@ -707,7 +748,7 @@ def test_monitor_maps_done_to_completed_envelope(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -756,7 +797,7 @@ $Worked for 2s
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -797,7 +838,7 @@ def test_monitor_maps_failed_to_failed_with_failure_block(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -840,7 +881,7 @@ def test_monitor_maps_stopped_to_cancelled(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -884,7 +925,7 @@ def test_monitor_blocked_noninteractive_produces_execution_failure(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -894,6 +935,7 @@ def test_monitor_blocked_noninteractive_produces_execution_failure(
     import agent_crossbar.adapters.registry as reg
 
     adapter = reg.get_adapter("claude")
+    store.update_job_meta(job_id, {"interactive": False})
     monitor_agent_job(store, job_id, adapter, poll_interval_sec=0.01)
 
     final = store.get_result(job_id)
@@ -935,7 +977,6 @@ def test_monitor_does_not_cancel_startup_block_without_prompt_evidence(
             _auth_ok(),
             _launch_ok("deadbeef"),
             blocked_without_prompt,
-            _logs_ok("[Screen Reader Mode: on via flag]"),
             _agents_entry("done", "deadbeef"),
             _logs_ok("GPT_PRO_PROVIDER_GATE_OK"),
         ]
@@ -950,7 +991,7 @@ def test_monitor_does_not_cancel_startup_block_without_prompt_evidence(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -998,12 +1039,13 @@ def test_monitor_claude_limit_is_actionable_and_never_returns_raw_tui(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     store = JobStore(claude_state_root)
     import agent_crossbar.adapters.registry as reg
 
+    store.update_job_meta(result["job_id"], {"interactive": False})
     monitor_agent_job(
         store,
         result["job_id"],
@@ -1044,12 +1086,13 @@ def test_monitor_claude_missing_login_is_auth_failure(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     store = JobStore(claude_state_root)
     import agent_crossbar.adapters.registry as reg
 
+    store.update_job_meta(result["job_id"], {"interactive": False})
     monitor_agent_job(
         store,
         result["job_id"],
@@ -1176,7 +1219,7 @@ def test_monitor_finalization_exception_produces_finalization_failure(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -1229,7 +1272,7 @@ def test_monitor_persists_full_session_id_on_every_poll_not_only_terminal(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -1275,7 +1318,7 @@ def test_monitor_failure_diagnostics_bounded_and_no_secrets(
         profile="claude",
         prompt="do thing",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -1336,7 +1379,7 @@ def test_monitor_emits_log_delta_events_during_working_state(
         profile="claude",
         prompt="stream this",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -1395,7 +1438,7 @@ def test_monitor_log_delta_handles_empty_or_identical_logs_gracefully(
         profile="claude",
         prompt="quiet task",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -1437,7 +1480,7 @@ def test_monitor_log_delta_deduplicates_sliding_log_tails(
     from agent_crossbar.agent_runner import monitor_agent_job
 
     job_id = agent_start(
-        profile="claude", prompt="sliding logs", task="ask", interactive=False, client_name="test"
+        profile="claude", prompt="sliding logs", task="ask", interactive=True, client_name="test"
     )["job_id"]
     store = JobStore(claude_state_root)
     import agent_crossbar.adapters.registry as reg
@@ -1473,7 +1516,7 @@ def test_monitor_emits_working_heartbeat_when_provider_is_silent(
         profile="claude",
         prompt="quiet reasoning",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )["job_id"]
     store = JobStore(claude_state_root)
@@ -1518,7 +1561,7 @@ def test_monitor_log_delta_survives_get_logs_failure(
         profile="claude",
         prompt="flaky logs",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -1562,7 +1605,7 @@ def test_monitor_log_delta_sanitizes_ansi_control_chars(
         profile="claude",
         prompt="colorful",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -1655,7 +1698,7 @@ def test_monitor_finalizes_working_idle_with_final_response(
         profile="claude",
         prompt="audit pandahome contract",
         task="review",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     assert result.get("ok") is True, result
@@ -1718,7 +1761,7 @@ def test_monitor_does_not_false_finalize_without_final_response(
         profile="claude",
         prompt="something",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -1767,7 +1810,7 @@ def test_monitor_resets_idle_counter_on_changed_logs(
         profile="claude",
         prompt="something",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]
@@ -1807,7 +1850,7 @@ def test_job_tail_preserves_log_delta_events_for_claude_bg(
         profile="claude",
         prompt="test",
         task="ask",
-        interactive=False,
+        interactive=True,
         client_name="test",
     )
     job_id = result["job_id"]

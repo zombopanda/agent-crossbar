@@ -124,7 +124,7 @@ With the MCP server running, from any MCP client:
 | 3 | `profile_health` | Run live readiness probes for all configured profiles |
 | 4 | `job_tail` | Stream incremental job output by sequence number |
 | 5 | `job_result` | Get final structured result, exit code, and summary |
-| 6 | `job_send` | Send follow-up input to a running interactive job (not available for Claude bg) |
+| 6 | `job_send` | Send follow-up input, or a structured owner decision, to a running interactive job |
 | 7 | `job_stop` | Stop a running job gracefully |
 | 8 | `job_list` | List jobs scoped to the current client session |
 
@@ -160,8 +160,8 @@ owning session. No environment variable or token setup is required —
 | Profile | Tasks | Backend | OS | Model selection |
 |---------|-------|---------|-----|-----------------|
 | `codex` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
-| `claude` | ask, review, dev | Native `claude_bg`; interactive follow-ups via `job_send` (no `claude -p`) | macOS, Linux | Required on every call |
-| `opencode` | ask, review, dev | ACP one-shot (including explicit effort) | macOS, Linux | Required on every call |
+| `claude` | ask, review, dev | Native `claude_bg`; **interactive-only** — non-interactive `agent_start` is rejected with `interactive_required` | macOS, Linux | Required on every call |
+| `opencode` | ask, review, dev | ACP one-shot (including explicit effort); owner permission decisions held through `job_send` | macOS, Linux | Required on every call |
 
 `model` is mandatory for every `agent_start` request. Agent Crossbar never
 chooses or falls back to a default model. Use `profiles_list` to inspect the
@@ -188,9 +188,68 @@ currently available model IDs before starting a job.
 Agent Crossbar uses Claude's native `claude --bg` subscription path. This uses your ordinary Claude plan — no separate API billing.
 
 - `claude -p` (print/SDK mode) is **disabled** — it uses separate Agent SDK metered billing
+- Claude is **interactive-only**: `agent_start(profile="claude")` rejects an explicit or defaulted `interactive=false` with `interactive_required` before readiness, admission, lease, or job creation
 - With `interactive: true`, Agent Crossbar opens a harness-owned `claude attach <session-id>` tmux session; `job_send` writes the next turn into that same native session
+- The background monitor stays alive across `awaiting_input` under one monotonic `max_runtime_sec` deadline, so a `job_send` reply is observed without restarting the monitor or resetting the deadline
+- When the native session pauses mid-turn, the `awaiting_input` detail carries the full question text recovered from the tmux transcript (redacted, not cut to the 2 KiB diagnostics prefix) alongside the native `waiting_for` label
 - Profile `claude` maps to `claude_bg` for one-shot calls and `claude_bg_pty` internally for attach-backed interactive calls
 - Readiness is validated via `claude auth status --json` before job creation
+
+## Owner-Mediated Permissions and Continuation
+
+Two provider pause points are surfaced to the owner through the existing
+`job_send` tool — no new tool and no new `agent_start` field.
+
+**Claude questions.** When a Claude interactive turn pauses mid-turn, the job
+becomes `awaiting_input` and `job_tail` reports the native `waiting_for` label
+plus a `question` field carrying the full, redacted question text. Reply with
+plain text via `job_send`; the same monitor thread observes the resume on its
+next poll.
+
+**ACP permissions (OpenCode/DeepSeek).** A `session/request_permission` call
+that is not resolved by the existing bounded local-edit auto-allow policy is
+held pending instead of being auto-rejected. The job becomes `awaiting_input`
+with a durable `pending_request` in `job_tail`:
+
+```json
+{
+  "pending_request": {
+    "request_id": "perm-1a2b3c4d5e6f",
+    "kind": "other",
+    "decisions": ["allow", "reject"],
+    "command": "rm -rf /tmp/x"
+  }
+}
+```
+
+`request_id`, `kind`, bounded tool/command/path(s), and generic `allow`/`reject`
+choices are exposed; raw ACP option ids are never surfaced, and no decision
+can escalate to `allow_always`. Resolve it with a JSON object as `job_send`'s
+`text`:
+
+```json
+{"request_id": "perm-1a2b3c4d5e6f", "decision": "allow"}
+```
+
+Any `text` that is not a JSON object carrying string `request_id` and
+`decision` keeps its exact plain-text meaning. A decision for a stale,
+unknown, or already-resolved request is rejected with `request_not_pending`
+(never reinterpreted as plain text). Resolution enforces the same
+owner/`client_session_id` policy as any other `job_send`, including the `"*"`
+wildcard. Pending requests settle (expire/cancel) in the same operation that
+terminalizes a job by `job_stop` or deadline, so a late decision can never
+resurrect a terminal job; a durable pending request with no live provider
+callback fails closed and cleans up.
+
+OpenCode does not support free-text interactive continuation (`interactive` is
+false), but its ACP permission flow advertises `owner_permission_decisions`
+separately in `profiles_list`; structured decisions still use `job_send` while
+the ACP connection remains alive.
+
+**ACP completion honesty.** `ok=true, status="completed"` now requires native
+completion evidence: a prompt response whose `stop_reason` is not `refusal`,
+`max_turn_requests`, `cancelled`, or `max_tokens`. Non-empty progress output
+alone no longer counts as success.
 
 ## Timeouts
 
@@ -390,8 +449,13 @@ the configured Agents process and does not trust client or session metadata.
 | `acp_launch_error` | ACP agent process failed to launch (binary missing, dependency error) | Check provider CLI installation, run `agent-crossbar doctor` |
 | `acp_protocol_error` | ACP protocol handshake or message error (version mismatch, invalid request) | Check provider and protocol logs; provider CLI may need upgrade |
 | `acp_timeout` | ACP job exceeded `max_runtime_sec` while awaiting an already-delivered prompt's response | Follow `failure.next_action`: normally increase `max_runtime_sec`; for OpenCode, `check_provider_limits_or_retry_with_free_model` |
+| `owner_input_timeout` | ACP execution deadline expired while an owner-mediated permission request was still pending | Retry the job and answer the surfaced permission request via `job_send` before the deadline |
 | `acp_prompt_delivery_timeout` | ACP startup did not finish within its bounded startup window, before the prompt was dispatched | Check provider availability, quota, CLI installation, and selected model |
 | `acp_empty_result` | An ACP `dev` task returned whitespace-only or entirely absent output — treated as a failed no-op rather than `completed`, since a real dev turn should produce observable text even when `changes` stays empty (Agents MCP does not inventory the workspace) | Retry, or inspect the prompt and provider session mode |
+| `acp_incomplete` | An ACP turn stopped on an incomplete native `stop_reason` (`refusal`, `max_turn_requests`, `cancelled`, or `max_tokens`) even though it produced output — reported as failed, not `completed` | Adjust the prompt, grant a pending permission, or retry |
+| `interactive_required` | `agent_start(profile="claude")` was called with `interactive=false` (explicitly or by default) | Pass `interactive=true` |
+| `request_not_pending` | A `job_send` structured decision referenced an unknown, already-resolved, or terminal `request_id`, or a durable pending request had no live provider callback | Re-read `job_tail` for the current `pending_request`, or use plain text for an interactive reply |
+| `invalid_decision` | A `job_send` structured decision used a value not offered in `pending_request.decisions` (for example `allow_always`) | Use one of the surfaced `decisions`; the request stays pending |
 
 `job_stop` is idempotent. ACP jobs persist a terminal result even when the
 provider process has already exited; running ACP child processes receive

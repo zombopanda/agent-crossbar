@@ -26,7 +26,7 @@ import logging
 import shlex
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,7 @@ from acp.schema import (
 )
 
 from .models import Autonomy
+from .redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 ACP_HEARTBEAT_INTERVAL_SEC = 30.0
@@ -65,6 +66,10 @@ class AcpResult:
     output: str
     stop_reason: str
     session_id: str
+    # A provider can emit progress and ``end_turn`` after an owner rejected a
+    # permission.  Keep that protocol outcome independent of native text so
+    # the runtime cannot report the refused/incomplete turn as completed.
+    permission_rejected: bool = False
 
 
 class AcpError(Exception):
@@ -142,7 +147,34 @@ _PATH_KEYS = frozenset(
         "dest",
         "from",
         "to",
+        # OpenCode emits these instead of the generic keys above; without
+        # them a legitimate local edit/read looks like an unprovable path.
+        "filepath",
+        "filePath",
+        "file_path",
+        "parentDir",
+        "parent_dir",
+        "parentdir",
     }
+)
+_PATH_FIELD_ORDER = (
+    "filepath",
+    "filePath",
+    "file_path",
+    "path",
+    "target",
+    "parentDir",
+    "parent_dir",
+    "parentdir",
+    "cwd",
+    "directory",
+    "root",
+    "source",
+    "from",
+    "destination",
+    "dest",
+    "to",
+    "file",
 )
 _SAFE_EXECUTABLES = frozenset({"ls", "pwd"})
 _SAFE_LS_FLAGS = frozenset({"a", "A", "l", "1"})
@@ -186,13 +218,19 @@ class _OneShotClient:
         on_text_delta: Callable[[str], None] | None = None,
         *,
         cwd: str | None = None,
+        permission_handler: Callable[
+            [ToolCallUpdate, list[PermissionOption]], Awaitable[RequestPermissionResponse]
+        ]
+        | None = None,
     ) -> None:
         self._autonomy = autonomy
         self._on_text_delta = on_text_delta
         self._cwd = Path(cwd).expanduser().resolve(strict=False) if cwd else None
+        self._permission_handler = permission_handler
         self._session_id: str | None = None
         self._output_parts: list[str] = []
         self._stop_reason = "unknown"
+        self.permission_rejected = False
         self.prompt_sent = False
         self.last_protocol_activity_at = time.monotonic()
 
@@ -213,18 +251,46 @@ class _OneShotClient:
         # and make the complete set of filesystem changes required by its task.
         # Restricting EDIT_LOCAL to the literal "edit" kind leaves OpenCode
         # unable to perform its normal read/search/execute workflow and makes
-        # healthy ACP jobs appear to make no progress.
+        # healthy ACP jobs appear to make no progress.  This is the *only*
+        # auto-allow policy; everything it does not resolve is held for an
+        # owner decision instead of being auto-rejected in-process.
         if self._autonomy is Autonomy.EDIT_LOCAL and kind in _EDIT_LOCAL_PERMISSION_KINDS:
-            if kind == "execute" and not self._bounded_local_execute(tool_call):
-                return _select_reject_once(options)
-            paths = self._permission_paths(tool_call)
-            if kind in _PATH_PERMISSION_KINDS and not paths:
-                # A file operation without a target cannot be proven local.
-                return _select_reject_once(options)
-            if self._cwd is None or any(not self._path_is_within_cwd(path) for path in paths):
-                return _select_reject_once(options)
-            return _select_allow_once(options)
-        return _select_reject_once(options)
+            allowed = False
+            if kind == "execute":
+                allowed = self._bounded_local_execute(tool_call) and self._cwd is not None
+            else:
+                paths = self._permission_paths(tool_call)
+                allowed = (
+                    not (kind in _PATH_PERMISSION_KINDS and not paths)
+                    and self._cwd is not None
+                    and all(self._path_is_within_cwd(path) for path in paths)
+                )
+            if allowed:
+                return _select_allow_once(options)
+        # Anything outside the explicit bounded local-edit policy is held for
+        # an owner decision (or rejected when no handler is configured, e.g.
+        # a direct unit-level caller).
+        response = await self._owner_mediated(tool_call, options)
+        outcome = getattr(response, "outcome", None)
+        if isinstance(outcome, DeniedOutcome) or (
+            isinstance(outcome, AllowedOutcome)
+            and any(
+                getattr(option, "option_id", None) == getattr(outcome, "option_id", None)
+                and getattr(option, "kind", None) == "reject_once"
+                for option in options
+            )
+        ):
+            self.permission_rejected = True
+        return response
+
+    async def _owner_mediated(
+        self,
+        tool_call: ToolCallUpdate,
+        options: list[PermissionOption],
+    ) -> RequestPermissionResponse:
+        if self._permission_handler is None:
+            return _select_reject_once(options)
+        return await self._permission_handler(tool_call, options)
 
     def _path_is_within_cwd(self, value: str) -> bool:
         """Return whether *value* resolves beneath the canonical job cwd."""
@@ -284,6 +350,13 @@ class _OneShotClient:
         )
         if not isinstance(command, str) or not command.strip():
             return False
+        # ACP implementations use raw ``cwd``/``directory``/filepath fields
+        # for commands such as ``pwd``.  Validate those fields before the
+        # command-specific argument policy; a bare ``pwd`` must not authorize
+        # an out-of-workspace directory supplied in raw input.
+        explicit_paths = self._permission_paths(tool_call)
+        if any(not self._path_is_within_cwd(path) for path in explicit_paths):
+            return False
         if any(
             marker in command
             for marker in (";", "&&", "||", "|", ">", "<", "`", "&", "\n", "\r", "$", "\\")
@@ -309,12 +382,23 @@ class _OneShotClient:
         if not (bare_executable or system_executable):
             return False
 
-        args = raw_input.get("args", raw_input.get("arguments", raw_input.get("argv")))
-        if args is not None and (
-            not isinstance(args, list) or any(not isinstance(item, str) for item in args)
-        ):
-            return False
-        command_tokens = [*tokens, *(args or [])]
+        # Do not use a fallback ``dict.get`` chain here: an empty/valid first
+        # spelling must not hide a second spelling carrying an unsafe target.
+        # Merge every present form and reject malformed/oversized input.
+        argument_values: list[str] = []
+        for argument_key in _PERMISSION_ARGUMENT_KEYS:
+            if argument_key not in raw_input:
+                continue
+            args = raw_input[argument_key]
+            if not isinstance(args, list) or len(args) > _PERMISSION_ARGUMENT_COUNT_MAX:
+                return False
+            if any(
+                not isinstance(item, str) or len(item) > _PERMISSION_ARGUMENT_ITEM_MAX
+                for item in args
+            ):
+                return False
+            argument_values.extend(args)
+        command_tokens = [*tokens, *argument_values]
         if executable == "pwd":
             # pwd has no target and therefore accepts no additional args.
             if len(command_tokens) != 1:
@@ -445,6 +529,169 @@ def _select_allow_once(
     return _select_reject_once(options)
 
 
+# ── Owner-mediated permission surface ───────────────────────────────────
+
+_PERMISSION_FIELD_MAX = 512
+_PERMISSION_ARGUMENT_ITEM_MAX = 256
+_PERMISSION_ARGUMENT_COUNT_MAX = 32
+_PERMISSION_ARGUMENT_KEYS = ("args", "arguments", "argv")
+
+
+def _bounded_field(value: Any) -> str | None:
+    """Redact and bound one surfaced permission field; None when empty."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    redacted, _ = redact_secrets(text)
+    return redacted[:_PERMISSION_FIELD_MAX]
+
+
+def _field_truncated(value: Any) -> bool:
+    """Return whether redaction/bounding would hide part of a field."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    redacted, _ = redact_secrets(value.strip())
+    return len(redacted) > _PERMISSION_FIELD_MAX
+
+
+def _permission_argument_forms(raw_input: dict[str, Any]) -> tuple[dict[str, Any], bool, bool]:
+    """Surface every ACP argument spelling without trusting or leaking it.
+
+    ACP implementations disagree on whether command arguments are carried as
+    ``args``, ``arguments`` or ``argv``.  A detail that picks one spelling can
+    hide a dangerous target from the owner (and from the bounded execute
+    policy).  Keep each present form distinct, bound every item, and report an
+    incomplete form so callers can fail closed when it cannot be represented.
+    """
+    surfaced: dict[str, Any] = {}
+    truncated = False
+    complete = True
+    for key in _PERMISSION_ARGUMENT_KEYS:
+        if key not in raw_input:
+            continue
+        value = raw_input[key]
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            if len(items) > _PERMISSION_ARGUMENT_COUNT_MAX:
+                truncated = True
+                items = items[:_PERMISSION_ARGUMENT_COUNT_MAX]
+            bounded_items: list[str] = []
+            for item in items:
+                if not isinstance(item, str):
+                    complete = False
+                    bounded_items.append("[UNAVAILABLE]")
+                    continue
+                redacted, _ = redact_secrets(item.strip())
+                if len(redacted) > _PERMISSION_ARGUMENT_ITEM_MAX:
+                    truncated = True
+                bounded_items.append(redacted[:_PERMISSION_ARGUMENT_ITEM_MAX])
+            surfaced[key] = bounded_items
+        elif isinstance(value, str):
+            # Keep malformed scalar values visible to the owner while making
+            # the policy reject them.  ACP execute arguments must be arrays.
+            complete = False
+            bounded = _bounded_field(value)
+            surfaced[key] = bounded if bounded is not None else ""
+            truncated = truncated or _field_truncated(value)
+        else:
+            complete = False
+            surfaced[key] = "[UNAVAILABLE]"
+    return surfaced, truncated, complete
+
+
+def permission_request_detail(tool_call: Any) -> dict[str, Any]:
+    """Build a bounded, honest, redacted description of a permission request.
+
+    Surfaces the request's own ``kind`` verbatim (including ``"other"`` and
+    ``"switch_mode"``), plus any tool title, command, and path targets —
+    including OpenCode's ``filepath``/``parentDir`` raw-input keys.  Never
+    includes secret-looking values or ACP option identifiers.
+    """
+    kind_raw = getattr(tool_call, "kind", None)
+    kind = kind_raw if isinstance(kind_raw, str) and kind_raw else "other"
+    detail: dict[str, Any] = {"kind": kind}
+    tool = _bounded_field(getattr(tool_call, "title", None))
+    if tool:
+        detail["tool"] = tool
+
+    command: str | None = None
+    truncated = False
+    arguments_complete = True
+    paths: list[str] = []
+    raw_input = getattr(tool_call, "raw_input", None)
+    if isinstance(raw_input, dict):
+        for key in ("command", "cmd", "shell"):
+            truncated = _field_truncated(raw_input.get(key))
+            command = _bounded_field(raw_input.get(key))
+            if command:
+                break
+        for key in _PATH_FIELD_ORDER:
+            truncated = truncated or _field_truncated(raw_input.get(key))
+            path = _bounded_field(raw_input.get(key))
+            if path and path not in paths:
+                paths.append(path)
+        argument_forms, arguments_truncated, arguments_complete = _permission_argument_forms(
+            raw_input
+        )
+        detail.update(argument_forms)
+        truncated = truncated or arguments_truncated
+    # ``locations`` is a separate, ACP-native list of affected targets that
+    # can carry entries not present in ``raw_input`` (e.g. a multi-file move
+    # or directory operation). Always merge it in — checking it only when
+    # ``raw_input`` yielded nothing would silently hide additional targets
+    # for tool calls that populate both.
+    for location in getattr(tool_call, "locations", None) or []:
+        path = _bounded_field(getattr(location, "path", None))
+        truncated = truncated or _field_truncated(getattr(location, "path", None))
+        if path and path not in paths:
+            paths.append(path)
+    if command:
+        detail["command"] = command
+    if paths:
+        detail["path"] = paths[0]
+        if len(paths) > 1:
+            detail["paths"] = paths[:8]
+            if len(paths) > 8:
+                # The list itself was bounded, hiding targets beyond the
+                # cap; this must be treated exactly like a truncated field.
+                truncated = True
+    if truncated:
+        # Never offer an allow decision for an action whose displayed details
+        # omit an unreviewed suffix.  The owner can still reject it.
+        detail["details_truncated"] = True
+    if not arguments_complete:
+        # The owner-visible record is intentionally explicit.  Runtime callers
+        # must not turn an unrepresentable argument form into an approval.
+        detail["details_incomplete"] = True
+    return detail
+
+
+def permission_decision_options(options: list[PermissionOption]) -> list[str]:
+    """Return the generic owner decisions reachable for *options*.
+
+    ``allow`` is offered only when the request advertises an ``allow_once``
+    option; ``allow_always`` is deliberately never reachable.  ``reject`` is
+    always available (an agent with no ``reject_once`` option is still
+    rejectable via the protocol's cancelled outcome).
+    """
+    decisions: list[str] = []
+    if any(getattr(opt, "kind", None) == "allow_once" for opt in options):
+        decisions.append("allow")
+    decisions.append("reject")
+    return decisions
+
+
+def permission_response_for_decision(
+    options: list[PermissionOption], decision: str
+) -> RequestPermissionResponse:
+    """Map a generic owner decision back onto the request's own options."""
+    if decision == "allow":
+        return _select_allow_once(options)
+    return _select_reject_once(options)
+
+
 # ── Model config helpers ───────────────────────────────────────────────
 
 
@@ -545,6 +792,10 @@ async def run_acp_prompt(
     before_prompt: Callable[[], None] | None = None,
     on_text_delta: Callable[[str], None] | None = None,
     on_execution_heartbeat: Callable[[dict[str, Any]], None] | None = None,
+    permission_handler: Callable[
+        [ToolCallUpdate, list[PermissionOption]], Awaitable[RequestPermissionResponse]
+    ]
+    | None = None,
 ) -> AcpResult:
     """Launch a provider, optionally set model, run one ACP prompt, and return the result.
 
@@ -613,6 +864,7 @@ async def run_acp_prompt(
         normalized_autonomy,
         on_text_delta=on_text_delta,
         cwd=cwd,
+        permission_handler=permission_handler,
     )
 
     async def _run() -> AcpResult:
@@ -885,6 +1137,14 @@ async def run_acp_prompt(
                                 )
 
                         process_watch_task = asyncio.create_task(_watch_process_exit())
+                    # Let the provider coroutine reach its first suspension
+                    # point before entering the outer wait.  Without this
+                    # handoff, a very short overall timeout can cancel a
+                    # never-started task; the provider then never observes
+                    # cancellation even though ``prompt_sent`` is true.  The
+                    # heartbeat and process-watch tasks are started first so
+                    # a synchronous provider callback cannot starve them.
+                    await asyncio.sleep(0)
                     wait_tasks: set[asyncio.Task[Any]] = {prompt_task, stderr_task}
                     if process_watch_task is not None:
                         wait_tasks.add(process_watch_task)
@@ -930,6 +1190,7 @@ async def run_acp_prompt(
                     output=output,
                     stop_reason=stop_reason,
                     session_id=session_id,
+                    permission_rejected=client_impl.permission_rejected,
                 )
         except asyncio.CancelledError:
             raise
@@ -946,10 +1207,33 @@ async def run_acp_prompt(
             stage = "execution" if client_impl.prompt_sent else "prompt_delivery"
             raise AcpProtocolError(f"ACP protocol sequence failed: {exc}", stage=stage) from exc
 
+    run_task = asyncio.create_task(_run())
     try:
-        if timeout is not None:
-            return await asyncio.wait_for(_run(), timeout=timeout)
-        return await _run()
+        if timeout is None:
+            return await run_task
+
+        # Wait without cancelling the lifecycle task at the deadline.  The
+        # old ``asyncio.wait_for(_run(), ...)`` path could cancel ``_run`` in
+        # the same event-loop turn that created ``prompt_task``; a provider
+        # coroutine that had not executed its first instruction then never
+        # observed the cancellation.  Give that already-dispatched task one
+        # scheduling turn, cancel the lifecycle, and await its cleanup.
+        done, _pending = await asyncio.wait({run_task}, timeout=timeout)
+        if done:
+            return await run_task
+        if client_impl.prompt_sent:
+            await asyncio.sleep(0)
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+        stage = "execution" if client_impl.prompt_sent else "prompt_delivery"
+        raise AcpTimeoutError(f"ACP prompt timed out after {timeout:.1f}s", stage=stage) from None
     except asyncio.TimeoutError:
         stage = "execution" if client_impl.prompt_sent else "prompt_delivery"
         raise AcpTimeoutError(f"ACP prompt timed out after {timeout:.1f}s", stage=stage) from None
+    except asyncio.CancelledError:
+        if not run_task.done():
+            run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+        raise

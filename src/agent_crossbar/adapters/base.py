@@ -56,6 +56,7 @@ class ProviderAdapter(Protocol):
     native_lifecycle: bool
     live_model_discovery: bool
     review_warning: str | None
+    requires_interactive: bool
 
     def map_effort(self, effort: str) -> str: ...
 
@@ -99,6 +100,11 @@ class StaticAdapter:
     backend: str
     supports_interactive: bool
     effort_map: Mapping[str, str]
+    # When True, this adapter's launch path only functions in interactive
+    # mode; a caller-selected non-interactive launch must be rejected before
+    # any job/lease/provider state mutation. Core routing enforces this
+    # generically without branching on provider name.
+    requires_interactive: bool = False
     # Public-request transport defaults are adapter metadata.  Core routing
     # uses this value without identifying a provider by name.
     default_transport: str = "print"

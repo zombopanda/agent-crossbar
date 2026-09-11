@@ -27,7 +27,11 @@ def build_matrix_entry() -> dict:
         "os": ["darwin", "linux"],
         "operations": entry["operations"],
         "backend": "claude_bg",
-        "interaction_modes": ["noninteractive", "interactive"],
+        # Claude's launch path is interactive-only: a non-interactive
+        # agent_start is rejected with ``interactive_required`` before any
+        # state mutation, so it no longer truthfully offers a
+        # noninteractive mode.
+        "interaction_modes": ["interactive"],
         "effort_support": True,
         "billing_mode": "subscription_quota",
         "job_send_supported": True,

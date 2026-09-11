@@ -42,5 +42,9 @@ def build_matrix_entry() -> dict:
         "interaction_modes": ["noninteractive"],
         "effort_support": True,
         "billing_mode": "free_defaults",
+        # OpenCode has no free-text continuation transport, but its ACP
+        # permission callback is held and resolved through structured
+        # ``job_send`` decisions while the ACP connection remains alive.
+        "owner_permission_decisions": True,
         "job_send_supported": False,
     }

@@ -1,8 +1,12 @@
+import time
+
 import pytest
 
 from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete,
+    interactive_tmux_output_complete_since,
     interactive_tmux_output_summary,
+    reconstruct_tmux_output,
 )
 
 
@@ -277,6 +281,131 @@ esc to interrupt
 """
 
     assert interactive_tmux_output_complete(output, profile="claude") is False
+
+
+def test_claude_screen_reader_final_after_reply_boundary_is_complete():
+    """The screen-reader ``claude:`` redraw plus lifecycle footer is final."""
+    prefix = "previous turn transcript\n"
+    appended = """\n⏺ User answered Claude's questions:
+· Яка риса характеру у собаки? → Грайливий
+Calculating…
+auto mode on (shift+tab to cycle) · esc to interrupt
+35892 tokens
+effort: medium · /effort
+$claude: F
+Calculating…
+auto mode on (shift+tab to cycle) · esc to interrupt
+35892 tokens
+effort: medium · /effort
+$claude: FINAL: Барні
+Calculating…
+auto mode on (shift+tab to cycle) · esc to interrupt
+36502 tokens
+effort: medium · /effort
+$Cogitated for 7s
+auto mode on (shift+tab to cycle)
+"""
+
+    assert (
+        interactive_tmux_output_complete_since(
+            prefix + appended,
+            baseline_bytes=len(prefix.encode()),
+            profile="claude",
+        )
+        is True
+    )
+
+
+def test_claude_screen_reader_stale_redraw_without_final_footer_is_not_complete():
+    prefix = "previous turn transcript\n"
+    stale_redraw = """\n$claude: FINAL: old answer
+Calculating…
+auto mode on (shift+tab to cycle) · esc to interrupt
+36502 tokens
+effort: medium · /effort
+"""
+
+    assert (
+        interactive_tmux_output_complete_since(
+            prefix + stale_redraw,
+            baseline_bytes=len(prefix.encode()),
+            profile="claude",
+        )
+        is False
+    )
+
+
+def test_claude_screen_reader_generic_duration_footer_is_complete():
+    output = """
+$claude: LIVE_CLAUDE_TWO_AWAITS_OK
+Crunched for 10s
+"""
+
+    assert interactive_tmux_output_complete(output, profile="claude") is True
+
+
+def test_claude_screen_reader_generic_footer_requires_capitalized_past_tense_line():
+    output = """
+$claude: LIVE_CLAUDE_TWO_AWAITS_OK
+crunched for 10s
+"""
+
+    assert interactive_tmux_output_complete(output, profile="claude") is False
+
+
+def test_reconstruct_cursor_renderer_handles_newline_and_cursor_right():
+    raw = "first line\npartial\n\x1b[1A\x1b[8Gcontinuation\n"
+
+    rendered = reconstruct_tmux_output(raw)
+
+    assert rendered.splitlines()[:2] == ["first line", "partialcontinuation"]
+
+
+def test_reconstruct_cursor_renderer_preserves_text_before_line_erase():
+    raw = "final answer\n\x1b[1A\x1b[2Kreplacement\n"
+
+    rendered = reconstruct_tmux_output(raw)
+
+    assert "final answer" in rendered
+    assert "replacement" in rendered
+
+
+def test_claude_exact_cursor_rewrite_after_reply_is_complete_and_full():
+    prefix = "x" * 2595 + "\n"
+    appended = (
+        "\x1b(B\x0f\x1b[?1000h"
+        "\x1b[Gclaude: L\r\r\n"
+        "Contemplating…\r\r\n"
+        "auto mode on (shift+tab to cycle)  ·  esc to interrupt\r\r\n"
+        "37349 tokens\r\r\n"
+        "effort: high · /effort\r\r\n"
+        "$\x1b[2G\x1b[5A\x1b[10GIVE_CLAUDE_TWO_AWAITS_OK"
+        "\x1b[2G\x1b[5B\x1b[2K\x1b[1A\x1b[2K"
+        "\x1b[G37509 tokens\r\r\n"
+        "\x1b[GChurned for 6s\r\r\n"
+    )
+    raw = prefix + appended
+
+    assert len(prefix.encode("utf-8")) == 2596
+    assert (
+        interactive_tmux_output_complete_since(
+            raw,
+            baseline_bytes=2596,
+            profile="claude",
+        )
+        is True
+    )
+    assert "claude: LIVE_CLAUDE_TWO_AWAITS_OK" in reconstruct_tmux_output(raw)
+
+
+@pytest.mark.parametrize("movement", ["B", "C", "H"])
+def test_cursor_renderer_rejects_pathological_motion_without_allocating(movement):
+    raw = f"$claude: FINAL\n\x1b[999999999{movement}\nChurned for 1s\n"
+    started = time.perf_counter()
+
+    assert reconstruct_tmux_output(raw) == ""
+    assert interactive_tmux_output_complete(raw, profile="claude") is False
+    assert time.perf_counter() - started < 0.5
 
 
 def test_codex_intermediate_answer_while_working_is_not_complete():

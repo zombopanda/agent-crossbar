@@ -910,6 +910,45 @@ def test_timeout_cleanup():
     assert exc.value.stage == "execution"
 
 
+def test_cancellation_after_prompt_task_starts_waits_for_provider_cleanup():
+    """Once dispatched, cancellation must reach the provider before return."""
+
+    class _StartedConn(_Conn):
+        def __init__(self):
+            super().__init__(hang=True)
+            self.entered = asyncio.Event()
+
+        async def prompt(self, session_id, prompt, **kwargs):
+            self.entered.set()
+            return await super().prompt(session_id, prompt, **kwargs)
+
+    async def scenario():
+        state = {}
+        conn = _StartedConn()
+        with mock.patch(
+            "agent_crossbar.acp_client.spawn_agent_process",
+            _spawn(conn, state),
+        ):
+            task = asyncio.create_task(
+                run_acp_prompt(
+                    ["fake"],
+                    "prompt",
+                    "/tmp",
+                    autonomy=Autonomy.EDIT_LOCAL,
+                    model="test-model",
+                )
+            )
+            await conn.entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        return conn, state
+
+    conn, state = asyncio.run(scenario())
+    assert conn.prompt_cancelled is True
+    assert state["cleaned"] is True
+
+
 # H. timeout before the prompt was ever dispatched must be diagnosable
 def test_timeout_before_prompt_sent_marks_prompt_delivery_stage():
     """A timeout during initialize/session/new must not collapse into an

@@ -38,6 +38,17 @@ def start_claude_job(
 ) -> dict[str, Any]:
     runner = LocalSubprocessRunner()
 
+    # Defense-in-depth: server.agent_start already rejects a non-interactive
+    # launch for adapters that require interactive mode before this function
+    # is reached. Callers that invoke this lifecycle entry point directly
+    # (bypassing the public tool) must get the same stable rejection before
+    # any job/lease/provider state mutation.
+    if not interactive and getattr(adapter, "requires_interactive", False):
+        return tool_error(
+            "interactive_required",
+            f"Profile '{adapter.name}' only supports interactive launch; pass interactive=true.",
+        )
+
     # Check readiness before any state mutation
     readiness = adapter.check_readiness(runner)
     if not readiness.authenticated:

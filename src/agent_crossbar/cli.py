@@ -19,9 +19,18 @@ WAIT_JOB_SUCCESS = 0
 WAIT_JOB_DEADLINE = 2
 WAIT_JOB_TERMINAL_FAILURE = 3
 WAIT_JOB_NOT_FOUND = 4
+WAIT_JOB_NEEDS_INPUT = 5
 TERMINALIZE_REFUSED = 5
 TERMINALIZE_GRACE_SEC = 15.0
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "stopped", "cancelled"})
+
+
+class _NeedsInput(Exception):
+    """The durable job exposed an owner decision before terminal result."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__("job needs owner input")
+        self.payload = payload
 
 
 def _format_text(results: dict[str, Any], profile_filter: str | None = None) -> str:
@@ -109,8 +118,11 @@ def wait_job_cmd(
     """Wait for a durable job's terminal result without inferring a stall.
 
     Exit codes are stable for controller use: ``0`` completed successfully,
-    ``2`` deadline elapsed, ``3`` terminal job failure/cancellation, and ``4``
-    job not found or inaccessible.
+    ``2`` deadline elapsed, ``3`` terminal job failure/cancellation, ``4``
+    job not found or inaccessible, and ``5`` needs owner input.  The last
+    status is nonterminal: the provider job and its writer lease remain alive;
+    send a plain reply or structured decision through ``job_send`` and invoke
+    this waiter again.
     """
     from agent_crossbar.jobs import JobStore
     from agent_crossbar.terminal_wait import TerminalWaitTimeout, wait_for_terminal_result
@@ -122,14 +134,55 @@ def wait_job_cmd(
         # recovery path; it does not alter the MCP tool surface.
         return store.get_result(job_id, client_session_id="*")
 
+    async def on_not_ready(_result: dict[str, Any]) -> None:
+        # Inspect the same durable source used by job_tail.  Raising from the
+        # observer returns the concrete request immediately while preserving
+        # the original job and lease; result_not_ready itself remains an
+        # ordinary intermediate state.
+        tail = store.job_tail(job_id, client_session_id="*")
+        if tail.get("status") != "awaiting_input":
+            return
+        job = store.get_job(job_id)
+        meta = store._read_job_meta(job.path) if job is not None else {}
+        pending = tail.get("pending_request")
+        waiting_for = meta.get("waiting_for")
+        question = meta.get("question")
+        # A cross-process owner decision is durably recorded before the ACP
+        # coroutine consumes it.  During that short handoff window the job
+        # may still report ``waiting_for=permission`` while no unresolved
+        # request remains; do not emit a phantom second needs-input result.
+        if waiting_for == "permission" and not (
+            isinstance(pending, dict) and pending.get("state") == "pending"
+        ):
+            waiting_for = None
+        if not pending and not waiting_for and not question:
+            return
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error": "needs_input",
+            "job_id": job_id,
+            "status": "awaiting_input",
+            "pending_request": pending,
+        }
+        if isinstance(waiting_for, str) and waiting_for:
+            payload["waiting_for"] = waiting_for
+        if isinstance(question, str) and question:
+            payload["question"] = question
+        raise _NeedsInput(payload)
+
     try:
         result = asyncio.run(
             wait_for_terminal_result(
                 read_result,
                 timeout_sec=timeout_sec,
                 poll_interval_sec=poll_interval_sec,
+                on_not_ready=on_not_ready,
             )
         )
+    except _NeedsInput as exc:
+        json.dump(exc.payload, sys.stdout)
+        sys.stdout.write("\n")
+        return WAIT_JOB_NEEDS_INPUT
     except TerminalWaitTimeout as exc:
         json.dump(
             {
@@ -154,6 +207,112 @@ def wait_job_cmd(
     }:
         return WAIT_JOB_SUCCESS
     return WAIT_JOB_TERMINAL_FAILURE
+
+
+def _terminal_cleanup_needed(meta: dict[str, Any], result: dict[str, Any]) -> bool:
+    """Return whether a terminal result still needs provider cleanup."""
+    technical = result.get("technical")
+    if not isinstance(technical, dict):
+        technical = {}
+    if meta.get("cleanup_pending") is True:
+        return True
+    if technical.get("cleanup_pending") is True or technical.get("cleanup_confirmed") is False:
+        return True
+    cleanup_result = technical.get("cleanup_result") or technical.get("provider_cleanup")
+    if isinstance(cleanup_result, dict):
+        if cleanup_result.get("terminated") is False:
+            return True
+        if cleanup_result.get("adapter_cancel_confirmed") is False:
+            return True
+        if cleanup_result.get("provider_stop_confirmed") is False:
+            return True
+    return False
+
+
+def _retry_terminal_cleanup(
+    store: Any,
+    job: Any,
+    *,
+    reason: str,
+    prior_terminal_status: str,
+) -> dict[str, Any]:
+    """Retry provider-native cleanup for a terminal job and persist evidence."""
+    from agent_crossbar.adapters.registry import get_adapter
+    from agent_crossbar.subprocess_runner import LocalSubprocessRunner
+
+    meta = store._read_job_meta(job.path)
+    profile = str(meta.get("adapter_name") or meta.get("profile") or "")
+    backend = meta.get("backend")
+    session_id = meta.get("native_session_id") or meta.get("native_full_session_id")
+    cleanup_attempt: dict[str, Any] = {
+        "attempted": False,
+        "provider": profile or None,
+        "backend": backend,
+        "native_session_id_present": bool(session_id),
+    }
+    cleanup_result: dict[str, Any]
+    cleanup_confirmed = False
+
+    try:
+        if backend == "acp":
+            # ACP's process identity and process-group checks are the safe
+            # provider-neutral fallback when the original worker is gone.
+            from agent_crossbar.acp_runtime import safe_acp_termination
+
+            cleanup_attempt["operation"] = "safe_acp_termination"
+            cleanup_attempt["attempted"] = True
+            cleanup_result = safe_acp_termination(meta)
+            cleanup_confirmed = bool(cleanup_result.get("terminated"))
+        else:
+            adapter = get_adapter(profile)
+            cancel = getattr(adapter, "cancel", None)
+            if callable(cancel) and session_id:
+                cleanup_attempt["operation"] = "adapter_cancel"
+                cleanup_attempt["attempted"] = True
+                confirmed = bool(cancel(LocalSubprocessRunner(), str(session_id)))
+                cleanup_result = {
+                    "adapter_cancel_requested": True,
+                    "adapter_cancel_confirmed": confirmed,
+                }
+                cleanup_confirmed = confirmed
+            else:
+                cleanup_attempt["operation"] = "no_safe_cleanup_handler"
+                cleanup_result = {
+                    "adapter_cancel_requested": False,
+                    "adapter_cancel_confirmed": False,
+                    "reason": "native_session_id_missing"
+                    if not session_id
+                    else "adapter_cancel_unavailable",
+                }
+    except Exception as exc:  # cleanup failure must retain the lease
+        cleanup_result = {
+            "adapter_cancel_requested": bool(cleanup_attempt.get("attempted")),
+            "adapter_cancel_confirmed": False,
+            "reason": "cleanup_error",
+            "error": type(exc).__name__,
+        }
+
+    recorded = store.record_terminal_cleanup_retry(
+        job.job_id,
+        reason=reason,
+        prior_terminal_status=prior_terminal_status,
+        cleanup_attempt=cleanup_attempt,
+        cleanup_result=cleanup_result,
+        cleanup_confirmed=cleanup_confirmed,
+    )
+    if recorded.get("ok"):
+        return recorded
+    return {
+        "ok": False,
+        "error": recorded.get("error", "cleanup_retry_persist_failed"),
+        "job_id": job.job_id,
+        "reason": reason,
+        "prior_terminal_status": prior_terminal_status,
+        "cleanup_attempt": cleanup_attempt,
+        "cleanup_result": cleanup_result,
+        "cleanup_confirmed": False,
+        "lease_disposition": "retained_cleanup_evidence_unpersisted",
+    }
 
 
 def terminalize_job_cmd(
@@ -183,9 +342,60 @@ def terminalize_job_cmd(
 
     status = store.job_status(job_id)
     if status in _TERMINAL_STATUSES:
-        # A terminal result is already safe to collect, regardless of the
-        # caller's recovery reason.  Never send a second stop request.
-        pass
+        # A terminal result is safe to collect only after checking whether a
+        # prior worker left provider cleanup unconfirmed.  Retrying this
+        # provider-native cleanup is idempotent and is the only path allowed
+        # to release the retained writer lease.
+        existing = store.get_result(job_id, client_session_id="*")
+        job_meta = store._read_job_meta(job.path)
+        if _terminal_cleanup_needed(job_meta, existing):
+            diagnostic = _retry_terminal_cleanup(
+                store,
+                job,
+                reason=reason,
+                prior_terminal_status=status,
+            )
+            result = store.get_result(job_id, client_session_id="*")
+            result["diagnostics"] = diagnostic
+            if not diagnostic.get("ok"):
+                result.update(
+                    {
+                        "error": diagnostic.get("error", "cleanup_retry_failed"),
+                        "cleanup_retry": diagnostic,
+                    }
+                )
+        else:
+            technical = existing.get("technical")
+            if not isinstance(technical, dict):
+                technical = {}
+            diagnostic = {
+                "job_id": job_id,
+                "reason": reason,
+                "prior_terminal_status": status,
+                "cleanup_attempt": {
+                    "attempted": False,
+                    "skipped": True,
+                    "reason": "cleanup_already_confirmed",
+                },
+                "cleanup_result": technical.get("cleanup_result")
+                or technical.get("provider_cleanup"),
+                "cleanup_confirmed": True,
+                "lease_disposition": "already_released_or_not_present",
+                "lease_released": False,
+            }
+            result = existing
+            result["diagnostics"] = diagnostic
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        if result.get("error") == "job_not_found" or result.get("job_created") is False:
+            return WAIT_JOB_NOT_FOUND
+        if result.get("ok") is True and result.get("status") not in {
+            "failed",
+            "cancelled",
+            "stopped",
+        }:
+            return WAIT_JOB_SUCCESS
+        return WAIT_JOB_TERMINAL_FAILURE
     elif reason == "blocking_prompt" and status != "awaiting_input":
         result = {
             "ok": False,
