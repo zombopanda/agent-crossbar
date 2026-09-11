@@ -4,7 +4,7 @@ All notable changes to Agent Crossbar.
 
 ## [Unreleased]
 
-## [0.5.0] — 2026-09-10
+## [0.4.0] — 2026-09-10
 
 ### Added
 - Owner-mediated permissions and continuation over the existing `job_send`
@@ -25,6 +25,12 @@ All notable changes to Agent Crossbar.
   label.
 
 ### Changed
+- Admission is an optional local, provider-neutral callback. Strict mode
+  admits only the exact profile/model/task candidate returned by the external
+  quota policy; it never rewrites requests or selects fallbacks.
+- Maintainer live gates run locally with authenticated provider CLIs. The
+  GitHub-hosted workflow was removed because stock runners do not provide
+  those CLIs or credentials.
 - **Breaking:** Claude is now interactive-only. `agent_start(profile="claude")`
   with `interactive=false` (explicit or defaulted) is rejected with the stable
   `interactive_required` error before readiness, admission, lease, or job
@@ -50,16 +56,6 @@ All notable changes to Agent Crossbar.
   polling until a native turn/update identity changes or a provider completion
   marker is appended after the reply boundary; repeated `done` and echoed
   input are inconclusive.
-
-## [0.4.0] — 2026-09-07
-
-### Changed
-- Admission is an optional local, provider-neutral callback. Strict mode
-  admits only the exact profile/model/task candidate returned by the external
-  quota policy; it never rewrites requests or selects fallbacks.
-- Maintainer live gates run locally with authenticated provider CLIs. The
-  GitHub-hosted workflow was removed because stock runners do not provide
-  those CLIs or credentials.
 
 ## [0.3.7] — 2026-07-29
 
