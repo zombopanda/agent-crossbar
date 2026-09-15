@@ -12,5 +12,5 @@
 - [x] Run focused and full test suites (`299 focused passed`; `1396 passed,
       2 skipped` via `uv run --offline pytest -q`).
 - [x] Validate with `openspec validate capture-provider-usage --strict`.
-- [ ] Add verification evidence comment to bead `agent-crossbar-abe`; do not
+- [x] Add verification evidence comment to bead `agent-crossbar-abe`; do not
       archive this change without Bo's approval.
