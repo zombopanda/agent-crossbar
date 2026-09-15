@@ -318,6 +318,7 @@ def test_agent_start_always_creates_async_job_and_returns_job_id(
 def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
     """Codex does not support advice, so task=ask must map to text."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+    import threading
 
     def fake_start_print_job(store, job_id, req, **kwargs):
         pass
@@ -328,8 +329,10 @@ def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
     # this must be mocked too, or the fire-and-forget background thread calls
     # the real ACP bridge (pnpm dlx @agentclientprotocol/codex-acp).
     acp_calls: list[dict] = []
+    acp_started = threading.Event()
 
     async def fake_run_acp_job(store, job_id, **kwargs):
+        acp_started.set()
         acp_calls.append(kwargs)
         store.set_result(job_id, ok=True, summary="ACP_OK\n")
 
@@ -368,6 +371,7 @@ def test_codex_agent_start_ask_falls_back_to_text(tmp_path, monkeypatch):
     assert result["job_id"] is not None
     # The resolved operation must be 'text', not 'advice'
     assert result.get("operation") == "text", f"expected text, got {result.get('operation')}"
+    assert acp_started.wait(timeout=1.0), "mocked ACP job was not scheduled"
     assert len(acp_calls) == 1, "real ACP bridge must not be invoked from unit tests"
 
 
