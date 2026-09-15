@@ -205,15 +205,12 @@ def _sum_usage_samples_with_status(
 
     # Input/cache/output are required for an exact reconstructed total.
     required = fields[:4]
-    incomplete = sorted(
-        field for field in required if not seen[field] or field in invalid
-    )
+    incomplete = sorted(field for field in required if not seen[field] or field in invalid)
     if "reasoning_tokens" in invalid:
         incomplete.append("reasoning_tokens")
 
     aggregate: dict[str, Any] = {
-        field: totals[field] if seen[field] and field not in invalid else None
-        for field in fields
+        field: totals[field] if seen[field] and field not in invalid else None for field in fields
     }
     if all(seen[field] and field not in invalid for field in required):
         total_tokens = sum(totals[field] for field in required)
@@ -353,8 +350,7 @@ def extract_acp_usage(usage_obj: Any) -> dict[str, Any]:
         return unavailable_usage("acp_provider_omitted_usage")
 
     raw_values = {
-        field: _read_acp_field(usage_obj, aliases)
-        for field, aliases in _ACP_FIELD_ALIASES.items()
+        field: _read_acp_field(usage_obj, aliases) for field, aliases in _ACP_FIELD_ALIASES.items()
     }
     invalid = [
         field
@@ -366,7 +362,11 @@ def extract_acp_usage(usage_obj: Any) -> dict[str, Any]:
         for field, value in raw_values.items()
     }
 
-    if values["input_tokens"] is None and values["output_tokens"] is None and values["total_tokens"] is None:
+    if (
+        values["input_tokens"] is None
+        and values["output_tokens"] is None
+        and values["total_tokens"] is None
+    ):
         reason = (
             "acp_usage_fields_invalid:" + ",".join(invalid)
             if invalid

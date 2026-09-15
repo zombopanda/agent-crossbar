@@ -1036,7 +1036,9 @@ def _fail(
             "next_action": next_action,
             "diagnostics": diagnostics,
         },
-        usage=usage if usage is not None else unavailable_usage("acp_failed_before_usage_available"),
+        usage=usage
+        if usage is not None
+        else unavailable_usage("acp_failed_before_usage_available"),
         technical=technical,
     )
 
