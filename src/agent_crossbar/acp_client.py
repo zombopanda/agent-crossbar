@@ -70,6 +70,10 @@ class AcpResult:
     # permission.  Keep that protocol outcome independent of native text so
     # the runtime cannot report the refused/incomplete turn as completed.
     permission_rejected: bool = False
+    # The ACP ``PromptResponse.usage`` value (unstable protocol field), or
+    # ``None`` when the provider never reported it. Passed through as-is —
+    # interpretation/dedup happens in agent_crossbar.usage.extract_acp_usage.
+    usage: Any = None
 
 
 class AcpError(Exception):
@@ -1191,6 +1195,7 @@ async def run_acp_prompt(
                     stop_reason=stop_reason,
                     session_id=session_id,
                     permission_rejected=client_impl.permission_rejected,
+                    usage=getattr(prompt_response, "usage", None),
                 )
         except asyncio.CancelledError:
             raise

@@ -24,6 +24,7 @@ from agent_crossbar.tmux_output import (
     interactive_tmux_output_summary,
     interactive_tmux_session_resumed,
 )
+from agent_crossbar.usage import resolve_usage_for_meta
 
 _JOB_ID_RE = re.compile(r"^[0-9]{8,}-[a-zA-Z0-9_-]+$")
 _FILE_MODE = 0o600
@@ -1330,6 +1331,57 @@ class JobStore:
             started_at=meta.get("started_at"),
             requested=requested,
             resolved=resolved,
+            usage=resolve_usage_for_meta(meta),
+            technical=technical,
+        )
+
+    @staticmethod
+    def _build_tmux_result_envelope(
+        meta: dict[str, Any],
+        *,
+        summary: str,
+        ok: bool,
+        exit_code: int | None,
+        artifacts: list[str],
+        technical: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the same durable envelope for lazy tmux finalization.
+
+        A short-lived MCP process may exit before the main runner publishes an
+        envelope.  Lazy finalization must still expose the Claude transcript
+        usage and preserve the provider-neutral result shape.
+        """
+        requested = {
+            "profile": meta.get("profile"),
+            "model": meta.get("model"),
+            "effort": meta.get("effort"),
+            "task": meta.get("task"),
+            "interactive": meta.get("interactive", False),
+            "cwd": meta.get("cwd"),
+        }
+        resolved = {**requested, "backend": meta.get("backend")}
+        failure = None
+        if not ok:
+            failure = {
+                "code": "tmux_provider_exit",
+                "stage": "execution",
+                "retryable": True,
+                "next_action": "inspect_provider_output",
+                "diagnostics": {"exit_code": exit_code},
+            }
+        return build_result_envelope(
+            status="completed" if ok else "failed",
+            stop_reason="completed" if ok else "provider_exit",
+            output=summary,
+            summary=summary,
+            created_at=meta.get("created") or meta.get("started_at") or "",
+            started_at=meta.get("started_at"),
+            requested=requested,
+            resolved=resolved,
+            exit_code=exit_code,
+            failure=failure,
+            usage=resolve_usage_for_meta(meta),
+            artifacts=artifacts,
             technical=technical,
         )
 
@@ -1380,7 +1432,25 @@ class JobStore:
                         "lazy_finalized": True,
                     },
                 )
-                self.set_result(job.job_id, ok=False, summary=message, artifacts=artifacts)
+                self.set_result(
+                    job.job_id,
+                    ok=False,
+                    summary=message,
+                    artifacts=artifacts,
+                    envelope=self._build_tmux_result_envelope(
+                        meta,
+                        summary=message,
+                        ok=False,
+                        exit_code=None,
+                        artifacts=artifacts,
+                        technical={
+                            "lifecycle_events": self._lifecycle_event_count(job),
+                            "native_session_id": meta.get("native_session_id"),
+                            "native_full_session_id": meta.get("native_full_session_id"),
+                            "lazy_finalized": True,
+                        },
+                    ),
+                )
                 return
             if meta.get("interactive") is True and interactive_tmux_output_complete(
                 output,
@@ -1400,7 +1470,25 @@ class JobStore:
                         "lazy_finalized": True,
                     },
                 )
-                self.set_result(job.job_id, ok=True, summary=summary, artifacts=artifacts)
+                self.set_result(
+                    job.job_id,
+                    ok=True,
+                    summary=summary,
+                    artifacts=artifacts,
+                    envelope=self._build_tmux_result_envelope(
+                        meta,
+                        summary=summary,
+                        ok=True,
+                        exit_code=0,
+                        artifacts=artifacts,
+                        technical={
+                            "lifecycle_events": self._lifecycle_event_count(job),
+                            "native_session_id": meta.get("native_session_id"),
+                            "native_full_session_id": meta.get("native_full_session_id"),
+                            "lazy_finalized": True,
+                        },
+                    ),
+                )
             return
 
         try:
@@ -1420,7 +1508,26 @@ class JobStore:
                 "lazy_finalized": True,
             },
         )
-        self.set_result(job.job_id, ok=ok, summary=summary, artifacts=artifacts)
+        envelope = self._build_tmux_result_envelope(
+            meta,
+            summary=summary,
+            ok=ok,
+            exit_code=exit_code,
+            artifacts=artifacts,
+            technical={
+                "lifecycle_events": self._lifecycle_event_count(job),
+                "native_session_id": meta.get("native_session_id"),
+                "native_full_session_id": meta.get("native_full_session_id"),
+                "lazy_finalized": True,
+            },
+        )
+        self.set_result(
+            job.job_id,
+            ok=ok,
+            summary=summary,
+            artifacts=artifacts,
+            envelope=envelope,
+        )
 
     def _reap_deadline_expired_job(self, job: Job) -> bool:
         """Terminalize an orphaned nonterminal job whose runtime deadline elapsed.
@@ -1505,6 +1612,7 @@ class JobStore:
                     "grace_sec": DEADLINE_REAP_GRACE_SEC,
                 },
             },
+            usage=resolve_usage_for_meta(meta),
             technical={
                 "lifecycle_events": self._lifecycle_event_count(job),
                 "native_session_id": meta.get("native_session_id"),
@@ -1703,7 +1811,7 @@ class JobStore:
                     "warnings": [],
                 }
                 # Pass through envelope technical / failure / resolved fields
-                for key in ("technical", "failure", "resolved"):
+                for key in ("technical", "failure", "resolved", "usage"):
                     if key in envelope:
                         result[key] = envelope[key]
                 return result

@@ -27,6 +27,7 @@ from agent_crossbar.envelope import build_result_envelope, sanitize_diagnostic_t
 from agent_crossbar.models import Autonomy
 from agent_crossbar.pending_permissions import PendingRequestLimitError, pending_permissions
 from agent_crossbar.run_handles import run_handles
+from agent_crossbar.usage import extract_acp_usage, unavailable_usage
 
 DEFAULT_MAX_RUNTIME_SEC: int = 1800
 
@@ -808,6 +809,7 @@ async def run_acp_job(
                 "output_len": len(result.output),
                 "permission_rejected": True,
             },
+            usage=extract_acp_usage(getattr(result, "usage", None)),
         )
         return
 
@@ -844,6 +846,7 @@ async def run_acp_job(
                 "native_session_id": getattr(result, "session_id", None),
                 "output_len": len(result.output),
             },
+            usage=extract_acp_usage(getattr(result, "usage", None)),
         )
         return
 
@@ -876,6 +879,7 @@ async def run_acp_job(
                 "native_session_id": getattr(result, "session_id", None),
                 "output_len": len(result.output),
             },
+            usage=extract_acp_usage(getattr(result, "usage", None)),
         )
         return
 
@@ -912,6 +916,7 @@ async def run_acp_job(
         finished_at=finished_at,
         requested=requested,
         resolved=resolved,
+        usage=extract_acp_usage(getattr(result, "usage", None)),
         technical={
             "lifecycle_events": _count_events(store, job_id),
             "native_session_id": getattr(result, "session_id", None),
@@ -947,6 +952,7 @@ def _fail(
     cwd: str,
     diagnostics: dict[str, Any],
     cleanup: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> None:
     """Persist a failure result.  Prompt is absent from all persisted data.
 
@@ -1030,6 +1036,7 @@ def _fail(
             "next_action": next_action,
             "diagnostics": diagnostics,
         },
+        usage=usage if usage is not None else unavailable_usage("acp_failed_before_usage_available"),
         technical=technical,
     )
 

@@ -23,6 +23,7 @@ from agent_crossbar.tmux_output import (
     interactive_tmux_output_complete_since,
     interactive_tmux_output_summary,
 )
+from agent_crossbar.usage import resolve_usage_for_meta
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _PROVIDER_LIMIT_MARKERS = (
@@ -260,6 +261,7 @@ def _terminalize_runtime_deadline(
                 **({"telemetry_failure": telemetry_failure} if telemetry_failure else {}),
             },
         },
+        usage=resolve_usage_for_meta(meta),
         technical={
             "lifecycle_events": _count_lifecycle_events(store, job_id),
             "native_session_id": session_id,
@@ -798,6 +800,7 @@ def _run_adapter_job(
                                 "provider_cleanup": blocked_cleanup,
                             },
                         },
+                        usage=resolve_usage_for_meta(meta_blocked),
                         technical={
                             "lifecycle_events": _count_lifecycle_events(store, job_id),
                             "native_session_id": session_id,
@@ -992,6 +995,7 @@ def _run_adapter_job(
                 "cwd": meta_terminal.get("cwd"),
             },
             failure=failure,
+            usage=resolve_usage_for_meta(meta_terminal),
             technical={
                 "lifecycle_events": _count_lifecycle_events(store, job_id),
                 "native_session_id": session_id,
@@ -1066,6 +1070,7 @@ def _run_adapter_job(
                     "provider_cleanup": cleanup,
                 },
             },
+            usage=resolve_usage_for_meta(meta_exc),
             technical={
                 "lifecycle_events": _count_lifecycle_events(store, job_id),
                 "native_session_id": session_id,

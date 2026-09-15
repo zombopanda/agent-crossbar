@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_crossbar.redaction import redact_secrets
+from agent_crossbar.usage import unavailable_usage
 
 DIAGNOSTICS_MAX_BYTES = 2048  # 2 KiB
 
@@ -286,7 +287,7 @@ def build_result_envelope(
             "signal": signal,
         },
         "failure": safe_failure,
-        "usage": usage if usage is not None else {"available": False},
+        "usage": usage if usage is not None else unavailable_usage("not_captured"),
         "changes": changes if changes is not None else [],
         "artifacts": artifacts if artifacts is not None else [],
         "technical": envelope_technical,

@@ -305,7 +305,11 @@ def test_envelope_usage_defaults_to_unavailable() -> None:
         output="hello",
         created_at="2025-01-01T00:00:00Z",
     )
-    assert env["usage"] == {"available": False}
+    assert env["usage"]["available"] is False
+    assert env["usage"]["status"] == "unavailable"
+    assert env["usage"]["source"] is None
+    assert env["usage"]["reason"]
+    assert env["usage"]["total_tokens"] is None
 
 
 def test_envelope_usage_preserves_native_when_provided() -> None:

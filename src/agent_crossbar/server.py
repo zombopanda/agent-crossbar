@@ -38,6 +38,7 @@ from agent_crossbar.runner import (
 )
 from agent_crossbar.subprocess_runner import LocalSubprocessRunner
 from agent_crossbar.telemetry import TelemetryStore
+from agent_crossbar.usage import resolve_usage_for_meta
 from agent_crossbar.validation import validate_start_request
 from agent_crossbar.writer_lease import WriterLeaseResult, WriterLeaseStore
 
@@ -1183,6 +1184,7 @@ def job_stop(
                     "backend": "acp",
                     "cwd": meta.get("cwd"),
                 },
+                usage=resolve_usage_for_meta(meta),
                 technical={"provider_cleanup": cleanup_data},
             )
             cleanup_confirmed = bool(cleanup_data.get("terminated"))
