@@ -491,15 +491,66 @@ def check_opencode_readiness(runner: Any = None) -> ProbeResult:
     )
 
 
+def _reasonix_readiness_from_providers(
+    payload: dict[str, Any], version: str | None, checks: dict[str, Any]
+) -> ProbeResult | None:
+    """Derive auth readiness from the current ``providers[].key_present`` schema.
+
+    Returns ``None`` when ``providers`` is missing, non-list, or empty so the
+    caller can fall back to its existing "doctor did not report checks"
+    degraded result — never fabricates readiness from an absent field.
+    """
+    providers = payload.get("providers")
+    if not isinstance(providers, list) or not providers:
+        return None
+
+    named = [
+        p
+        for p in providers
+        if isinstance(p, dict) and isinstance(p.get("name"), str) and p.get("name").strip()
+    ]
+    if not named:
+        return None
+
+    with_key = sorted({p["name"] for p in named if p.get("key_present") is True})
+    without_key = sorted({p["name"] for p in named if p.get("key_present") is not True})
+
+    if not with_key:
+        return ProbeResult(
+            state="needs_auth",
+            authenticated=False,
+            error_code="reasonix_not_authenticated",
+            remediation="Run `reasonix setup` to configure your DeepSeek API key.",
+            evidence=f"reasonix={version}; providers={without_key}; key_present=false",
+            version=version,
+        )
+
+    return ProbeResult(
+        state="ready",
+        authenticated=True,
+        auth_mode="api_key",
+        billing_mode="api",
+        version=version,
+        evidence=(
+            f"reasonix={version}; providers_with_key={with_key}; "
+            f"providers_without_key={without_key}; doctor checks={sorted(checks)}"
+        ),
+    )
+
+
 def check_reasonix_readiness(runner: Any = None) -> ProbeResult:
     """Probe Reasonix readiness via ``reasonix doctor --json``.
 
     Reasonix is an **experimental** adapter — binary presence alone
     SHALL NOT produce ``ready``.  The probe parses the doctor's
     structured ``api-key`` and ``api-reach`` checks (never the key
-    value itself) to prove authentication.  When the doctor output is
-    unavailable or unparseable, the probe returns ``degraded`` with an
-    actionable remediation rather than guessing ``ready``.
+    value itself) to prove authentication.  reasonix >= 1.38 dropped that
+    ``checks`` array; when it is absent, the probe falls back to the
+    current ``providers[].key_present`` schema (see
+    ``_reasonix_readiness_from_providers``), which proves configuration
+    but not live reachability. When the doctor output is unavailable or
+    unparseable, the probe returns ``degraded`` with an actionable
+    remediation rather than guessing ``ready``.
     """
     if runner is None:
         runner = _SubprocessRunner()
@@ -561,20 +612,38 @@ def check_reasonix_readiness(runner: Any = None) -> ProbeResult:
             version=version,
         )
 
-    checks = {
-        c.get("id"): c for c in payload.get("checks", []) if isinstance(c, dict) and c.get("id")
-    }
+    checks_raw = payload.get("checks")
+    checks = (
+        {c.get("id"): c for c in checks_raw if isinstance(c, dict) and c.get("id")}
+        if isinstance(checks_raw, list)
+        else {}
+    )
     api_key_check = checks.get("api-key")
     api_reach_check = checks.get("api-reach")
 
     if api_key_check is None or api_reach_check is None:
+        # reasonix >= 1.38 dropped the top-level `checks` array entirely —
+        # auth is now reported per-provider via `providers[].key_present`.
+        # This schema has no live-reachability equivalent to the old
+        # `api-reach` check, so `ready` here proves configuration, not
+        # network reachability. Fall back to it only when the legacy
+        # `checks` schema is genuinely absent, so an older reasonix build
+        # that still emits `checks` keeps its stronger reachability proof.
+        # A non-empty checks array is an explicit legacy schema, even when it
+        # is incomplete or malformed. Do not turn a partial/unknown doctor
+        # response into ready solely because a provider key is configured.
+        if "checks" not in payload or checks_raw == []:
+            fallback = _reasonix_readiness_from_providers(payload, version, checks)
+            if fallback is not None:
+                return fallback
         return ProbeResult(
             state="degraded",
             authenticated=False,
             error_code="reasonix_auth_unverified",
             remediation=(
-                "`reasonix doctor --json` did not report api-key/api-reach checks. "
-                "Run `reasonix doctor` manually to verify authentication."
+                "`reasonix doctor --json` did not report api-key/api-reach checks "
+                "or a providers list. Run `reasonix doctor` manually to verify "
+                "authentication."
             ),
             evidence=f"reasonix={version}; doctor checks={sorted(checks)}",
             version=version,

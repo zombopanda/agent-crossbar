@@ -659,6 +659,147 @@ class TestReasonixReadiness:
         assert result.billing_mode == "api"
         assert PROVIDER_SUPPORT_MATRIX["reasonix"]["billing_mode"] == result.billing_mode
 
+    def test_reasonix_ready_new_schema_providers_key_present(self):
+        """Regression: reasonix >= 1.38 dropped the `checks` array entirely.
+
+        `reasonix doctor --json` now reports auth per-provider via
+        `providers[].key_present` with no top-level `checks` field at all
+        (not even `checks: []`). Previously this fell straight into the
+        "did not report api-key/api-reach checks" degraded branch even
+        though the doctor payload proves a configured key — this is the
+        exact live schema drift (reasonix v1.38.7) that caused Reasonix to
+        report `degraded`/`reasonix_auth_unverified` while model discovery,
+        which already reads `providers`, succeeded.
+        """
+        doctor_json = json.dumps(
+            {
+                "version": "v1.38.7",
+                "config": {"default_model": "deepseek-flash/deepseek-v4-flash"},
+                "providers": [
+                    {
+                        "name": "deepseek-flash",
+                        "kind": "openai",
+                        "models": ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
+                        "api_key_env": "DEEPSEEK_API_KEY",
+                        "key_present": True,
+                    },
+                    {
+                        "name": "deepseek-pro",
+                        "kind": "openai",
+                        "models": ["deepseek-v4-pro"],
+                        "api_key_env": "DEEPSEEK_API_KEY",
+                        "key_present": True,
+                    },
+                ],
+            }
+        )
+        calls = {
+            "reasonix --version": RunResult(0, "reasonix v1.38.7", ""),
+            "reasonix doctor --json": RunResult(0, doctor_json, ""),
+        }
+        runner = _SequenceRunner(calls)
+        result = check_reasonix_readiness(runner)
+        assert result.state == "ready"
+        assert result.authenticated is True
+        assert result.auth_mode == "api_key"
+        assert result.billing_mode == "api"
+        assert result.error_code is None
+        assert "deepseek-flash" in (result.evidence or "")
+        assert "deepseek-pro" in (result.evidence or "")
+        # Evidence must never contain the actual key value
+        assert "sk-" not in (result.evidence or "")
+
+    def test_reasonix_needs_auth_new_schema_no_key_present(self):
+        """New `providers[].key_present` schema, but no provider has a key."""
+        doctor_json = json.dumps(
+            {
+                "version": "v1.38.7",
+                "providers": [
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": False,
+                    },
+                    {"name": "deepseek-pro", "models": ["deepseek-v4-pro"], "key_present": False},
+                ],
+            }
+        )
+        calls = {
+            "reasonix --version": RunResult(0, "reasonix v1.38.7", ""),
+            "reasonix doctor --json": RunResult(0, doctor_json, ""),
+        }
+        runner = _SequenceRunner(calls)
+        result = check_reasonix_readiness(runner)
+        assert result.state == "needs_auth"
+        assert result.authenticated is False
+        assert result.error_code == "reasonix_not_authenticated"
+        assert "reasonix setup" in (result.remediation or "").lower()
+
+    def test_reasonix_degraded_new_schema_no_checks_no_providers(self):
+        """Neither `checks` nor a usable `providers` list — stay honestly degraded."""
+        doctor_json = json.dumps({"version": "v1.38.7", "providers": []})
+        calls = {
+            "reasonix --version": RunResult(0, "reasonix v1.38.7", ""),
+            "reasonix doctor --json": RunResult(0, doctor_json, ""),
+        }
+        runner = _SequenceRunner(calls)
+        result = check_reasonix_readiness(runner)
+        assert result.state == "degraded"
+        assert result.authenticated is False
+        assert result.error_code == "reasonix_auth_unverified"
+
+    def test_reasonix_legacy_checks_schema_still_wins_over_providers(self):
+        """When a reasonix build reports both schemas, the stronger legacy
+        `checks` (api-key + api-reach, a live reachability proof) governs —
+        the providers-based fallback must not silently downgrade it."""
+        doctor_json = json.dumps(
+            {
+                "checks": [
+                    {"id": "api-key", "status": "ok", "message": "configured"},
+                    {"id": "api-reach", "status": "fail", "message": "401 unauthorized"},
+                ],
+                "providers": [
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": True,
+                    },
+                ],
+            }
+        )
+        calls = {
+            "reasonix --version": RunResult(0, "0.53.2", ""),
+            "reasonix doctor --json": RunResult(0, doctor_json, ""),
+        }
+        runner = _SequenceRunner(calls)
+        result = check_reasonix_readiness(runner)
+        assert result.state == "needs_auth"
+        assert result.error_code == "reasonix_api_unreachable"
+
+    def test_reasonix_partial_legacy_checks_stay_degraded(self):
+        """An explicit but incomplete legacy array must not use key-only fallback."""
+        doctor_json = json.dumps(
+            {
+                "checks": [{"id": "api-key", "status": "ok", "message": "configured"}],
+                "providers": [
+                    {
+                        "name": "deepseek-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "key_present": True,
+                    }
+                ],
+            }
+        )
+        calls = {
+            "reasonix --version": RunResult(0, "v1.38.7", ""),
+            "reasonix doctor --json": RunResult(0, doctor_json, ""),
+        }
+        runner = _SequenceRunner(calls)
+        result = check_reasonix_readiness(runner)
+        assert result.state == "degraded"
+        assert result.authenticated is False
+        assert result.error_code == "reasonix_auth_unverified"
+
 
 # ── ChatGPT Pro readiness probe ─────────────────────────────────────────────
 

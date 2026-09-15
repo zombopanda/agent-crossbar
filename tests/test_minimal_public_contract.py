@@ -413,6 +413,11 @@ def test_reasonix_interactive_true_selects_tmux_transport(tmp_path, monkeypatch)
 def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeypatch):
     """Claude interactive mode must remain on native --bg, never Claude -p."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+    # Keep this provider-path unit test hermetic when a local controller has
+    # strict admission enabled; admission has its own dedicated test module.
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_MODE", raising=False)
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_COMMAND", raising=False)
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_TIMEOUT_SEC", raising=False)
 
     import time
 
@@ -476,6 +481,11 @@ def test_claude_interactive_uses_native_background_attach_path(tmp_path, monkeyp
 def test_claude_agent_start_uses_claude_bg_backend(tmp_path, monkeypatch):
     """Claude agent_start response must report backend='claude_bg', not 'print'."""
     monkeypatch.setenv("AGENT_CROSSBAR_STATE_DIR", str(tmp_path))
+    # Keep this provider-path unit test hermetic when a local controller has
+    # strict admission enabled; admission has its own dedicated test module.
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_MODE", raising=False)
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_COMMAND", raising=False)
+    monkeypatch.delenv("AGENT_CROSSBAR_ADMISSION_TIMEOUT_SEC", raising=False)
 
     import time
 
