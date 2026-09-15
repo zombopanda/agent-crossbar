@@ -12,5 +12,8 @@
 - [x] Run focused and full test suites (`299 focused passed`; `1396 passed,
       2 skipped` via `uv run --offline pytest -q`).
 - [x] Validate with `openspec validate capture-provider-usage --strict`.
+- [x] Sync `provider-usage-telemetry` into the canonical specs and pass strict
+      validation for both the change and canonical specs; leave this change
+      active and unarchived.
 - [x] Add verification evidence comment to bead `agent-crossbar-abe`; do not
       archive this change without Bo's approval.
