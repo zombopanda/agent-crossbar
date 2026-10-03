@@ -44,3 +44,34 @@ These rules apply to code contributions. They are intentionally concise and focu
 ## Package Hygiene
 
 15. **Public artifacts exclude internal content.** Benchmark results, `.reasonix/`, `.memsearch/`, personal paths, private URLs, and handoff files MUST NOT appear in wheel/sdist/npm tarball.
+
+<!-- openspec-canonical-workflow-v2 -->
+## OpenSpec Canonical Workflow
+
+- `openspec/specs/` is the canonical contract for verified current behavior. `openspec/changes/<name>/specs/` contains temporary deltas for work that needs a durable decision record.
+- OpenSpec is a complexity gate, not a requirement for every feature, bug, retry, or normative edit. Use it for explicit OpenSpec requests, cross-cutting or architectural work, non-obvious trade-offs, risky migrations, public contracts, security boundaries, deployment architecture, or work likely to span sessions or agents.
+- Before changing an existing capability, read its main spec and record one result: `spec impact: none`, `spec impact: restores <requirement>`, `spec impact: canonical correction — <evidence>`, `spec impact: changes contract — direct canonical update`, or `spec impact: changes contract — OpenSpec <change-name>`.
+- A fix that restores an existing canonical requirement proceeds without a delta. Add regression evidence and reference the restored requirement.
+- A direct canonical correction is allowed only when implementation, tests, configuration, or verified runtime evidence establish that the spec is stale. Do not use this path to introduce an undecided policy.
+- A small, well-understood contract adjustment with obvious acceptance criteria may update the canonical spec directly. A contract change requires OpenSpec only when it also passes the complexity gate.
+- Retry code does not trigger OpenSpec by itself. Distinguish restoration of an existing recovery guarantee, an internal mechanism with no external semantic change, a small direct contract adjustment, and a complex retry policy with non-obvious trade-offs.
+- Keep exact cron expressions, polling intervals, queue names, internal paths, and similar mechanisms out of normative specs unless the exact value is itself a required external or operator contract. Put operational values in config, contract tests, and runbook documentation.
+- Before creating a change, inspect active changes for the affected capability. Reuse one only for the same bounded outcome; otherwise group related work by coherent capability or release slice, never one change per bug.
+- The project task tracker (if any) owns individual defects and implementation work. OpenSpec is not an issue tracker.
+- When unsure whether a small change deserves OpenSpec, default to direct work. When the intended contract itself is ambiguous, resolve that ambiguity before implementation.
+- Sync verified deltas into main specs and archive completed changes in the same delivery lifecycle. Do not leave completed changes active or use long-lived changes as competing canonical specifications.
+- When all tasks and required verification gates are complete, report the completion and delta-sync state and ask Bo for explicit current-thread approval before archiving. Never archive a completed change automatically; a direct instruction to close or archive that named change counts as approval.
+<!-- end-openspec-canonical-workflow-v2 -->
+
+<!-- memsearch-agent-instructions-v3 -->
+<!-- AUTO-GENERATED BLOCK - do not edit manually. Source: /Users/bo/.codex/memsearch/agents.md -->
+
+## Memsearch Recall (MANDATORY WHEN RELEVANT)
+
+Use MemSearch when prior decisions can change the answer: debugging regressions or repeated runtime failures, resuming earlier work, requests about past decisions, or nontrivial work involving project conventions or shared infrastructure. Skip it for self-contained exact lookups, tiny edits, and pure formatting unless Bo asks.
+
+Use the existing `memory-recall` skill for search, expansion, and transcript retrieval. Use `memsearch-global` for cross-project recall and `memsearch search` in the owning project for literal strings. State which project or collections you searched, then verify relevant facts against current files or runtime.
+
+The project's `.memsearch.toml` owns one collection across its worktrees and submodules. Never guess collection names or add nested `.memsearch.toml` files. Use the installed wrapper; do not add another lock or install a second MemSearch/Milvus runtime. Follow stricter project-specific executable rules.
+
+<!-- end-memsearch-agent-instructions -->
